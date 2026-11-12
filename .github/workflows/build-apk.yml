@@ -3,13 +3,6 @@ name: Build Native RadioMaster EGO GCS APK
 on:
   push:
     branches: [ "main", "master" ]
-    paths:
-      - '*.zip'
-      - '**/*.zip'
-      - 'app/**'
-      - '**/app/**'
-      - 'build.gradle.kts'
-      - 'settings.gradle.kts'
   workflow_dispatch:
 
 permissions:
@@ -21,26 +14,46 @@ jobs:
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Auto-Unpack Uploaded ZIP or Subfolder
+      - name: Unpack Latest Uploaded ZIP Archive
+        shell: bash
         run: |
-          shopt -s nullglob
-          zips=(*.zip)
-          if [ ${#zips[@]} -gt 0 ]; then
-            echo "Unpacking ${zips[0]}..."
-            mkdir -p _unpack_tmp
-            unzip -q -o "${zips[0]}" -d _unpack_tmp
-            if [ -d "_unpack_tmp/RadioMaster_EGO_GCS_Native_Android/app" ]; then
-              cp -rf _unpack_tmp/RadioMaster_EGO_GCS_Native_Android/* .
-            elif [ -d "_unpack_tmp/app" ]; then
-              cp -rf _unpack_tmp/* .
+          set -e
+          LATEST_ZIP=""
+          while IFS= read -r candidate; do
+            if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+              LATEST_ZIP="$candidate"
+              break
             fi
-            rm -rf _unpack_tmp
+          done < <(git -c core.quotePath=false log --diff-filter=AM --name-only --pretty=format: -- '*.zip')
+          if [ -z "$LATEST_ZIP" ]; then
+            LATEST_ZIP="$(ls -1t *.zip 2>/dev/null | head -n 1 || true)"
           fi
-          if [ ! -f "build.gradle.kts" ] && [ -f "RadioMaster_EGO_GCS_Native_Android/build.gradle.kts" ]; then
-            cp -rf RadioMaster_EGO_GCS_Native_Android/* .
+          if [ -n "$LATEST_ZIP" ] && [ -f "$LATEST_ZIP" ]; then
+            echo "Unpacking uploaded archive: $LATEST_ZIP"
+            rm -rf /tmp/gcs_unpack
+            mkdir -p /tmp/gcs_unpack
+            unzip -q -o "$LATEST_ZIP" -d /tmp/gcs_unpack
+            PROJ_SETTINGS="$(find /tmp/gcs_unpack -maxdepth 3 -name 'settings.gradle.kts' | head -n 1)"
+            if [ -z "$PROJ_SETTINGS" ]; then
+              echo "ERROR: settings.gradle.kts not found inside $LATEST_ZIP"
+              exit 1
+            fi
+            PROJ_ROOT="$(dirname "$PROJ_SETTINGS")"
+            echo "Syncing Android project from: $PROJ_ROOT"
+            rm -rf app
+            cp -rf "$PROJ_ROOT/app" ./app
+            cp -f "$PROJ_ROOT/build.gradle.kts" ./build.gradle.kts
+            cp -f "$PROJ_ROOT/settings.gradle.kts" ./settings.gradle.kts
+            cp -f "$PROJ_ROOT/gradle.properties" ./gradle.properties
+            if [ -f "$PROJ_ROOT/README.md" ]; then
+              cp -f "$PROJ_ROOT/README.md" ./README.md
+            fi
+          else
+            echo "No .zip archive found in repo root; building directly from source tree."
           fi
-          ls -la
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -48,8 +61,16 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Configure Preinstalled Android SDK 34
+        shell: bash
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f | sort -V | tail -n 1)"
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
@@ -57,19 +78,23 @@ jobs:
           gradle-version: '8.7'
 
       - name: Assemble Native Debug APK
-        run: gradle assembleDebug --no-daemon
+        shell: bash
+        run: |
+          set -e
+          gradle assembleDebug --no-daemon --stacktrace
+          cp -f app/build/outputs/apk/debug/app-debug.apk EGO-Pilot-AX12.apk
 
       - name: Upload Compiled Native APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: RadioMaster-EGO-Pilot-Native-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: EGO-Pilot-AX12.apk
 
-      - name: Publish Direct Download Release APK
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cp app/build/outputs/apk/debug/app-debug.apk EGO-Pilot-AX12.apk
-          gh release delete v1.0-latest -y || true
-          gh release create v1.0-latest EGO-Pilot-AX12.apk --title "EGO Pilot Native APK (AX12)" --notes "Pure native Kotlin + OpenGL ES FAST-LIO & EGO-Planner GCS APK"
+        with:
+          tag_name: latest-apk
+          name: "EGO Pilot AX12 最新自动构建版 APK"
+          body: "由 GitHub Actions 自动解压最新上传工程压缩包并编译生成的原生 Kotlin + OpenGL ES 安卓地面站安装包 (EGO-Pilot-AX12.apk)。"
+          files: EGO-Pilot-AX12.apk
