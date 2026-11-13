@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- EGO-Planner 三维 B 样条避障轨迹流光带 (全段严格收束于 r<=29dp 安全区内) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeWidth="2.9"
+        android:strokeLineCap="round"
+        android:pathData="M34,74 C43,71 48,62 54,54 C60,46 65,38 73,34">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="34"
+                android:startY="74"
+                android:endX="73"
+                android:endY="34">
+                <item android:offset="0.0" android:color="#2800E676" />
+                <item android:offset="0.55" android:color="#BD00E676" />
+                <item android:offset="1.0" android:color="#FF00E5FF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 机头前向 FAST-LIO 三维激光感知声呐波弧 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#D800E5FF"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:pathData="M46.5,32.2 A11.8,11.8 0 0,1 61.5,32.2" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#8064FFDA"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:pathData="M43.2,28.5 A16.8,16.8 0 0,1 64.8,28.5" />
+
+    <!-- Tilt-INDI 前后双横向倾转舵机连杆轴 (S1: M1/M3前轴 y=41, S2: M2/M4后轴 y=67) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFB300"
+        android:strokeWidth="2.0"
+        android:strokeLineCap="round"
+        android:pathData="M39,41 L69,41 M39,67 L69,67" />
+
+    <!-- 碳纤 X4 主承力机臂底层暗影与金属高光棱 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#19283A"
+        android:strokeWidth="4.8"
+        android:strokeLineCap="round"
+        android:pathData="M39,41 L69,67 M69,41 L39,67" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#CFE0F2"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M39,41 L69,67 M69,41 L39,67" />
+
+    <!-- 前组倾转涵道护圈 (左前 M3 / 右前 M1 · r=7.2 · 航空前向珊瑚红导光弧) -->
+    <path
+        android:fillColor="#30091320"
+        android:strokeColor="#E0ECFA"
+        android:strokeWidth="1.95"
+        android:pathData="M39,41m-7.2,0a7.2,7.2 0 1,0 14.4,0a7.2,7.2 0 1,0 -14.4,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF5252"
+        android:strokeWidth="2.35"
+        android:strokeLineCap="round"
+        android:pathData="M33.0,37.0 A7.2,7.2 0 0,1 45.0,37.0" />
+    <path
+        android:fillColor="#30091320"
+        android:strokeColor="#E0ECFA"
+        android:strokeWidth="1.95"
+        android:pathData="M69,41m-7.2,0a7.2,7.2 0 1,0 14.4,0a7.2,7.2 0 1,0 -14.4,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF5252"
+        android:strokeWidth="2.35"
+        android:strokeLineCap="round"
+        android:pathData="M63.0,37.0 A7.2,7.2 0 0,1 75.0,37.0" />
+
+    <!-- 后组倾转涵道护圈 (左后 M2 / 右后 M4 · r=7.2 · 战术翠绿尾航灯弧) -->
+    <path
+        android:fillColor="#30091320"
+        android:strokeColor="#C6D6E8"
+        android:strokeWidth="1.9"
+        android:pathData="M39,67m-7.2,0a7.2,7.2 0 1,0 14.4,0a7.2,7.2 0 1,0 -14.4,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E676"
+        android:strokeWidth="2.35"
+        android:strokeLineCap="round"
+        android:pathData="M33.0,71.0 A7.2,7.2 0 0,0 45.0,71.0" />
+    <path
+        android:fillColor="#30091320"
+        android:strokeColor="#C6D6E8"
+        android:strokeWidth="1.9"
+        android:pathData="M69,67m-7.2,0a7.2,7.2 0 1,0 14.4,0a7.2,7.2 0 1,0 -14.4,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E676"
+        android:strokeWidth="2.35"
+        android:strokeLineCap="round"
+        android:pathData="M63.0,71.0 A7.2,7.2 0 0,0 75.0,71.0" />
+
+    <!-- 四电机转子轴心与前向倾转推力矢量金标 -->
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M39,41m-2.0,0a2.0,2.0 0 1,0 4.0,0a2.0,2.0 0 1,0 -4.0,0 M69,41m-2.0,0a2.0,2.0 0 1,0 4.0,0a2.0,2.0 0 1,0 -4.0,0 M39,67m-1.9,0a1.9,1.9 0 1,0 3.8,0a1.9,1.9 0 1,0 -3.8,0 M69,67m-1.9,0a1.9,1.9 0 1,0 3.8,0a1.9,1.9 0 1,0 -3.8,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFD54F"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M39,41 L39,35.0 M69,41 L69,35.0" />
+
+    <!-- 中央倒角八边形机载计算舱 (NUC12 / PX4 / Livox 激光雷达穹顶) -->
+    <path
+        android:fillColor="#102236"
+        android:strokeColor="#EAF3FC"
+        android:strokeWidth="1.9"
+        android:strokeLineJoin="round"
+        android:pathData="M50.5,43.5 L57.5,43.5 L61.2,47.8 L61.2,60.2 L57.5,64.5 L50.5,64.5 L46.8,60.2 L46.8,47.8 Z" />
+
+    <!-- 机头指向三角航向标与中央激光雷达核心环 -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M54,37.0 L57.6,43.2 L54,41.6 L50.4,43.2 Z" />
+    <path
+        android:fillColor="#0B1828"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="1.7"
+        android:pathData="M54,54m-3.8,0a3.8,3.8 0 1,0 7.6,0a3.8,3.8 0 1,0 -7.6,0" />
+    <path
+        android:fillColor="#64FFDA"
+        android:pathData="M54,54m-1.5,0a1.5,1.5 0 1,0 3.0,0a1.5,1.5 0 1,0 -3.0,0" />
+</vector>

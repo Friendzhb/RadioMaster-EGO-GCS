@@ -1,0 +1,119 @@
+name: Build Native RadioMaster EGO GCS APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-native-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unpack Latest Uploaded ZIP Archive
+        shell: bash
+        run: |
+          set -e
+          LATEST_ZIP=""
+          while IFS= read -r candidate; do
+            if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+              LATEST_ZIP="$candidate"
+              break
+            fi
+          done < <(git -c core.quotePath=false log --diff-filter=AM --name-only --pretty=format: -- '*.zip')
+          if [ -z "$LATEST_ZIP" ]; then
+            LATEST_ZIP="$(ls -1t *.zip 2>/dev/null | head -n 1 || true)"
+          fi
+          USE_ZIP=0
+          if [ -n "$LATEST_ZIP" ] && [ -f "$LATEST_ZIP" ]; then
+            ZIP_TS="$(git log -1 --format=%ct -- "$LATEST_ZIP" 2>/dev/null || echo 0)"
+            SRC_TS="$(git log -1 --format=%ct -- app/src 2>/dev/null || echo 0)"
+            if [ ! -d app/src ] || [ "${ZIP_TS:-0}" -ge "${SRC_TS:-0}" ]; then
+              USE_ZIP=1
+            else
+              echo "Detected newer unpacked app/src commit ($SRC_TS > $ZIP_TS); skipping stale $LATEST_ZIP."
+            fi
+          fi
+          if [ "$USE_ZIP" -eq 1 ]; then
+            echo "Unpacking uploaded archive: $LATEST_ZIP"
+            rm -rf /tmp/gcs_unpack
+            mkdir -p /tmp/gcs_unpack
+            unzip -q -o "$LATEST_ZIP" -d /tmp/gcs_unpack
+            PROJ_SETTINGS="$(find /tmp/gcs_unpack -maxdepth 3 -name 'settings.gradle.kts' | head -n 1)"
+            if [ -z "$PROJ_SETTINGS" ]; then
+              echo "ERROR: settings.gradle.kts not found inside $LATEST_ZIP"
+              exit 1
+            fi
+            PROJ_ROOT="$(dirname "$PROJ_SETTINGS")"
+            echo "Syncing Android project from: $PROJ_ROOT"
+            rm -rf app
+            cp -rf "$PROJ_ROOT/app" ./app
+            cp -f "$PROJ_ROOT/build.gradle.kts" ./build.gradle.kts
+            cp -f "$PROJ_ROOT/settings.gradle.kts" ./settings.gradle.kts
+            cp -f "$PROJ_ROOT/gradle.properties" ./gradle.properties
+            if [ -f "$PROJ_ROOT/README.md" ]; then
+              cp -f "$PROJ_ROOT/README.md" ./README.md
+            fi
+            if [ -f "$PROJ_ROOT/CHANGELOG_10_EDITIONS.md" ]; then
+              cp -f "$PROJ_ROOT/CHANGELOG_10_EDITIONS.md" ./CHANGELOG_10_EDITIONS.md
+            fi
+          else
+            echo "No .zip archive found in repo root; building directly from source tree."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configure Preinstalled Android SDK 34
+        shell: bash
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f | sort -V | tail -n 1)"
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Assemble Native Debug APK
+        shell: bash
+        run: |
+          set -e
+          gradle assembleDebug --no-daemon --stacktrace
+          cp -f app/build/outputs/apk/debug/app-debug.apk EGO-Pilot-AX12.apk
+          sha256sum EGO-Pilot-AX12.apk > EGO-Pilot-AX12.apk.sha256
+
+      - name: Upload Compiled Native APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RadioMaster-EGO-Pilot-Native-APK
+          path: EGO-Pilot-AX12.apk
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: latest-apk
+          name: "智航 (AX12) v3.11.6 官方自动构建版 APK"
+          body: "由 GitHub Actions 自动解压最新工程压缩包并编译生成的原生 Kotlin + OpenGL ES 2.0 安卓地面站安装包 (v3.10.0-r10，集成单/多机与 Tilt-INDI 矢量/普通 X4 全兼容热切换及 R1-R10 十版连续工程优化)。"
+          files: |
+            EGO-Pilot-AX12.apk
+            EGO-Pilot-AX12.apk.sha256

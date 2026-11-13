@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 深空碳纤航电径向渐变底板 -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54"
+                android:centerY="46"
+                android:gradientRadius="68">
+                <item android:offset="0.0" android:color="#162E4A" />
+                <item android:offset="0.52" android:color="#0B1728" />
+                <item android:offset="1.0" android:color="#050A12" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 顶部微弱冷青天际高光散射 -->
+    <path android:pathData="M0,0h108v54h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="54"
+                android:startY="0"
+                android:endX="54"
+                android:endY="54">
+                <item android:offset="0.0" android:color="#2200E5FF" />
+                <item android:offset="1.0" android:color="#0000E5FF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 激光雷达极坐标同心测距环 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1E00E5FF"
+        android:strokeWidth="0.8"
+        android:pathData="M54,54m-23,0a23,23 0 1,0 46,0a23,23 0 1,0 -46,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1600E5FF"
+        android:strokeWidth="0.8"
+        android:pathData="M54,54m-35,0a35,35 0 1,0 70,0a35,35 0 1,0 -70,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1064FFDA"
+        android:strokeWidth="0.7"
+        android:pathData="M54,54m-46,0a46,46 0 1,0 92,0a46,46 0 1,0 -92,0" />
+
+    <!-- 航向精密十字基准刻度 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2069B7FF"
+        android:strokeWidth="0.75"
+        android:pathData="M54,10 L54,19 M54,89 L54,98 M10,54 L19,54 M89,54 L98,54" />
+</vector>

@@ -1,0 +1,257 @@
+{
+  "archive": "RadioMaster_EGO_GCS_Native_Android (19).zip",
+  "archive_sha256": "c3681e2d323f5af8ed6a8c637b114dd42a6544bbbacff1eadbd14f1e6d2dece9",
+  "original_commit": "3902516f3be572c3980228cc88d99ea186643162",
+  "files": [
+    {
+      "path": "docs/ORIGINAL_ARCHIVE_WORKFLOW.yml",
+      "sha256": "812587593a6385327762a59e4fadfdfd06146d178aac39465568fd5373e85fda",
+      "size": 4569
+    },
+    {
+      "path": "CHANGELOG_10_EDITIONS.md",
+      "sha256": "49b33119de8bdb20c11cfd1f57984713700ad8207266769dac7e9c729051d559",
+      "size": 5800
+    },
+    {
+      "path": "docs/ORIGINAL_PROJECT_README.md",
+      "sha256": "4c16c3e10f2798002646bb9468c157167bdefc7e795461b4b811d8a5fb609f2a",
+      "size": 11292
+    },
+    {
+      "path": "app/build.gradle.kts",
+      "sha256": "d8e4b9dfdf62ce956bd4f93330d15bc76b985947f2dbc66145fc482a44d9f713",
+      "size": 2461
+    },
+    {
+      "path": "app/keystore/ego_pilot_ota.jks",
+      "sha256": "352556e85c3fcc60ed846115253842fef28566d974145eb056785d18aaec8130",
+      "size": 2764
+    },
+    {
+      "path": "app/proguard-rules.pro",
+      "sha256": "1e24dc3e3bb40d70fc2b26168b0b475496546ce65167af73eec7b4116e49adcd",
+      "size": 408
+    },
+    {
+      "path": "app/src/main/AndroidManifest.xml",
+      "sha256": "c2724e8e8782a7a3ae0a1ab32a7a02a081a9b66b14b08de6459a3d20fed132a4",
+      "size": 2364
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/MainActivity.kt",
+      "sha256": "20898a67dcdaef4f4837de5fad470c3269ce791f24bd090c05b4e096d038d070",
+      "size": 255788
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/engine/EgoSimEngine.kt",
+      "sha256": "85b8443acd6424d4773033ac42f1de2f70c86c4f5b4a2ad1442760802d2401a9",
+      "size": 127416
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/engine/FastLioVoxelMap.kt",
+      "sha256": "f87f25b39caeaddb18305c7694467e0d7cf6a52f25630daafd79042462c7e834",
+      "size": 16180
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/engine/FlightTelemetryRecorder.kt",
+      "sha256": "db346df23cfe9863f4d1330484a466a6d9e84eb20822306ef7e906b6b1282cbb",
+      "size": 5745
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/hw/Ax12HardwareBridge.kt",
+      "sha256": "c194de0bea26a0b66546e88afbf29c9f0e9c9537610badbb29bb233571894361",
+      "size": 11395
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/model/GcsState.kt",
+      "sha256": "a10e3d561b916a14dd3de0af2939337a7fe19ccb0ef545179829176f1a88525e",
+      "size": 19614
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ota/OtaUpdateManager.kt",
+      "sha256": "78b8fe86daff85cb0c48c83de3bdb9bcc4026783511123acd2e5445dacd278ae",
+      "size": 60716
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ros/LanDroneScanner.kt",
+      "sha256": "027ad8c443630f96bf6ddf897926f99ab4b777de280164b35eddde67fd969c63",
+      "size": 13744
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ros/RosBridgeClient.kt",
+      "sha256": "342b40352a6a51bf034b03ba9ab47e85112aabd0d050f9b1422937b6fec33855",
+      "size": 25259
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ros/RosTopicInspector.kt",
+      "sha256": "66ddcc081d483212a3c356523f3f8f487658bcc2de6d86b0d597016d0757516d",
+      "size": 86882
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ros/RosTransport.kt",
+      "sha256": "2b3cd1d80881b9eb1341d05623861357f33567b19dbce78557ad75349beead17",
+      "size": 4914
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ros/TcpRosNativeClient.kt",
+      "sha256": "2e167bad3131780de4be10646107e9a31850b81a7622adb52de135e280379d37",
+      "size": 59048
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/AnimHelper.kt",
+      "sha256": "6fbfded487dca8ff8c9c0b970974cd1ed735ecb568cdd9c53201c3a83fa7cd4a",
+      "size": 16384
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/DjiHudWidgets.kt",
+      "sha256": "f295b392e782e7612fc4df1af23f6b2d801653d31a880a05a852fa6d1fa067c0",
+      "size": 25253
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/DroneVectorModel.kt",
+      "sha256": "64c992be393b42783f18775f406e31ef962edef699a4f4f233fe31e8e11505d5",
+      "size": 14632
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/FastHudFormatter.kt",
+      "sha256": "f0aeaef0577e6bd6f5ab7b3c0427dc68f40ab62ea8d22be1bb85a258296a60e9",
+      "size": 10384
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/GcsIcons.kt",
+      "sha256": "2c27145b5e4963ccae25f4ef1d1f67551a2806076a6268a198cad0a983c15f19",
+      "size": 32274
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/GcsSettingsModal.kt",
+      "sha256": "85b3df2f1894b679b31eb3a0c3901da35864a70c624d7aced8eb389f451e72a6",
+      "size": 74728
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/GcsTheme.kt",
+      "sha256": "5f8389b3bcc9a486e41afedd66b46bbdb95de2852ef27e91b39ef97301dfa6dc",
+      "size": 18934
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/GlPointCloudMapView.kt",
+      "sha256": "2a116015944b2b5127bd1e3fff3bf43fd6475142c2b8a0cd72a7421c5e9a6542",
+      "size": 117574
+    },
+    {
+      "path": "app/src/main/java/com/radiomaster/egogcs/ui/UavAttitudeHudView.kt",
+      "sha256": "cd6c0e9a48080a69ac2d3197b112324b67e44b4c0e03b4f587e7174e829c7d3d",
+      "size": 27009
+    },
+    {
+      "path": "app/src/main/res/drawable/ic_launcher_background.xml",
+      "sha256": "52b47ae336c0b67e0306ef0e07ee8ca2879a47ba75470f0b17df793987d50e04",
+      "size": 2326
+    },
+    {
+      "path": "app/src/main/res/drawable/ic_launcher_foreground.xml",
+      "sha256": "525aedb8a7ab8b7edd966f6f367fae3f05df585f92dec49a7d7e93c80efbaa7b",
+      "size": 5868
+    },
+    {
+      "path": "app/src/main/res/drawable/ic_launcher_monochrome.xml",
+      "sha256": "3737fa16a4b81a82fdde420103de181ed92bd7ba28bd646cc2def9c4d182f480",
+      "size": 1256
+    },
+    {
+      "path": "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml",
+      "sha256": "ada31da9e23f4520f3753e71ca23799a107431473daa3774b6cecac26847260c",
+      "size": 344
+    },
+    {
+      "path": "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml",
+      "sha256": "ada31da9e23f4520f3753e71ca23799a107431473daa3774b6cecac26847260c",
+      "size": 344
+    },
+    {
+      "path": "app/src/main/res/mipmap-hdpi/ic_launcher.png",
+      "sha256": "9b68bc388c1abe3178c6d7607d897fdd714f12453fcd51f2c126de8f5500fa08",
+      "size": 12086
+    },
+    {
+      "path": "app/src/main/res/mipmap-hdpi/ic_launcher_round.png",
+      "sha256": "c368cb8fa411031a928383595a7c2eb6beb435abefac9f27d03d3ad265b445e8",
+      "size": 10745
+    },
+    {
+      "path": "app/src/main/res/mipmap-mdpi/ic_launcher.png",
+      "sha256": "c9ef1ef7eb6ba3b846194c8f026baea3bd08fa9855434244ef4cd5d1c90dc40c",
+      "size": 6399
+    },
+    {
+      "path": "app/src/main/res/mipmap-mdpi/ic_launcher_round.png",
+      "sha256": "e61253a5b9e40f07e1062b386f6b56b06334275219ffc4ab7176d468c46944f7",
+      "size": 5889
+    },
+    {
+      "path": "app/src/main/res/mipmap-xhdpi/ic_launcher.png",
+      "sha256": "afc18662ff79bc8ad06a7c7f865145d437f60918f7580f106a91752fb9fbd5a9",
+      "size": 18464
+    },
+    {
+      "path": "app/src/main/res/mipmap-xhdpi/ic_launcher_round.png",
+      "sha256": "4c12348425ccdcfbb339bfa810bc7b8a4cb92bf5fa6570f4d3c46444595221e6",
+      "size": 16258
+    },
+    {
+      "path": "app/src/main/res/mipmap-xxhdpi/ic_launcher.png",
+      "sha256": "ac92005d16488198f785aa7fa3402a3c054ac2d328a2306d18b5992815f1262b",
+      "size": 33020
+    },
+    {
+      "path": "app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png",
+      "sha256": "d946f8c6e4bf9ed66c64e3a2c21b81f3a0e6a23494c9a4f57c9380c6e5bae49c",
+      "size": 29046
+    },
+    {
+      "path": "app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+      "sha256": "599e817a1ebffad2277be9e1772a560f53729b98e6b006e8915d3dab97398dc2",
+      "size": 48811
+    },
+    {
+      "path": "app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png",
+      "sha256": "f71812c860752455fc95100b6232731cbf3dde4b6d49dc6dbd6b7dcb4d513035",
+      "size": 43542
+    },
+    {
+      "path": "app/src/main/res/values-zh/strings.xml",
+      "sha256": "d99cb72975122543f71cc15b0ab7b256ca4c3aef3d58f2a5e1ce402ecced5358",
+      "size": 188
+    },
+    {
+      "path": "app/src/main/res/values/strings.xml",
+      "sha256": "d99cb72975122543f71cc15b0ab7b256ca4c3aef3d58f2a5e1ce402ecced5358",
+      "size": 188
+    },
+    {
+      "path": "app/src/main/res/xml/file_paths.xml",
+      "sha256": "976fd5293c36e6b6d130ae4c718a8c5166f3625d8be9c3f0d66f510945377941",
+      "size": 264
+    },
+    {
+      "path": "build.gradle.kts",
+      "sha256": "48f7c9d13c50fa379dce0a2b7c028bcffe60d428eada35b12cfb8af28b31c962",
+      "size": 142
+    },
+    {
+      "path": "gradle.properties",
+      "sha256": "678c35a27eeda302d6a960484179d118d08fb1edf05c1b40745bc7aed6e88f03",
+      "size": 136
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.properties",
+      "sha256": "712d9bc912d4b0d42b0faf8c6afeed13ae31ced75ca28463b1dfc4ced1a4bc9a",
+      "size": 250
+    },
+    {
+      "path": "settings.gradle.kts",
+      "sha256": "84ce6bc89c37555a8603ce7f9618a582ef197ae60dd04c3ce2f2675cba634b26",
+      "size": 341
+    }
+  ]
+}
