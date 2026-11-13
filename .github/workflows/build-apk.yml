@@ -109,6 +109,8 @@ jobs:
 
   render-scenario-tests:
     runs-on: ubuntu-24.04
+    env:
+      ANDROID_AVD_HOME: ${{ runner.temp }}/gcs-avd
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -127,10 +129,13 @@ jobs:
           set -o pipefail
           "$SDKMANAGER" "platform-tools" "emulator" "platforms;android-34" "build-tools;34.0.0" "system-images;android-28;google_apis;x86_64"
           sudo setfacl -m "u:$(id -un):rw" /dev/kvm
-          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n gcs-api28 -k "system-images;android-28;google_apis;x86_64" --force
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n gcs-api28 -k "system-images;android-28;google_apis;x86_64" --path "$ANDROID_AVD_HOME/gcs-api28.avd" --force
+          test -f "$ANDROID_AVD_HOME/gcs-api28.avd/config.ini"
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-28\n' "$ANDROID_AVD_HOME/gcs-api28.avd" > "$ANDROID_AVD_HOME/gcs-api28.ini"
           nohup "$ANDROID_HOME/emulator/emulator" -avd gcs-api28 -port 5554 -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 -cores 2 > "$RUNNER_TEMP/emulator.log" 2>&1 &
           for attempt in $(seq 1 90); do
-            if [ "$(adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
+            if [ "$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
               exit 0
             fi
             sleep 2
@@ -143,9 +148,9 @@ jobs:
         if: always()
         shell: bash
         run: |
-          adb -s emulator-5554 exec-out run-as com.radiomaster.egogcs cat files/render-benchmark.json > render-benchmark.json || true
+          "$ANDROID_HOME/platform-tools/adb" -s emulator-5554 exec-out run-as com.radiomaster.egogcs cat files/render-benchmark.json > render-benchmark.json || true
           cp "$RUNNER_TEMP/emulator.log" emulator.log || true
-          adb -s emulator-5554 emu kill || true
+          "$ANDROID_HOME/platform-tools/adb" -s emulator-5554 emu kill || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
