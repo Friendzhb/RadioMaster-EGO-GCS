@@ -182,7 +182,7 @@ object SwarmPalette {
 
 /**
  * 单架集群无人机零分配渲染帧槽位 (`SwarmAgentFrame`)：
- * 预分配在四缓冲 `RenderSnapshot` 内，60FPS 渲染循环零 GC。
+ * 预分配在消费者自己的 `RenderSnapshot` 内。
  */
 class SwarmAgentFrame {
     var droneId: Int = 0
@@ -224,10 +224,44 @@ class SwarmAgentFrame {
     var previewSlotY: Float = 0f
     var previewSlotZ: Float = 1.2f
     var previewSlotSafe: Boolean = true
+
+    fun copyFrom(source: SwarmAgentFrame) {
+        droneId = source.droneId
+        online = source.online
+        armed = source.armed
+        uavX = source.uavX
+        uavY = source.uavY
+        uavZ = source.uavZ
+        vx = source.vx
+        vy = source.vy
+        vz = source.vz
+        yaw = source.yaw
+        smoothRoll = source.smoothRoll
+        smoothPitch = source.smoothPitch
+        isTiltRig = source.isTiltRig
+        tiltServo1Rad = source.tiltServo1Rad
+        tiltServo2Rad = source.tiltServo2Rad
+        homeX = source.homeX
+        homeY = source.homeY
+        goalX = source.goalX
+        goalY = source.goalY
+        goalZ = source.goalZ
+        batVolt = source.batVolt
+        batPct = source.batPct
+        fsmState = source.fsmState
+        bsplineCount = source.bsplineCount
+        trailCount = source.trailCount
+        previewSlotX = source.previewSlotX
+        previewSlotY = source.previewSlotY
+        previewSlotZ = source.previewSlotZ
+        previewSlotSafe = source.previewSlotSafe
+        source.bsplinePts.copyInto(bsplinePts)
+        source.trailPts.copyInto(trailPts)
+    }
 }
 
 /**
- * 预分配四缓冲零 GC 渲染帧快照 (Zero-Allocation Quad-Buffered Frame Snapshot)：
+ * 可复用的消费者私有渲染快照：
  * 包含完整三维位置、速度、真实四元数与欧拉角姿态 (Roll / Pitch / Yaw)、多机编队态势及 EGO 三维膨胀体素地图。
  */
 class RenderSnapshot {
@@ -338,10 +372,95 @@ class RenderSnapshot {
     var routeClosedLoop: Boolean = false
 
     val radarSmooth60: FloatArray = FloatArray(60) { 9.5f }
+
+    fun copyFrom(source: RenderSnapshot) {
+        uavX = source.uavX
+        uavY = source.uavY
+        uavZ = source.uavZ
+        vx = source.vx
+        vy = source.vy
+        vz = source.vz
+        ax = source.ax
+        ay = source.ay
+        yaw = source.yaw
+        smoothRoll = source.smoothRoll
+        smoothPitch = source.smoothPitch
+        quatW = source.quatW
+        quatX = source.quatX
+        quatY = source.quatY
+        quatZ = source.quatZ
+        hasLiveAttitudeQuat = source.hasLiveAttitudeQuat
+        activeIsTiltRig = source.activeIsTiltRig
+        tiltServo1Rad = source.tiltServo1Rad
+        tiltServo2Rad = source.tiltServo2Rad
+        tiltServo1RateDegS = source.tiltServo1RateDegS
+        tiltServo2RateDegS = source.tiltServo2RateDegS
+        tiltCmd1Rad = source.tiltCmd1Rad
+        tiltCmd2Rad = source.tiltCmd2Rad
+        tiltManipulability = source.tiltManipulability
+        tiltThrustMarginPct = source.tiltThrustMarginPct
+        tiltServoSaturated = source.tiltServoSaturated
+        hasLiveTiltTelemetry = source.hasLiveTiltTelemetry
+        homeX = source.homeX
+        homeY = source.homeY
+        goalX = source.goalX
+        goalY = source.goalY
+        goalZ = source.goalZ
+        fsmState = source.fsmState
+        px4Mode = source.px4Mode
+        armed = source.armed
+        batVolt = source.batVolt
+        batCurrentAmps = source.batCurrentAmps
+        batPct = source.batPct
+        txBatPct = source.txBatPct
+        txBatVolt = source.txBatVolt
+        txCurrentAmps = source.txCurrentAmps
+        odomHz = source.odomHz
+        cloudHz = source.cloudHz
+        cloudScanPts = source.cloudScanPts
+        mapPointCount = source.mapPointCount
+        solveMs = source.solveMs
+        minClearance = source.minClearance
+        trajLength = source.trajLength
+        hasPreviewPin = source.hasPreviewPin
+        previewX = source.previewX
+        previewY = source.previewY
+        previewZ = source.previewZ
+        previewClearance = source.previewClearance
+        previewSafe = source.previewSafe
+        swarmCount = source.swarmCount
+        activeDroneId = source.activeDroneId
+        swarmCommandAll = source.swarmCommandAll
+        minInterDroneDist = source.minInterDroneDist
+        obsPrimitiveCount = source.obsPrimitiveCount
+        voxelCount = source.voxelCount
+        astarCount = source.astarCount
+        bsplineCount = source.bsplineCount
+        ctrlCount = source.ctrlCount
+        trailCount = source.trailCount
+        lioPathCount = source.lioPathCount
+        waypointQueueCount = source.waypointQueueCount
+        isRouteStagedOnly = source.isRouteStagedOnly
+        stagedRouteArcLen = source.stagedRouteArcLen
+        routeClosedLoop = source.routeClosedLoop
+        source.motorNorm4.copyInto(motorNorm4)
+        source.obsPrimitives.copyInto(obsPrimitives)
+        source.voxels.copyInto(voxels)
+        source.astarPts.copyInto(astarPts)
+        source.bsplinePts.copyInto(bsplinePts)
+        source.ctrlPts.copyInto(ctrlPts)
+        source.trailPts.copyInto(trailPts)
+        source.lioPathPts.copyInto(lioPathPts)
+        source.waypointQueuePts.copyInto(waypointQueuePts)
+        source.radarSmooth60.copyInto(radarSmooth60)
+        for (i in swarmAgents.indices) swarmAgents[i].copyFrom(source.swarmAgents[i])
+    }
 }
 
 data class TopicConfig(
     var protocol: String = "tcpros",
+    var udpTelemetryEnabled: Boolean = false,
+    var udpPort: Int = 14560,
     var masterUri: String = "http://192.168.1.100:11311",
     var wsUrl: String = "ws://192.168.1.100:9090",
     var odomTopic: String = "/Odometry",
@@ -585,5 +704,12 @@ class GcsSharedHub {
 
     @Volatile var otaAutoCheckOnStart: Boolean = true
 
-    @Volatile var latestSnapshot: RenderSnapshot = RenderSnapshot()
+    @Volatile var udpTelemetryStatus: String = "UDP 未启用"
+
+    @Volatile var udpLastOdomMs: Long = 0L
+
+    @Volatile var udpLastCloudMs: Long = 0L
+    fun hasFreshUdpOdometry(nowMs: Long): Boolean = udpLastOdomMs > 0L && nowMs - udpLastOdomMs in 0L until 500L
+
+    val snapshots = SnapshotExchange()
 }

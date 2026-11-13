@@ -29,8 +29,9 @@ android {
         applicationId = "com.radiomaster.egogcs"
         minSdk = 26 // 原生兼容 RadioMaster AX12 (Android 9.0 / API 28)
         targetSdk = 34
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = autoVersionCode
-        versionName = "3.11.6"
+        versionName = "3.12.0"
         resValue("string", "ego_build_stamp", buildUtcStamp)
         resValue("string", "ego_build_epoch_ms", buildEpochMs.toString())
     }
@@ -79,6 +80,9 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
     implementation("androidx.core:core-ktx:1.13.1")
     // Google 官方物理弹簧动画库：提供抽屉阻尼滑出、标签切换与按键回弹 60FPS 物理动效
     implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")

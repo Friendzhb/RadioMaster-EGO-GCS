@@ -1,0 +1,11 @@
+{
+  "comparison": "same renderer, geometry cache off\/on, fixed input and animation clock",
+  "device": "Android SDK built for x86_64",
+  "uncached_cpu_p50_ms": 1.89046,
+  "cached_cpu_p50_ms": 0.36099,
+  "uncached_cpu_p95_ms": 6.35153,
+  "cached_cpu_p95_ms": 0.97067,
+  "cache_hits": 108,
+  "pixel_comparisons": "4 themes x 2 projections, camera pan, changed voxels, core on\/off",
+  "java_heap_growth_after_300_static_frames_bytes": 114688
+}

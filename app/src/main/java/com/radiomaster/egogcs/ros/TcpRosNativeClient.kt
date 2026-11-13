@@ -150,7 +150,9 @@ class TcpRosNativeClient(
                 // 订阅 0 号主机核心感知与建图流
                 droneIndexToHostIp[0] = masterHost
                 launchSubOnce(primaryMasterUri, masterHost, localIp, cfg.odomTopic.trim(), "odom", 0)
-                launchSubOnce(primaryMasterUri, masterHost, localIp, cfg.fastLioCloudTopic.trim(), "fastlio_cloud", 0)
+                if (!cfg.udpTelemetryEnabled) {
+                    launchSubOnce(primaryMasterUri, masterHost, localIp, cfg.fastLioCloudTopic.trim(), "fastlio_cloud", 0)
+                }
                 if (cfg.fastLioPathTopic.isNotBlank() && cfg.fastLioPathTopic.trim() != cfg.optimalTopic.trim()) {
                     launchSubOnce(primaryMasterUri, masterHost, localIp, cfg.fastLioPathTopic.trim(), "fastlio_path", 0)
                 }
@@ -702,6 +704,7 @@ class TcpRosNativeClient(
     }
 
     private fun decodeNativeOdometry(bytes: ByteArray, length: Int, droneId: Int) {
+        if (droneId == 0 && topics.udpTelemetryEnabled && hub.hasFreshUdpOdometry(android.os.SystemClock.elapsedRealtime())) return
         val bb = ByteBuffer.wrap(bytes, 0, length).order(ByteOrder.LITTLE_ENDIAN)
         if (!skipStdHeader(bb)) return
         if (!skipRosString(bb)) return

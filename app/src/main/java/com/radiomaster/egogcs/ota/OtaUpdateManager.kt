@@ -1292,7 +1292,7 @@ class OtaUpdateManager(
     }
 
     private fun isRealDroneArmedInFlight(): Boolean {
-        return hub.isRosMode && hub.rosConnected && hub.latestSnapshot.armed
+        return hub.isRosMode && hub.rosConnected && hub.snapshots.armed
     }
 
     private fun updateProgressState(pct: Int, down: Long, total: Long, speed: Long, msg: String) {

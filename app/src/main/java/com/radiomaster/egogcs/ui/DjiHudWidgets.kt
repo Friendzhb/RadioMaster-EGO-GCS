@@ -11,6 +11,7 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.View
 import com.radiomaster.egogcs.model.GcsSharedHub
+import com.radiomaster.egogcs.model.RenderSnapshot
 import com.radiomaster.egogcs.model.SwarmPalette
 import java.util.Locale
 import kotlin.math.PI
@@ -29,6 +30,8 @@ import kotlin.math.sqrt
  * 零分配、主题自适应 + 实测文字胶囊宽度零裁剪版商业航空全向避障姿态球 (HSI)
  */
 class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(context) {
+
+    private val readSnapshot = RenderSnapshot()
 
     companion object {
         private const val COL_RED = -0x00c4d0 // #FF3B30
@@ -93,7 +96,7 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
     private fun worldToCanvasRad(wAng: Float): Float = -PI.toFloat() * 0.5f - (wAng - curRefYaw)
 
     fun invalidateIfChanged() {
-        val s = hub.latestSnapshot
+        val s = hub.snapshots.readInto(readSnapshot)
         val tid = hub.themeId
         var sum = 0f
         val r = s.radarSmooth60
@@ -169,7 +172,7 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val snap = hub.latestSnapshot
+        val snap = hub.snapshots.readInto(readSnapshot)
         val pal = GcsTheme.of(hub.themeId)
         val cx = width * 0.5f
         val cy = height * 0.5f
@@ -451,6 +454,8 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
  */
 class DjiCompassTapeView(context: Context, private val hub: GcsSharedHub) : View(context) {
 
+    private val readSnapshot = RenderSnapshot()
+
     companion object {
         private val DEG_LABELS = Array(12) { idx ->
             when (val deg = idx * 30) {
@@ -500,7 +505,7 @@ class DjiCompassTapeView(context: Context, private val hub: GcsSharedHub) : View
     private val badgeRect = RectF()
 
     fun invalidateIfChanged() {
-        val s = hub.latestSnapshot
+        val s = hub.snapshots.readInto(readSnapshot)
         val tid = hub.themeId
         val ga = atan2(s.goalY - s.uavY, s.goalX - s.uavX)
         if (tid != lastThemeId || abs(s.yaw - lastYaw) > 0.0025f || abs(ga - lastGoalAng) > 0.01f) {
@@ -513,7 +518,7 @@ class DjiCompassTapeView(context: Context, private val hub: GcsSharedHub) : View
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val snap = hub.latestSnapshot
+        val snap = hub.snapshots.readInto(readSnapshot)
         val pal = GcsTheme.of(hub.themeId)
         val w = width.toFloat()
         val h = height.toFloat()

@@ -23,7 +23,8 @@ interface RosTransport {
 class RosConnectionManager(
     private val hub: GcsSharedHub,
     private val tcpRosTransport: TcpRosNativeClient,
-    private val rosBridgeTransport: RosBridgeClient
+    private val rosBridgeTransport: RosBridgeClient,
+    private val udpTelemetry: RosUdpTelemetryClient
 ) {
     @Volatile var topics: TopicConfig = TopicConfig()
 
@@ -37,6 +38,7 @@ class RosConnectionManager(
         if (topics.protocol == "tcpros") tcpRosTransport else rosBridgeTransport
 
     fun connect(cfg: TopicConfig = topics) {
+        udpTelemetry.connect(cfg)
         topics = cfg.copy()
         tcpRosTransport.topics = topics.copy()
         rosBridgeTransport.topics = topics.copy()
@@ -51,6 +53,7 @@ class RosConnectionManager(
     }
 
     fun disconnectAll(silent: Boolean = false) {
+        udpTelemetry.disconnect()
         pendingParams.clear()
         rosBridgeTransport.disconnect(silent = silent)
         tcpRosTransport.disconnect(silent = silent)
@@ -65,6 +68,10 @@ class RosConnectionManager(
     }
 
     fun updateTopicsAndResubscribe(cfg: TopicConfig) {
+        if (hub.isRosMode && hub.rosConnected && (topics.udpTelemetryEnabled != cfg.udpTelemetryEnabled || topics.udpPort != cfg.udpPort)) {
+            connect(cfg)
+            return
+        }
         topics = cfg.copy()
         tcpRosTransport.topics = topics.copy()
         if (hub.isRosMode && hub.rosConnected) {

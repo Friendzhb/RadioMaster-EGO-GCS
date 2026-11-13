@@ -132,8 +132,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     private val rng = Random()
     private val lock = Any()
 
-    private val snapshotRing = Array(4) { RenderSnapshot() }
-    private var snapshotWriteIdx = 0
+    private val snapshotBuilder = RenderSnapshot()
 
     private var obstacles = mutableListOf<Obstacle>()
     private val distField = FloatArray(GRID_CELLS)
@@ -2596,8 +2595,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     }
 
     private fun publishSnapshotLocked() {
-        snapshotWriteIdx = (snapshotWriteIdx + 1) and 3
-        val frame = snapshotRing[snapshotWriteIdx]
+        val frame = snapshotBuilder
 
         val zMax = hub.zSliceMax
         val showInf = hub.showInflate
@@ -2997,7 +2995,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             frame.quatZ = cr * cp * sy - sr * sp * cy
         }
 
-        hub.latestSnapshot = frame
+        hub.snapshots.publish(frame)
         telemetryRecorder.sampleIfDue(nowElapsed, hub, frame)
     }
 

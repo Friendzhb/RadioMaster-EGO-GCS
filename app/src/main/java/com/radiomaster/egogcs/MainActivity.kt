@@ -24,6 +24,7 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -44,6 +45,7 @@ import com.radiomaster.egogcs.ros.RosBridgeClient
 import com.radiomaster.egogcs.ros.RosConnectionManager
 import com.radiomaster.egogcs.ros.RosTopicEntry
 import com.radiomaster.egogcs.ros.RosTopicInspector
+import com.radiomaster.egogcs.ros.RosUdpTelemetryClient
 import com.radiomaster.egogcs.ros.TcpRosNativeClient
 import com.radiomaster.egogcs.ros.TopicEchoSnapshot
 import com.radiomaster.egogcs.ros.TopicEchoState
@@ -78,6 +80,8 @@ import kotlin.math.sqrt
  * 3. 对标 DJI Pilot 2 / DJI Fly / QGroundControl 的四大核心飞控设置（飞行安全 · 感知与飞控 · 通信链路 · 显示与通用）。
  */
 class MainActivity : Activity() {
+
+    private val readSnapshot = RenderSnapshot()
 
     private val hub = GcsSharedHub()
     private val uiHandler = Handler(Looper.getMainLooper())
@@ -262,6 +266,9 @@ class MainActivity : Activity() {
     private lateinit var wrapWsUrl: LinearLayout
     private lateinit var inpMasterUri: EditText
     private lateinit var inpWsUrl: EditText
+    private lateinit var chkUdpTelemetry: CheckBox
+    private lateinit var inpUdpPort: EditText
+    private lateinit var tvUdpStatus: TextView
     private lateinit var btnExpandTopicMap: TextView
     private lateinit var topicMapAccordionBody: LinearLayout
     private var topicMapExpanded = false
@@ -382,7 +389,7 @@ class MainActivity : Activity() {
         val tcpClient = TcpRosNativeClient(hub, simEngine) { msg ->
             runOnUiThread { AnimHelper.showDjiToast(toastBanner, msg, d) }
         }
-        rosManager = RosConnectionManager(hub, tcpClient, wsClient)
+        rosManager = RosConnectionManager(hub, tcpClient, wsClient, RosUdpTelemetryClient(hub, simEngine))
         topicInspector = RosTopicInspector(hub, rosManager, tcpClient, wsClient)
 
         GcsSettingsModal.loadPersistedSettings(this, hub)
@@ -1233,7 +1240,7 @@ class MainActivity : Activity() {
 
     private fun refreshCommandDockUi(latestPin: EgoSimEngine.PinInspectResult? = null, pulseDock: Boolean = false) {
         val pal = GcsTheme.of(hub.themeId)
-        val snap = hub.latestSnapshot
+        val snap = hub.snapshots.readInto(readSnapshot)
         val hasPin = latestPin != null || simEngine.hasActivePreviewPin()
         val (routeCnt, isStaged, arcLen) = simEngine.routeStatusSummary()
 
@@ -2695,6 +2702,18 @@ class MainActivity : Activity() {
         wrapWsUrl = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         inpWsUrl = labeledInput(wrapWsUrl, "机载 rosbridge WebSocket 地址", cfg.wsUrl)
         directCard.addView(wrapWsUrl)
+        chkUdpTelemetry = CheckBox(this).apply {
+            text = "UDP 点云/位姿（命令保持可靠链路）"
+            isChecked = cfg.udpTelemetryEnabled
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
+            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+        }
+        directCard.addView(chkUdpTelemetry)
+        inpUdpPort = labeledInput(directCard, "本机 UDP 接收端口（需机载 ROS→UDP 桥）", cfg.udpPort.toString()).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+        tvUdpStatus = monoLabel(hub.udpTelemetryStatus, "#AAB6C7", 9.4f, Role.TEXT_MUTED)
+        directCard.addView(tvUdpStatus)
 
         val actRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val btnConn = TextView(this).apply {
@@ -2709,8 +2728,7 @@ class MainActivity : Activity() {
             GcsIcons.bind(this, Type.LINK, "立即连接机载 ROS1", d, iconDp = 12f)
             setOnClickListener {
                 hideSoftKeyboard()
-                saveCurrentTopics(quiet = true)
-                connectWithConfig(rosManager.topics)
+                if (saveCurrentTopics(quiet = true, refreshLink = false)) connectWithConfig(rosManager.topics)
             }
         }
         AnimHelper.attachSpringTouch(btnConn)
@@ -4210,6 +4228,9 @@ class MainActivity : Activity() {
     }
 
     private fun updateHudReadouts(s: RenderSnapshot) {
+        if (::tvUdpStatus.isInitialized && drawerOpen && activeTabIndex == TAB_CONN) {
+            setTextIfChanged(tvUdpStatus, hub.udpTelemetryStatus)
+        }
         hsiView.invalidateIfChanged()
         compassView.invalidateIfChanged()
         if (!drawerOpen && attitudeHudView.visibility == View.VISIBLE) {
@@ -4438,6 +4459,8 @@ class MainActivity : Activity() {
         val sp = getSharedPreferences(GcsSettingsModal.PREFS_NAME, Context.MODE_PRIVATE)
         val cfg = TopicConfig(
             protocol = sp.getString("protocol", "tcpros") ?: "tcpros",
+            udpTelemetryEnabled = sp.getBoolean("udpTelemetryEnabled", false),
+            udpPort = sp.getInt("udpPort", 14560).let { if (it in 1024..65535 && it != 14550) it else 14560 },
             masterUri = sp.getString("masterUri", "http://192.168.1.100:11311") ?: "http://192.168.1.100:11311",
             wsUrl = sp.getString("wsUrl", "ws://192.168.1.100:9090") ?: "ws://192.168.1.100:9090",
             odomTopic = sp.getString("odom", "/Odometry") ?: "/Odometry",
@@ -4466,8 +4489,14 @@ class MainActivity : Activity() {
         rosManager.topics = cfg
     }
 
-    private fun saveCurrentTopics(quiet: Boolean) {
+    private fun saveCurrentTopics(quiet: Boolean, refreshLink: Boolean = true): Boolean {
         val cur = rosManager.topics
+        val udpEnabled = if (::chkUdpTelemetry.isInitialized) chkUdpTelemetry.isChecked else cur.udpTelemetryEnabled
+        val udpPort = if (::inpUdpPort.isInitialized) inpUdpPort.text.toString().toIntOrNull() else cur.udpPort
+        if (udpPort == null || udpPort !in 1024..65535 || udpPort == 14550) {
+            AnimHelper.showDjiToast(toastBanner, "UDP 端口需为1024–65535，且不能占用14550", d)
+            return false
+        }
         val peerCsv = if (::inpSwarmPeerIps.isInitialized) inpSwarmPeerIps.text.toString().trim() else cur.swarmPeerIpsCsv
         val odPat = if (::inpSwarmOdomPat.isInitialized) inpSwarmOdomPat.text.toString().trim() else cur.swarmOdomPattern
         val opPat = if (::inpSwarmOptPat.isInitialized) inpSwarmOptPat.text.toString().trim() else cur.swarmOptimalPattern
@@ -4479,6 +4508,8 @@ class MainActivity : Activity() {
 
         val cfg = TopicConfig(
             protocol = cur.protocol,
+            udpTelemetryEnabled = udpEnabled,
+            udpPort = udpPort,
             masterUri = inpMasterUri.text.toString().trim(),
             wsUrl = inpWsUrl.text.toString().trim(),
             odomTopic = inpOdom.text.toString().trim(),
@@ -4498,6 +4529,8 @@ class MainActivity : Activity() {
             swarmTiltCmdPattern = swTiltPub.ifBlank { "/drone_{id}_active_pitch_planner/pitch_tilt_cmd" }
         )
         getSharedPreferences(GcsSettingsModal.PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putBoolean("udpTelemetryEnabled", cfg.udpTelemetryEnabled)
+            .putInt("udpPort", cfg.udpPort)
             .putString("protocol", cfg.protocol)
             .putString("masterUri", cfg.masterUri)
             .putString("wsUrl", cfg.wsUrl)
@@ -4517,8 +4550,9 @@ class MainActivity : Activity() {
             .putString("swarmTiltSubPattern", cfg.swarmTiltSubPattern)
             .putString("swarmTiltCmdPattern", cfg.swarmTiltCmdPattern)
             .apply()
-        rosManager.updateTopicsAndResubscribe(cfg)
+        if (refreshLink) rosManager.updateTopicsAndResubscribe(cfg) else rosManager.topics = cfg
         if (!quiet) AnimHelper.showDjiToast(toastBanner, "话题与多机拓扑配置已保存生效", d)
+        return true
     }
 
     // ==================== 多机集群协同编队座舱栏与抽屉控制组件 ====================

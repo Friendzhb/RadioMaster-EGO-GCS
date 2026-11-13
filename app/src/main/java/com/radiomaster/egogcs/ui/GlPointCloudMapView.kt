@@ -6,7 +6,7 @@ import android.content.Context
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
-import android.os.SystemClock
+import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -54,7 +54,8 @@ class GlPointCloudMapView(
     private val onInterceptDrawerClose: () -> Boolean,
     private val onSingleTapPreviewPin: (wx: Float, wy: Float) -> Unit,
     private val onLongPressQuickFly: (wx: Float, wy: Float) -> Unit,
-    private val onFollowStateChanged: (followMode: Int, toastMsg: String?) -> Unit
+    private val onFollowStateChanged: (followMode: Int, toastMsg: String?) -> Unit,
+    private val animationTimeNanos: () -> Long = System::nanoTime
 ) : GLSurfaceView(context), GLSurfaceView.Renderer {
 
     companion object {
@@ -420,7 +421,6 @@ class GlPointCloudMapView(
     private var viewportW = 1
     private var viewportH = 1
     private var lastFrameNs = System.nanoTime()
-    private var hudSyncAcc = 0f
     private var fpsFrameCount = 0
     private var fpsTimeAcc = 0f
 
@@ -564,8 +564,41 @@ class GlPointCloudMapView(
     private var vboActorLineId = 0
     private var vboActorTriId = 0
 
-    private val uiTickRunnable = Runnable {
-        onHudTick(hub.latestSnapshot)
+    private val gridKey = GeometryKey(16)
+    private val voxelKey = GeometryKey(4096 * 4 + 64)
+    private var gridCacheHit = false
+    private var voxelCacheHit = false
+    private var cachedGridVerts = 0
+    private val cachedVoxelCounts = IntArray(4)
+    private val cachedVoxelShadows = FloatArray(MAX_FX_TRI_VERTS * FLOATS_PER_VERT)
+    private var cachedVoxelShadowVerts = 0
+    private var cachedDroneBlocked = false
+    private var previousHadCore = false
+    private var vboStaticGridId = 0
+
+    private val glSnapshot = RenderSnapshot()
+    private val uiSnapshot = RenderSnapshot()
+
+    val renderMetrics = RenderMetrics()
+    internal var geometryCachingEnabled = true
+    private val renderPending = PendingRender()
+    private val framePacer = FramePacer()
+    private val hudPacer = FramePacer()
+    private var loopRunning = false
+    private var lastAnimationNs = 0L
+
+    @Volatile private var resetFrameClock = true
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!loopRunning) return
+            if (framePacer.due(frameTimeNanos, if (hub.perfMode == 2) 30 else 60) && renderPending.request()) {
+                requestRender()
+            }
+            if (hudPacer.due(frameTimeNanos, if (hub.perfMode == 2) 7 else 10)) {
+                onHudTick(hub.snapshots.readInto(uiSnapshot))
+            }
+            if (loopRunning) Choreographer.getInstance().postFrameCallback(this)
+        }
     }
 
     private val scaleDetector = ScaleGestureDetector(
@@ -587,7 +620,7 @@ class GlPointCloudMapView(
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
                 if (e2.pointerCount >= 2) {
                     if (followMode != 0) {
-                        val s = hub.latestSnapshot
+                        val s = hub.snapshots.readInto(uiSnapshot)
                         camPanX = s.uavX
                         camPanY = s.uavY
                         followMode = 0
@@ -610,7 +643,7 @@ class GlPointCloudMapView(
                     camPitchDesired = (camPitchDesired + distanceY * 0.0062f / density * 1.6f).coerceIn(0.18f, 1.44f)
                 } else {
                     if (!is3DMode && followMode != 0 && hypot(distanceX, distanceY) > 6f * density) {
-                        val s = hub.latestSnapshot
+                        val s = hub.snapshots.readInto(uiSnapshot)
                         camPanX = s.uavX
                         camPanY = s.uavY
                         followMode = 0
@@ -673,7 +706,7 @@ class GlPointCloudMapView(
         setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         preserveEGLContextOnPause = true
         setRenderer(this)
-        renderMode = RENDERMODE_CONTINUOUSLY
+        renderMode = RENDERMODE_WHEN_DIRTY
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -688,11 +721,26 @@ class GlPointCloudMapView(
     }
 
     fun startLoop() {
+        if (loopRunning) return
+        loopRunning = true
+        resetFrameClock = true
+        framePacer.reset()
+        hudPacer.reset()
         onResume()
+        Choreographer.getInstance().postFrameCallback(frameCallback)
     }
 
     fun stopLoop() {
+        if (!loopRunning) return
+        loopRunning = false
+        Choreographer.getInstance().removeFrameCallback(frameCallback)
         onPause()
+        renderPending.complete()
+    }
+
+    override fun onDetachedFromWindow() {
+        stopLoop()
+        super.onDetachedFromWindow()
     }
 
     fun triggerPinSpringAnim() {
@@ -738,7 +786,7 @@ class GlPointCloudMapView(
                 2
             }
             2 -> {
-                val s = hub.latestSnapshot
+                val s = hub.snapshots.readInto(uiSnapshot)
                 camPanX = s.uavX
                 camPanY = s.uavY
                 0
@@ -910,8 +958,8 @@ class GlPointCloudMapView(
         aOccColor = GLES20.glGetAttribLocation(progOccluded, "aColor")
         aOccArc = GLES20.glGetAttribLocation(progOccluded, "aArc")
 
-        val bufs = IntArray(9)
-        GLES20.glGenBuffers(9, bufs, 0)
+        val bufs = IntArray(10)
+        GLES20.glGenBuffers(10, bufs, 0)
         vboCloudId = bufs[0]
         vboGroundLineId = bufs[1]
         vboSolidTriId = bufs[2]
@@ -921,6 +969,9 @@ class GlPointCloudMapView(
         vboFxTriId = bufs[6]
         vboActorLineId = bufs[7]
         vboActorTriId = bufs[8]
+        vboStaticGridId = bufs[9]
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboStaticGridId)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, 128 * STRIDE_VERT, null, GLES20.GL_STATIC_DRAW)
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboCloudId)
         GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, FastLioVoxelMap.MAX_POINTS * FastLioVoxelMap.BYTES_PER_VERTEX, null, GLES20.GL_DYNAMIC_DRAW)
@@ -951,7 +1002,9 @@ class GlPointCloudMapView(
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
         voxelMap.notifyGlContextRecreated()
-        lastFrameNs = System.nanoTime()
+        gridKey.invalidate()
+        voxelKey.invalidate()
+        resetFrameClock = true
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -962,140 +1015,141 @@ class GlPointCloudMapView(
 
     override fun onDrawFrame(gl: GL10?) {
         val frameStartNs = System.nanoTime()
-        val rawDt = (frameStartNs - lastFrameNs) * 1e-9f
-        val dt = rawDt.coerceIn(0.001f, 0.05f)
+        val animationNs = animationTimeNanos()
+        val rawDt = if (resetFrameClock) 1f / 60f else (frameStartNs - lastFrameNs) * 1e-9f
+        val dt = if (resetFrameClock) 1f / 60f else ((animationNs - lastAnimationNs) * 1e-9f).coerceIn(0f, 0.05f)
+        resetFrameClock = false
         lastFrameNs = frameStartNs
+        lastAnimationNs = animationNs
         shaderClockSec = (shaderClockSec + dt) % 3600f
-
-        fpsFrameCount++
-        fpsTimeAcc += rawDt
-        if (fpsTimeAcc >= 0.5f) {
-            hub.renderFps = (fpsFrameCount / fpsTimeAcc).roundToInt().coerceIn(1, 120)
-            fpsFrameCount = 0
-            fpsTimeAcc = 0f
-        }
-
-        val snap = hub.latestSnapshot
-        stepThemeAtmosphereBlend(dt)
-        updateCameraMatrices(dt, snap)
-
-        GLES20.glClearColor(curSkyFlat[0], curSkyFlat[1], curSkyFlat[2], 1.0f)
-        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-
-        // Pass 0: 3D 天际大气渐变穹顶
-        drawSkyDomePass()
-
-        groundLineVerts = 0
-        solidObsTriVerts = 0
-        solidObsEdgeVerts = 0
-        glassObsTriVerts = 0
-        glassObsEdgeVerts = 0
-        fxAlphaTriVerts = 0
-        actorLineVerts = 0
-        actorTriVerts = 0
-
-        buildSceneBatches(dt, snap)
-
-        val zFlat = 0.08f + 0.92f * projBlend
-
-        // Pass 1: 透视地面网格与同心测距环 (开启混合，不写深度)
-        GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-        GLES20.glDepthFunc(GLES20.GL_LEQUAL)
-        GLES20.glDepthMask(false)
-        GLES20.glEnable(GLES20.GL_BLEND)
-        flushEnvLines(vboGroundLineId, groundLineArray, groundLineVerts, max(1f, 1.12f * density))
-
-        // Pass 2: 100% 纯不透明实体膨胀体素与 4x4 Bayer 消隐点云 (关闭实体三角形混合，彻底杜绝地面网格穿透实体障碍)
-        GLES20.glDepthMask(true)
-        GLES20.glDisable(GLES20.GL_BLEND)
-        flushEnvTriangles(vboSolidTriId, solidObsTriArray, solidObsTriVerts)
-
-        GLES20.glEnable(GLES20.GL_BLEND)
-        flushEnvLines(vboSolidEdgeId, solidObsEdgeArray, solidObsEdgeVerts, max(1f, 1.0f * density))
-
-        val cloudVerts = voxelMap.syncToGpuVbo(vboCloudId)
-        val pMode = hub.perfMode
-        val drawCloudCnt = if (pMode == 2) min(cloudVerts, 90_000) else cloudVerts
-        if (hub.showFastLioMap && drawCloudCnt > 0) {
-            GLES20.glUseProgram(progCloud)
-            GLES20.glUniformMatrix4fv(uCloudMvp, 1, false, vpMatrix, 0)
-            GLES20.glUniform1f(uCloudZMax, hub.zSliceMax)
-            val fovScale = (viewportH / 720f).coerceAtLeast(0.75f) * 34.0f * hub.pointSizeScale * density
-            GLES20.glUniform1f(uCloudPointScale, fovScale * (0.35f + 0.65f * projBlend))
-            GLES20.glUniform1f(uCloudZFlatten, zFlat)
-            GLES20.glUniform1i(uCloudColorMode, hub.pointColorMode)
-            GLES20.glUniform3f(uCloudEyePos, curEyeX, curEyeY, curEyeZ)
-            GLES20.glUniform3f(uCloudDronePos, snap.uavX, snap.uavY, snap.uavZ * zFlat)
-            GLES20.glUniform3f(uCloudAheadPos, curAheadX, curAheadY, curAheadZ)
-            GLES20.glUniform1f(uCloudInnerR, curCutInnerR)
-            GLES20.glUniform1f(uCloudOuterR, curCutOuterR)
-            GLES20.glUniform1f(uCloudFogSpan, worldHalfSpan * 2.2f)
-            GLES20.glUniform1i(uCloudXrayOn, if (hub.xrayOcclusionEnabled && projBlend > 0.12f) 1 else 0)
-            GLES20.glUniform3f(uCloudFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
-
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboCloudId)
-            GLES20.glEnableVertexAttribArray(aCloudPos)
-            GLES20.glVertexAttribPointer(aCloudPos, 3, GLES20.GL_FLOAT, false, FastLioVoxelMap.BYTES_PER_VERTEX, 0)
-            GLES20.glEnableVertexAttribArray(aCloudMeta)
-            GLES20.glVertexAttribPointer(aCloudMeta, 1, GLES20.GL_FLOAT, false, FastLioVoxelMap.BYTES_PER_VERTEX, 12)
-
-            GLES20.glDrawArrays(GLES20.GL_POINTS, 0, drawCloudCnt)
-
-            GLES20.glDisableVertexAttribArray(aCloudPos)
-            GLES20.glDisableVertexAttribArray(aCloudMeta)
-        }
-
-        uploadActorVbos()
-
-        // Pass 3: 前景实体无人机与规划航线遍 (在半透明遮挡体素之前绘制！确保随后透镜外壳按真实物理顺序覆盖在其前方)
-        GLES20.glDepthFunc(GLES20.GL_LEQUAL)
-        GLES20.glDepthMask(true)
-        drawActorBatchesVisible(max(1.2f, 1.5f * density))
-
-        // Pass 4: 视线走廊遮挡体素「单层外表皮深度预通透镜」(Single-Skin Depth-Prepass Cutaway Lens)
-        // 4a: 静默深度预通 (仅写最近外表面 Z 值，零颜色输出) -> 4b: GL_EQUAL 单层外皮逐像素平滑消隐 (100% 消除内部共享乱面与多层叠加混浊！)
-        if (glassObsTriVerts > 0) {
-            drawCutawaySingleSkinVolume()
-            if (glassObsEdgeVerts > 0) {
-                GLES20.glDepthFunc(GLES20.GL_LEQUAL)
-                GLES20.glDepthMask(false)
-                flushEnvLines(vboGlassEdgeId, glassObsEdgeArray, glassObsEdgeVerts, max(1.0f, 1.15f * density))
+        try {
+            fpsFrameCount++
+            fpsTimeAcc += rawDt
+            if (fpsTimeAcc >= 0.5f) {
+                hub.renderFps = (fpsFrameCount / fpsTimeAcc).roundToInt().coerceIn(1, 120)
+                fpsFrameCount = 0
+                fpsTimeAcc = 0f
             }
-        }
 
-        // Pass 5: 硬件深度逆测试 GL_GREATER 遮挡 X-Ray 增强遍 (对任何处于实体墙或透视薄壳后方的轨迹叠加双色抗锯齿流动虚线！)
-        if (hub.xrayOcclusionEnabled && projBlend > 0.12f) {
-            GLES20.glDepthFunc(GLES20.GL_GREATER)
+            val snap = hub.snapshots.readInto(glSnapshot)
+            stepThemeAtmosphereBlend(dt)
+            updateCameraMatrices(dt, snap)
+
+            GLES20.glClearColor(curSkyFlat[0], curSkyFlat[1], curSkyFlat[2], 1.0f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+
+            // Pass 0: 3D 天际大气渐变穹顶
+            drawSkyDomePass()
+
+            groundLineVerts = 0
+            solidObsTriVerts = 0
+            solidObsEdgeVerts = 0
+            glassObsTriVerts = 0
+            glassObsEdgeVerts = 0
+            fxAlphaTriVerts = 0
+            actorLineVerts = 0
+            actorTriVerts = 0
+
+            buildSceneBatches(dt, snap)
+
+            val zFlat = 0.08f + 0.92f * projBlend
+
+            // Pass 1: 透视地面网格与同心测距环 (开启混合，不写深度)
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+            GLES20.glDepthFunc(GLES20.GL_LEQUAL)
             GLES20.glDepthMask(false)
-            drawActorBatchesOccluded(max(1.25f, 1.55f * density))
-        }
+            GLES20.glEnable(GLES20.GL_BLEND)
+            flushEnvLines(vboStaticGridId, groundLineArray, cachedGridVerts, max(1f, 1.12f * density), upload = !gridCacheHit)
+            flushEnvLines(vboGroundLineId, groundLineArray, groundLineVerts - cachedGridVerts, max(1f, 1.12f * density), sourceOffset = cachedGridVerts)
 
-        // Pass 6: 半透明高程垂幕、接地阴影与触控波纹
-        GLES20.glDepthFunc(GLES20.GL_LEQUAL)
-        GLES20.glDepthMask(false)
-        flushEnvTriangles(vboFxTriId, fxAlphaTriArray, fxAlphaTriVerts)
+            // Pass 2: 100% 纯不透明实体膨胀体素与 4x4 Bayer 消隐点云 (关闭实体三角形混合，彻底杜绝地面网格穿透实体障碍)
+            GLES20.glDepthMask(true)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            flushEnvTriangles(vboSolidTriId, solidObsTriArray, solidObsTriVerts, upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
 
-        GLES20.glDepthMask(true)
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+            GLES20.glEnable(GLES20.GL_BLEND)
+            flushEnvLines(vboSolidEdgeId, solidObsEdgeArray, solidObsEdgeVerts, max(1f, 1.0f * density), upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
 
-        val hudInterval = if (pMode == 2) 0.140f else 0.095f
-        hudSyncAcc += dt
-        if (hudSyncAcc >= hudInterval) {
-            hudSyncAcc = 0f
-            post(uiTickRunnable)
-        }
+            val cloudVerts = voxelMap.syncToGpuVbo(vboCloudId)
+            val pMode = hub.perfMode
+            val drawCloudCnt = if (pMode == 2) min(cloudVerts, 90_000) else cloudVerts
+            if (hub.showFastLioMap && drawCloudCnt > 0) {
+                GLES20.glUseProgram(progCloud)
+                GLES20.glUniformMatrix4fv(uCloudMvp, 1, false, vpMatrix, 0)
+                GLES20.glUniform1f(uCloudZMax, hub.zSliceMax)
+                val fovScale = (viewportH / 720f).coerceAtLeast(0.75f) * 34.0f * hub.pointSizeScale * density
+                GLES20.glUniform1f(uCloudPointScale, fovScale * (0.35f + 0.65f * projBlend))
+                GLES20.glUniform1f(uCloudZFlatten, zFlat)
+                GLES20.glUniform1i(uCloudColorMode, hub.pointColorMode)
+                GLES20.glUniform3f(uCloudEyePos, curEyeX, curEyeY, curEyeZ)
+                GLES20.glUniform3f(uCloudDronePos, snap.uavX, snap.uavY, snap.uavZ * zFlat)
+                GLES20.glUniform3f(uCloudAheadPos, curAheadX, curAheadY, curAheadZ)
+                GLES20.glUniform1f(uCloudInnerR, curCutInnerR)
+                GLES20.glUniform1f(uCloudOuterR, curCutOuterR)
+                GLES20.glUniform1f(uCloudFogSpan, worldHalfSpan * 2.2f)
+                GLES20.glUniform1i(uCloudXrayOn, if (hub.xrayOcclusionEnabled && projBlend > 0.12f) 1 else 0)
+                GLES20.glUniform3f(uCloudFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
 
-        val workMs = ((System.nanoTime() - frameStartNs) * 1e-6f).coerceIn(0.05f, 50f)
-        hub.frameRenderMs += (workMs - hub.frameRenderMs) * 0.16f
-        if (pMode == 2 && workMs < 29.5f) {
-            SystemClock.sleep((31.0f - workMs).toLong().coerceIn(1L, 18L))
+                GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboCloudId)
+                GLES20.glEnableVertexAttribArray(aCloudPos)
+                GLES20.glVertexAttribPointer(aCloudPos, 3, GLES20.GL_FLOAT, false, FastLioVoxelMap.BYTES_PER_VERTEX, 0)
+                GLES20.glEnableVertexAttribArray(aCloudMeta)
+                GLES20.glVertexAttribPointer(aCloudMeta, 1, GLES20.GL_FLOAT, false, FastLioVoxelMap.BYTES_PER_VERTEX, 12)
+
+                GLES20.glDrawArrays(GLES20.GL_POINTS, 0, drawCloudCnt)
+
+                GLES20.glDisableVertexAttribArray(aCloudPos)
+                GLES20.glDisableVertexAttribArray(aCloudMeta)
+            }
+
+            uploadActorVbos()
+
+            // Pass 3: 前景实体无人机与规划航线遍 (在半透明遮挡体素之前绘制！确保随后透镜外壳按真实物理顺序覆盖在其前方)
+            GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+            GLES20.glDepthMask(true)
+            drawActorBatchesVisible(max(1.2f, 1.5f * density))
+
+            // Pass 4: 视线走廊遮挡体素「单层外表皮深度预通透镜」(Single-Skin Depth-Prepass Cutaway Lens)
+            // 4a: 静默深度预通 (仅写最近外表面 Z 值，零颜色输出) -> 4b: GL_EQUAL 单层外皮逐像素平滑消隐 (100% 消除内部共享乱面与多层叠加混浊！)
+            if (glassObsTriVerts > 0) {
+                drawCutawaySingleSkinVolume()
+                if (glassObsEdgeVerts > 0) {
+                    GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+                    GLES20.glDepthMask(false)
+                    flushEnvLines(vboGlassEdgeId, glassObsEdgeArray, glassObsEdgeVerts, max(1.0f, 1.15f * density), upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
+                }
+            }
+
+            // Pass 5: 硬件深度逆测试 GL_GREATER 遮挡 X-Ray 增强遍 (对任何处于实体墙或透视薄壳后方的轨迹叠加双色抗锯齿流动虚线！)
+            if (hub.xrayOcclusionEnabled && projBlend > 0.12f) {
+                GLES20.glDepthFunc(GLES20.GL_GREATER)
+                GLES20.glDepthMask(false)
+                drawActorBatchesOccluded(max(1.25f, 1.55f * density))
+            }
+
+            // Pass 6: 半透明高程垂幕、接地阴影与触控波纹
+            GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+            GLES20.glDepthMask(false)
+            flushEnvTriangles(vboFxTriId, fxAlphaTriArray, fxAlphaTriVerts)
+
+            GLES20.glDepthMask(true)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+
+            val workNs = System.nanoTime() - frameStartNs
+            val workMs = workNs * 1e-6f
+            hub.frameRenderMs += (workMs - hub.frameRenderMs) * 0.16f
+            renderMetrics.record(workNs, voxelMap.uploadedPointsLastFrame, voxelCacheHit)
+        } finally {
+            renderPending.complete()
         }
     }
 
     private fun drawCutawaySingleSkinVolume() {
-        envTriBuf.clear()
-        envTriBuf.put(glassObsTriArray, 0, glassObsTriVerts * FLOATS_PER_VERT)
-        envTriBuf.position(0)
+        if (!voxelCacheHit || glSnapshot.obsPrimitiveCount > 0) {
+            envTriBuf.clear()
+            envTriBuf.put(glassObsTriArray, 0, glassObsTriVerts * FLOATS_PER_VERT)
+            envTriBuf.position(0)
+        }
 
         GLES20.glUseProgram(progCutaway)
         GLES20.glUniformMatrix4fv(uCutMvp, 1, false, vpMatrix, 0)
@@ -1111,7 +1165,9 @@ class GlPointCloudMapView(
         GLES20.glUniform3f(uCutFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboGlassTriId)
-        GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, glassObsTriVerts * STRIDE_VERT, envTriBuf)
+        if (!voxelCacheHit || glSnapshot.obsPrimitiveCount > 0) {
+            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, glassObsTriVerts * STRIDE_VERT, envTriBuf)
+        }
 
         GLES20.glEnableVertexAttribArray(aCutPos)
         GLES20.glVertexAttribPointer(aCutPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
@@ -1354,27 +1410,43 @@ class GlPointCloudMapView(
         val zScale = 0.08f + 0.92f * b
         val uavScaledZ = snap.uavZ * zScale
 
-        // 1. 透视地面网格与世界原点三维 XYZ 参考轴
-        if (hub.showGroundGrid) {
-            val anchorX = floor(camFocusX / 4f) * 4f
-            val anchorY = floor(camFocusY / 4f) * 4f
-            val halfGrid = 14
-            for (g in -halfGrid..halfGrid) {
-                val gx = anchorX + g
-                val gy = anchorY + g
-                val majorX = (abs(gx.toInt()) % 4 == 0)
-                val majorY = (abs(gy.toInt()) % 4 == 0)
-                val fade = (1f - (abs(g) / 15.0f) * (abs(g) / 15.0f)).coerceAtLeast(0.12f)
-                val aX = (if (majorX) curGridMajorAlpha else curGridMinorAlpha) * fade
-                val aY = (if (majorY) curGridMajorAlpha else curGridMinorAlpha) * fade
-                pushGroundLine(gx, anchorY - halfGrid, 0f, gx, anchorY + halfGrid, 0f, curGridRgb[0], curGridRgb[1], curGridRgb[2], aX)
-                pushGroundLine(anchorX - halfGrid, gy, 0f, anchorX + halfGrid, gy, 0f, curGridRgb[0], curGridRgb[1], curGridRgb[2], aY)
+        gridKey.begin()
+        gridKey.add(if (hub.showGroundGrid) 1f else 0f)
+        gridKey.add(floor(camFocusX / 4f) * 4f)
+        gridKey.add(floor(camFocusY / 4f) * 4f)
+        gridKey.add(b)
+        gridKey.add(curGridRgb)
+        gridKey.add(curGridMajorAlpha)
+        gridKey.add(curGridMinorAlpha)
+        gridCacheHit = geometryCachingEnabled && gridKey.unchanged()
+        if (gridCacheHit) {
+            groundLineVerts = cachedGridVerts
+        } else {
+            // 1. 透视地面网格与世界原点三维 XYZ 参考轴
+            if (hub.showGroundGrid) {
+                val anchorX = floor(camFocusX / 4f) * 4f
+                val anchorY = floor(camFocusY / 4f) * 4f
+                val halfGrid = 14
+                for (g in -halfGrid..halfGrid) {
+                    val gx = anchorX + g
+                    val gy = anchorY + g
+                    val majorX = (abs(gx.toInt()) % 4 == 0)
+                    val majorY = (abs(gy.toInt()) % 4 == 0)
+                    val fade = (1f - (abs(g) / 15.0f) * (abs(g) / 15.0f)).coerceAtLeast(0.12f)
+                    val aX = (if (majorX) curGridMajorAlpha else curGridMinorAlpha) * fade
+                    val aY = (if (majorY) curGridMajorAlpha else curGridMinorAlpha) * fade
+                    pushGroundLine(gx, anchorY - halfGrid, 0f, gx, anchorY + halfGrid, 0f, curGridRgb[0], curGridRgb[1], curGridRgb[2], aX)
+                    pushGroundLine(anchorX - halfGrid, gy, 0f, anchorX + halfGrid, gy, 0f, curGridRgb[0], curGridRgb[1], curGridRgb[2], aY)
+                }
+                pushGroundLine(0f, 0f, 0.008f, 1.1f, 0f, 0.008f, 1.0f, 0.30f, 0.28f, 0.65f)
+                pushGroundLine(0f, 0f, 0.008f, 0f, 1.1f, 0.008f, 0.15f, 0.92f, 0.50f, 0.65f)
+                if (b > 0.05f) {
+                    pushGroundLine(0f, 0f, 0.008f, 0f, 0f, 1.1f * zScale, 0.25f, 0.68f, 1.0f, 0.65f * b)
+                }
             }
-            pushGroundLine(0f, 0f, 0.008f, 1.1f, 0f, 0.008f, 1.0f, 0.30f, 0.28f, 0.65f)
-            pushGroundLine(0f, 0f, 0.008f, 0f, 1.1f, 0.008f, 0.15f, 0.92f, 0.50f, 0.65f)
-            if (b > 0.05f) {
-                pushGroundLine(0f, 0f, 0.008f, 0f, 0f, 1.1f * zScale, 0.25f, 0.68f, 1.0f, 0.65f * b)
-            }
+
+            cachedGridVerts = groundLineVerts
+            gridKey.commit()
         }
 
         if (snap.swarmCount > 1) {
@@ -1453,112 +1525,158 @@ class GlPointCloudMapView(
         curCutInnerR = 0.58f + spanFactor * 0.45f
         curCutOuterR = 1.55f + spanFactor * 0.85f
 
-        // 2. EGO-Planner 三维膨胀体素地图：分离纯不透明远景批 (`solidObs`) 与外皮透镜消隐批 (`glassObs`)
-        val vCnt = snap.voxelCount
-        if (hub.showInflate && vCnt > 0) {
-            val cullSpan = worldHalfSpan * 2.9f + 4.5f
-            val vArr = snap.voxels
-            val zMax = hub.zSliceMax
-            val pMode = hub.perfMode
-            val lodNearSq = if (pMode == 2) 49.0f else 90.25f
-            val maxVoxBudget = when (pMode) {
-                1 -> 4096
-                2 -> 1400
-                else -> 2800
-            }
-            val farStride = if (vCnt > maxVoxBudget) max(1, (vCnt + maxVoxBudget - 1) / maxVoxBudget) else 1
+        voxelKey.begin()
+        voxelKey.add(snap.voxels, snap.voxelCount * 4)
+        voxelKey.add(if (hub.showInflate) 1f else 0f)
+        voxelKey.add(hub.zSliceMax)
+        voxelKey.add(hub.perfMode.toFloat())
+        voxelKey.add(if (xrayActive) 1f else 0f)
+        voxelKey.add(b)
+        voxelKey.add(worldHalfSpan)
+        voxelKey.add(camFocusX)
+        voxelKey.add(camFocusY)
+        voxelKey.add(curEyeX)
+        voxelKey.add(curEyeY)
+        voxelKey.add(curEyeZ)
+        voxelKey.add(curSegDroneX)
+        voxelKey.add(curSegDroneY)
+        voxelKey.add(curSegDroneZ)
+        voxelKey.add(curInvDroneLen2)
+        voxelKey.add(curSegAheadX)
+        voxelKey.add(curSegAheadY)
+        voxelKey.add(curSegAheadZ)
+        voxelKey.add(curInvAheadLen2)
+        voxelKey.add(curCutOuterR)
+        voxelKey.add(vpMatrix)
+        voxelKey.add(fxAlphaTriVerts.toFloat())
+        voxelCacheHit = geometryCachingEnabled && voxelKey.unchanged() && !previousHadCore
+        previousHadCore = snap.obsPrimitiveCount > 0
+        if (voxelCacheHit) {
+            solidObsTriVerts = cachedVoxelCounts[0]
+            solidObsEdgeVerts = cachedVoxelCounts[1]
+            glassObsTriVerts = cachedVoxelCounts[2]
+            glassObsEdgeVerts = cachedVoxelCounts[3]
+            cachedVoxelShadows.copyInto(fxAlphaTriArray, fxAlphaTriVerts * FLOATS_PER_VERT, 0, cachedVoxelShadowVerts * FLOATS_PER_VERT)
+            fxAlphaTriVerts += cachedVoxelShadowVerts
+            droneBlockedThisFrame = cachedDroneBlocked
+        } else {
+            val fxStart = fxAlphaTriVerts
+            // 2. EGO-Planner 三维膨胀体素地图：分离纯不透明远景批 (`solidObs`) 与外皮透镜消隐批 (`glassObs`)
+            val vCnt = snap.voxelCount
+            if (hub.showInflate && vCnt > 0) {
+                val cullSpan = worldHalfSpan * 2.9f + 4.5f
+                val vArr = snap.voxels
+                val zMax = hub.zSliceMax
+                val pMode = hub.perfMode
+                val lodNearSq = if (pMode == 2) 49.0f else 90.25f
+                val maxVoxBudget = when (pMode) {
+                    1 -> 4096
+                    2 -> 1400
+                    else -> 2800
+                }
+                val farStride = if (vCnt > maxVoxBudget) max(1, (vCnt + maxVoxBudget - 1) / maxVoxBudget) else 1
 
-            val m0 = vpMatrix[0]
-            val m4 = vpMatrix[4]
-            val m8 = vpMatrix[8]
-            val m12 = vpMatrix[12]
-            val m1 = vpMatrix[1]
-            val m5 = vpMatrix[5]
-            val m9 = vpMatrix[9]
-            val m13 = vpMatrix[13]
-            val m3 = vpMatrix[3]
-            val m7 = vpMatrix[7]
-            val m11 = vpMatrix[11]
-            val m15 = vpMatrix[15]
+                val m0 = vpMatrix[0]
+                val m4 = vpMatrix[4]
+                val m8 = vpMatrix[8]
+                val m12 = vpMatrix[12]
+                val m1 = vpMatrix[1]
+                val m5 = vpMatrix[5]
+                val m9 = vpMatrix[9]
+                val m13 = vpMatrix[13]
+                val m3 = vpMatrix[3]
+                val m7 = vpMatrix[7]
+                val m11 = vpMatrix[11]
+                val m15 = vpMatrix[15]
 
-            // 包围盒半径略大于 curCutOuterR，使跨边界体素全部进入逐像素平滑着色器，边界 100% 连续无接缝
-            val classifyOuterR = curCutOuterR + 0.32f
-            val classifyOuterRSq = classifyOuterR * classifyOuterR
+                // 包围盒半径略大于 curCutOuterR，使跨边界体素全部进入逐像素平滑着色器，边界 100% 连续无接缝
+                val classifyOuterR = curCutOuterR + 0.32f
+                val classifyOuterRSq = classifyOuterR * classifyOuterR
 
-            for (i in 0 until vCnt) {
-                val idx = i * 4
-                val signedPacked = vArr[idx + 3]
-                val inLocal = signedPacked > 0f
-                if (!inLocal && farStride > 1 && (i % farStride != 0)) continue
+                for (i in 0 until vCnt) {
+                    val idx = i * 4
+                    val signedPacked = vArr[idx + 3]
+                    val inLocal = signedPacked > 0f
+                    if (!inLocal && farStride > 1 && (i % farStride != 0)) continue
 
-                val vx = vArr[idx]
-                val vy = vArr[idx + 1]
-                if (abs(vx - camFocusX) > cullSpan || abs(vy - camFocusY) > cullSpan) continue
+                    val vx = vArr[idx]
+                    val vy = vArr[idx + 1]
+                    if (abs(vx - camFocusX) > cullSpan || abs(vy - camFocusY) > cullSpan) continue
 
-                val vzRaw = vArr[idx + 2]
-                val mag = abs(signedPacked)
-                val isTopCap = mag >= 5.0f
-                val hw = (if (isTopCap) mag - 10.0f else mag).coerceIn(0.04f, 0.20f)
-                val vzCenter = vzRaw * zScale
+                    val vzRaw = vArr[idx + 2]
+                    val mag = abs(signedPacked)
+                    val isTopCap = mag >= 5.0f
+                    val hw = (if (isTopCap) mag - 10.0f else mag).coerceIn(0.04f, 0.20f)
+                    val vzCenter = vzRaw * zScale
 
-                val wClip = m3 * vx + m7 * vy + m11 * vzCenter + m15
-                val padClip = hw * 3.2f + 0.48f
-                if (wClip < -padClip) continue
-                val xClip = m0 * vx + m4 * vy + m8 * vzCenter + m12
-                if (abs(xClip) > wClip + padClip) continue
-                val yClip = m1 * vx + m5 * vy + m9 * vzCenter + m13
-                if (abs(yClip) > wClip + padClip) continue
+                    val wClip = m3 * vx + m7 * vy + m11 * vzCenter + m15
+                    val padClip = hw * 3.2f + 0.48f
+                    if (wClip < -padClip) continue
+                    val xClip = m0 * vx + m4 * vy + m8 * vzCenter + m12
+                    if (abs(xClip) > wClip + padClip) continue
+                    val yClip = m1 * vx + m5 * vy + m9 * vzCenter + m13
+                    if (abs(yClip) > wClip + padClip) continue
 
-                val hh = hw * zScale
-                val z0 = max(0.006f, vzCenter - hh)
-                val z1 = vzCenter + hh
-                val dxFoc = vx - camFocusX
-                val dyFoc = vy - camFocusY
-                val dFocusSq = dxFoc * dxFoc + dyFoc * dyFoc
+                    val hh = hw * zScale
+                    val z0 = max(0.006f, vzCenter - hh)
+                    val z1 = vzCenter + hh
+                    val dxFoc = vx - camFocusX
+                    val dyFoc = vy - camFocusY
+                    val dFocusSq = dxFoc * dxFoc + dyFoc * dyFoc
 
-                // 底层接触阴影 (v3.1 距离自适应 LOD：仅对近景 <=9.5m 贴地体素生成阴影四边形，削减远景透明混合开销)
-                if (b > 0.12f && dFocusSq <= lodNearSq && vzRaw <= hw * 2.3f) {
-                    val sh = hw * 1.32f
-                    pushFxQuad(
-                        vx - sh, vy - sh, 0.004f,
-                        vx + sh, vy - sh, 0.004f,
-                        vx + sh, vy + sh, 0.004f,
-                        vx - sh, vy + sh, 0.004f,
-                        0f, 0f, 0f, 0.20f * b
+                    // 底层接触阴影 (v3.1 距离自适应 LOD：仅对近景 <=9.5m 贴地体素生成阴影四边形，削减远景透明混合开销)
+                    if (b > 0.12f && dFocusSq <= lodNearSq && vzRaw <= hw * 2.3f) {
+                        val sh = hw * 1.32f
+                        pushFxQuad(
+                            vx - sh, vy - sh, 0.004f,
+                            vx + sh, vy - sh, 0.004f,
+                            vx + sh, vy + sh, 0.004f,
+                            vx - sh, vy + sh, 0.004f,
+                            0f, 0f, 0f, 0.20f * b
+                        )
+                    }
+
+                    computeInflateVoxelColor(vzRaw, zMax, inLocal, tmpVoxelRgb)
+
+                    var intoGlass = false
+                    if (xrayActive) {
+                        val dDroneSq = distanceSqToCapsuleSeg(vx, vy, vzCenter, curSegDroneX, curSegDroneY, curSegDroneZ, curInvDroneLen2)
+                        val blockR = hw * 1.75f + 0.18f
+                        if (dDroneSq < blockR * blockR) {
+                            droneBlockedThisFrame = true
+                        }
+                        val dAheadScaledSq = if (curInvAheadLen2 > 0f) {
+                            distanceSqToCapsuleSeg(vx, vy, vzCenter, curSegAheadX, curSegAheadY, curSegAheadZ, curInvAheadLen2) * 1.6384f
+                        } else {
+                            9999f
+                        }
+
+                        val dxEye = vx - curEyeX
+                        val dyEye = vy - curEyeY
+                        val dzEye = vzCenter - curEyeZ
+                        val dEyeSq = dxEye * dxEye + dyEye * dyEye + dzEye * dzEye
+
+                        if (min(dDroneSq, dAheadScaledSq) < classifyOuterRSq || dEyeSq < 6.25f) {
+                            intoGlass = true
+                        }
+                    }
+
+                    pushInflatedVoxel3Face(
+                        vx, vy, z0, z1, hw,
+                        tmpVoxelRgb[0], tmpVoxelRgb[1], tmpVoxelRgb[2],
+                        intoGlass, isTopCap && (dFocusSq <= lodNearSq * 1.25f), b
                     )
                 }
-
-                computeInflateVoxelColor(vzRaw, zMax, inLocal, tmpVoxelRgb)
-
-                var intoGlass = false
-                if (xrayActive) {
-                    val dDroneSq = distanceSqToCapsuleSeg(vx, vy, vzCenter, curSegDroneX, curSegDroneY, curSegDroneZ, curInvDroneLen2)
-                    val blockR = hw * 1.75f + 0.18f
-                    if (dDroneSq < blockR * blockR) {
-                        droneBlockedThisFrame = true
-                    }
-                    val dAheadScaledSq = if (curInvAheadLen2 > 0f) {
-                        distanceSqToCapsuleSeg(vx, vy, vzCenter, curSegAheadX, curSegAheadY, curSegAheadZ, curInvAheadLen2) * 1.6384f
-                    } else {
-                        9999f
-                    }
-
-                    val dxEye = vx - curEyeX
-                    val dyEye = vy - curEyeY
-                    val dzEye = vzCenter - curEyeZ
-                    val dEyeSq = dxEye * dxEye + dyEye * dyEye + dzEye * dzEye
-
-                    if (min(dDroneSq, dAheadScaledSq) < classifyOuterRSq || dEyeSq < 6.25f) {
-                        intoGlass = true
-                    }
-                }
-
-                pushInflatedVoxel3Face(
-                    vx, vy, z0, z1, hw,
-                    tmpVoxelRgb[0], tmpVoxelRgb[1], tmpVoxelRgb[2],
-                    intoGlass, isTopCap && (dFocusSq <= lodNearSq * 1.25f), b
-                )
             }
+
+            cachedVoxelCounts[0] = solidObsTriVerts
+            cachedVoxelCounts[1] = solidObsEdgeVerts
+            cachedVoxelCounts[2] = glassObsTriVerts
+            cachedVoxelCounts[3] = glassObsEdgeVerts
+            cachedVoxelShadowVerts = fxAlphaTriVerts - fxStart
+            fxAlphaTriArray.copyInto(cachedVoxelShadows, 0, fxStart * FLOATS_PER_VERT, fxAlphaTriVerts * FLOATS_PER_VERT)
+            cachedDroneBlocked = droneBlockedThisFrame
+            voxelKey.commit()
         }
 
         // 可选几何内芯参考
@@ -1614,7 +1732,7 @@ class GlPointCloudMapView(
             }
             pushActorRibbon3D(pts, snap.bsplineCount, zScale, 0.054f, 0f, 0.94f, 0.50f, 0.98f)
 
-            val shift = ((SystemClock.uptimeMillis() / 60L) % 8L).toInt()
+            val shift = (((animationTimeNanos() / 1_000_000L) / 60L) % 8L).toInt()
             var chv = 4 + shift
             while (chv < snap.bsplineCount - 2) {
                 val bp = (chv - 1) * 3
@@ -1653,7 +1771,7 @@ class GlPointCloudMapView(
         if (b > 0.05f) {
             pushActorQuadSeg3D(snap.goalX, snap.goalY, 0.01f, snap.goalX, snap.goalY, gz, 0.022f, 0f, 0.92f, 0.48f, 0.88f, 0f, gz)
         }
-        val pulseR = 0.24f + (sin(SystemClock.uptimeMillis() * 0.006).toFloat() + 1f) * 0.09f
+        val pulseR = 0.24f + (sin((animationTimeNanos() / 1_000_000L) * 0.006).toFloat() + 1f) * 0.09f
         pushFxRingXY(snap.goalX, snap.goalY, 0.02f, pulseR, 0.035f, 20, 0f, 0.90f, 0.46f, 0.88f)
         val bob = sin(shaderClockSec * 3.4f) * 0.028f * b
         pushActorBeaconBox(snap.goalX, snap.goalY, gz + bob, 0.105f, 0f, 0.94f, 0.50f, 0.96f)
@@ -1728,7 +1846,7 @@ class GlPointCloudMapView(
                     pushGroundLine(rx, ry, 0.01f, rx, ry, rz, pr, pg, pb, 0.24f * b)
                 }
             }
-            val pinPulse = (0.26f + (sin(SystemClock.uptimeMillis() * 0.009).toFloat() + 1f) * 0.11f) * animS.coerceIn(0.4f, 1.2f)
+            val pinPulse = (0.26f + (sin((animationTimeNanos() / 1_000_000L) * 0.009).toFloat() + 1f) * 0.11f) * animS.coerceIn(0.4f, 1.2f)
             pushFxRingXY(px, py, 0.022f, pinPulse, 0.040f, 24, pr, pg, pb, 0.92f)
             pushGroundLine(px - 0.42f, py, 0.022f, px + 0.42f, py, 0.022f, pr, pg, pb, 0.78f)
             pushGroundLine(px, py - 0.42f, 0.022f, px, py + 0.42f, 0.022f, pr, pg, pb, 0.78f)
@@ -2164,7 +2282,7 @@ class GlPointCloudMapView(
         }
 
         if (droneOccludedBlend > 0.03f && isSelectedFocus) {
-            val sonarPhase = (SystemClock.uptimeMillis() % 1200L) / 1200f
+            val sonarPhase = ((animationTimeNanos() / 1_000_000L) % 1200L) / 1200f
             val sonarR = 0.38f + sonarPhase * 0.48f
             val sonarA = (1f - sonarPhase) * 0.68f * droneOccludedBlend
             pushActorRingXY(ux, uy, uz, sonarR, 0.030f, 24, 0.15f, 0.94f, 1.0f, sonarA, -1f)
@@ -2692,17 +2810,19 @@ class GlPointCloudMapView(
         GLES20.glUniform3f(uPrimFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
     }
 
-    private fun flushEnvLines(vboId: Int, src: FloatArray, vertCount: Int, lineWidthPx: Float) {
+    private fun flushEnvLines(vboId: Int, src: FloatArray, vertCount: Int, lineWidthPx: Float, upload: Boolean = true, sourceOffset: Int = 0) {
         if (vertCount <= 0) return
-        envLineBuf.clear()
-        envLineBuf.put(src, 0, vertCount * FLOATS_PER_VERT)
-        envLineBuf.position(0)
+        if (upload) {
+            envLineBuf.clear()
+            envLineBuf.put(src, sourceOffset * FLOATS_PER_VERT, vertCount * FLOATS_PER_VERT)
+            envLineBuf.position(0)
+        }
 
         bindPrimUniforms()
         GLES20.glLineWidth(lineWidthPx)
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
-        GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envLineBuf)
+        if (upload) GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envLineBuf)
 
         GLES20.glEnableVertexAttribArray(aPrimPos)
         GLES20.glVertexAttribPointer(aPrimPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
@@ -2720,16 +2840,18 @@ class GlPointCloudMapView(
         if (aPrimArc >= 0) GLES20.glDisableVertexAttribArray(aPrimArc)
     }
 
-    private fun flushEnvTriangles(vboId: Int, src: FloatArray, vertCount: Int) {
+    private fun flushEnvTriangles(vboId: Int, src: FloatArray, vertCount: Int, upload: Boolean = true) {
         if (vertCount <= 0) return
-        envTriBuf.clear()
-        envTriBuf.put(src, 0, vertCount * FLOATS_PER_VERT)
-        envTriBuf.position(0)
+        if (upload) {
+            envTriBuf.clear()
+            envTriBuf.put(src, 0, vertCount * FLOATS_PER_VERT)
+            envTriBuf.position(0)
+        }
 
         bindPrimUniforms()
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
-        GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envTriBuf)
+        if (upload) GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envTriBuf)
 
         GLES20.glEnableVertexAttribArray(aPrimPos)
         GLES20.glVertexAttribPointer(aPrimPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)

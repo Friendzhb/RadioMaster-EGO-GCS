@@ -12,6 +12,7 @@ import android.graphics.Typeface
 import android.os.SystemClock
 import android.view.View
 import com.radiomaster.egogcs.model.GcsSharedHub
+import com.radiomaster.egogcs.model.RenderSnapshot
 import com.radiomaster.egogcs.ui.DroneVectorModel.PartRole
 import kotlin.math.PI
 import kotlin.math.abs
@@ -26,6 +27,8 @@ import kotlin.math.sin
  * 与左下角 96dp HSI 避障姿态球严格等高底边对齐，头尾文字区采用实测宽度自适应与 FontMetrics 居中杜绝任何裁剪。
  */
 class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View(context) {
+
+    private val readSnapshot = RenderSnapshot()
 
     companion object {
         private const val RING_SEGS = 24
@@ -168,7 +171,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
 
     fun tickAndInvalidate() {
         if (visibility != VISIBLE) return
-        val s = hub.latestSnapshot
+        val s = hub.snapshots.readInto(readSnapshot)
         val tid = hub.themeId
         val tiltOn = s.activeIsTiltRig
         val attChanged = abs(s.smoothRoll - lastRoll) > 0.0025f ||
@@ -214,7 +217,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
         val h = height.toFloat()
         if (w <= 8f || h <= 8f) return
 
-        val snap = hub.latestSnapshot
+        val snap = hub.snapshots.readInto(readSnapshot)
         val pal = GcsTheme.of(hub.themeId)
         val tiltOn = snap.activeIsTiltRig
         val rig = DroneVectorModel.rigFor(tiltOn)

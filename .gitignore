@@ -16,3 +16,7 @@ local.properties
 app/keystore/
 captures/
 .DS_Store
+
+# Python bridge caches
+__pycache__/
+*.py[cod]

@@ -71,6 +71,7 @@ class RosBridgeClient(
             cfg.tiltTelemetryTopic,
             "/mavros/actuator_control"
         )
+        if (cfg.udpTelemetryEnabled) base.remove(cfg.fastLioCloudTopic)
         base.addAll(swarmOdomTopicToId.keys)
         base.addAll(swarmOptTopicToId.keys)
         base.addAll(swarmTiltTopicToId.keys)
@@ -310,7 +311,7 @@ class RosBridgeClient(
 
         val subs = LinkedHashMap<String, Int>()
         if (cfg.odomTopic.isNotBlank()) subs[cfg.odomTopic.trim()] = 25
-        if (cfg.fastLioCloudTopic.isNotBlank()) subs[cfg.fastLioCloudTopic.trim()] = 80
+        if (!cfg.udpTelemetryEnabled && cfg.fastLioCloudTopic.isNotBlank()) subs[cfg.fastLioCloudTopic.trim()] = 80
         if (cfg.optimalTopic.isNotBlank()) subs[cfg.optimalTopic.trim()] = 50
         subs["/mavros/state"] = 500
         subs["/mavros/battery"] = 800
@@ -490,6 +491,7 @@ class RosBridgeClient(
     }
 
     private fun decodeJsonOdometryIntoEngine(droneId: Int, msg: JSONObject) {
+        if (droneId == 0 && topics.udpTelemetryEnabled && hub.hasFreshUdpOdometry(android.os.SystemClock.elapsedRealtime())) return
         val poseObj = msg.optJSONObject("pose")?.optJSONObject("pose") ?: return
         val pos = poseObj.optJSONObject("position") ?: return
         val ori = poseObj.optJSONObject("orientation")

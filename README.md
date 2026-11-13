@@ -3,6 +3,9 @@
 面向 RadioMaster AX12 的原生 Kotlin Android 地面站，包含 OpenGL ES 点云显示、
 ROS1/TCPROS 与 rosbridge 通信、MAVLink 遥测、EGO 航线显示及本地仿真。
 
+3.12.0 增加保留画质的渲染缓存、点云分块上传及可选的 ROS→UDP 点云/位姿入口。
+UDP 设置和机载桥接用法见 [ROS UDP 说明](docs/ROS_UDP.md)。
+
 仓库直接维护 Android 源码。应用功能说明的原始版本见
 [原工程说明](docs/ORIGINAL_PROJECT_README.md)，此次源码迁移及构建修复见
 [构建修复记录](docs/BUILD_FIX_20261113.md)。
@@ -18,7 +21,7 @@ ROS1/TCPROS 与 rosbridge 通信、MAVLink 遥测、EGO 航线显示及本地仿
 
 ```bash
 ./gradlew spotlessApply
-./gradlew spotlessCheck :app:lintDebug :app:assembleDebug
+./gradlew spotlessCheck :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 ```
 
 Windows 使用 `gradlew.bat`。APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
@@ -26,7 +29,8 @@ Windows 使用 `gradlew.bat`。APK 输出到 `app/build/outputs/apk/debug/app-de
 
 ## CI 与 APK 下载
 
-GitHub Actions 对提交和拉取请求执行格式检查、Android Lint 和 APK 编译。
+GitHub Actions 对提交和拉取请求执行格式检查、单元测试、Android Lint、APK 编译，
+并在 Android 9 模拟器中运行渲染、前后台及 UDP 回环测试。
 在 Actions 成功运行页面下载 `RadioMaster-EGO-Pilot-Native-APK` 产物。
 主仓库 `main` 成功后更新 [OTA 下载入口](https://github.com/Friendzhb/RadioMaster-EGO-GCS/releases/tag/latest-apk)，
 保持已有 `EGO-Pilot-AX12.apk` 地址和开发证书兼容。

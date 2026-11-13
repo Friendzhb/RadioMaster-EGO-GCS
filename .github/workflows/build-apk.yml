@@ -56,13 +56,16 @@ jobs:
           printf '%s' "$OTA_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/ego-ota-signing.jks"
           echo "EGO_SIGNING_STORE_FILE=$RUNNER_TEMP/ego-ota-signing.jks" >> "$GITHUB_ENV"
 
-      - name: Check formatting, lint, and assemble APK
+      - name: Test ROS UDP bridge
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: Check formatting, unit tests, lint, and assemble APK
         env:
           EGO_SIGNING_STORE_PASSWORD: ${{ secrets.EGO_GCS_OTA_STORE_PASSWORD }}
           EGO_SIGNING_KEY_ALIAS: ${{ secrets.EGO_GCS_OTA_KEY_ALIAS }}
           EGO_SIGNING_KEY_PASSWORD: ${{ secrets.EGO_GCS_OTA_KEY_PASSWORD }}
         shell: bash
-        run: ./gradlew --no-daemon --stacktrace spotlessCheck :app:lintDebug :app:assembleDebug
+        run: ./gradlew --no-daemon --stacktrace spotlessCheck :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 
       - name: Verify APK and signing compatibility
         shell: bash
@@ -104,9 +107,59 @@ jobs:
         shell: bash
         run: rm -f "$RUNNER_TEMP/ego-ota-signing.jks"
 
+  render-scenario-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Android test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          set -o pipefail
+          "$SDKMANAGER" "platform-tools" "emulator" "platforms;android-34" "build-tools;34.0.0" "system-images;android-28;google_apis;x86_64"
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n gcs-api28 -k "system-images;android-28;google_apis;x86_64" --force
+          nohup "$ANDROID_HOME/emulator/emulator" -avd gcs-api28 -port 5554 -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 -cores 2 > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          for attempt in $(seq 1 90); do
+            if [ "$(adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -n 80 "$RUNNER_TEMP/emulator.log"
+          exit 1
+      - name: Run Android 9 render, lifecycle, and UDP integration scenarios
+        run: ./gradlew --no-daemon --stacktrace -Pandroid.injected.device.serial=emulator-5554 :app:connectedDebugAndroidTest
+      - name: Collect performance and emulator records
+        if: always()
+        shell: bash
+        run: |
+          adb -s emulator-5554 exec-out run-as com.radiomaster.egogcs cat files/render-benchmark.json > render-benchmark.json || true
+          cp "$RUNNER_TEMP/emulator.log" emulator.log || true
+          adb -s emulator-5554 emu kill || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Android-render-scenario-results
+          path: |
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
+            render-benchmark.json
+            emulator.log
+          retention-days: 7
+
   publish-apk:
     if: github.repository == 'Friendzhb/RadioMaster-EGO-GCS' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: build-native-apk
+    needs: [build-native-apk, render-scenario-tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

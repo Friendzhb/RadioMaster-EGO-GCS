@@ -27,6 +27,7 @@ import androidx.dynamicanimation.animation.DynamicAnimation
 import androidx.dynamicanimation.animation.SpringAnimation
 import androidx.dynamicanimation.animation.SpringForce
 import com.radiomaster.egogcs.model.GcsSharedHub
+import com.radiomaster.egogcs.model.RenderSnapshot
 import com.radiomaster.egogcs.model.TiltConfigSpec
 import com.radiomaster.egogcs.model.TopicConfig
 import com.radiomaster.egogcs.ota.OtaUpdateManager
@@ -63,6 +64,8 @@ class GcsSettingsModal(
     private val onShowToast: (String) -> Unit,
     private val onTiltConfigChanged: () -> Unit = {}
 ) {
+
+    private val readSnapshot = RenderSnapshot()
 
     interface ToggleSyncHandle {
         fun syncFromState(newVal: Boolean)
@@ -1456,7 +1459,7 @@ class GcsSettingsModal(
         val pal = GcsTheme.of(hub.themeId)
         tvSysDiagSummary.setTextColor(pal.textConsole)
         val dm = context.resources.displayMetrics
-        val s = hub.latestSnapshot
+        val s = hub.snapshots.readInto(readSnapshot)
         val rt = Runtime.getRuntime()
         val usedMb = ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt()
         val maxMb = (rt.maxMemory() / (1024L * 1024L)).toInt()
@@ -1468,7 +1471,7 @@ class GcsSettingsModal(
         }
         val txt = String.format(
             Locale.US,
-            "应用版本 : 智航 v3.11.6  |  %d FPS (%.2f ms)  |  内存 %d/%d MB\n" +
+            "应用版本 : 智航 v3.12.0  |  %d FPS (%.2f ms)  |  内存 %d/%d MB\n" +
                 "模式与栈 : %s%s  |  推力裕度 %d%%\n" +
                 "体素点云 : 膨胀 %d blks  |  点云 %d pts  |  分辨率 %dx%d\n" +
                 "双路电源 : 飞机 %.2fV (%.1fA, %d%%)  |  遥控本机 %.2fV (%d%%)",

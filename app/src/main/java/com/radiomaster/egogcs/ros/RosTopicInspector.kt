@@ -1,6 +1,7 @@
 package com.radiomaster.egogcs.ros
 
 import com.radiomaster.egogcs.model.GcsSharedHub
+import com.radiomaster.egogcs.model.RenderSnapshot
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -76,6 +77,8 @@ class RosTopicInspector(
     private val tcpClient: TcpRosNativeClient,
     private val wsClient: RosBridgeClient
 ) {
+
+    private val readSnapshot = RenderSnapshot()
 
     companion object {
         private const val INSPECTOR_CALLER = "/ego_topic_inspector"
@@ -1050,7 +1053,7 @@ class RosTopicInspector(
     }
 
     private fun synthesizeDemoMessage(topic: String, seq: Long): Triple<String, Int, String> {
-        val s = hub.latestSnapshot
+        val s = hub.snapshots.readInto(readSnapshot)
         val nowMs = System.currentTimeMillis()
         val secs = nowMs / 1000L
         val nsecs = (nowMs % 1000L) * 1_000_000L

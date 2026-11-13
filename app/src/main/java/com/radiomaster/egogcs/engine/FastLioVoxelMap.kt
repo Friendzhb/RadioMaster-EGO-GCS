@@ -6,22 +6,13 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.FloatBuffer
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.withLock
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * 无锁渲染级三维空间体素哈希增量地图引擎 (Lock-Free SPSC VBO Streaming Voxel Map)：
- * 1. OpenGL 渲染线程 (syncToGpuVbo) 全程零 synchronized 锁竞争：
- *    后台网络/雷达线程通过单生产者-单消费者无锁环形队列 (AtomicLong writeSeq/readSeq) 推送新增体素，
- *    彻底杜绝点云解包或哈希重整阻塞 60FPS 渲染帧；
- * 2. 静态体素零冗余过滤：已占用的三维体素格命中重复激光点时不再重复触发 glBufferSubData，
- *    将悬停或重复扫描区域的显存带宽消耗从 MB/s 降至 0 B/s，且新增体素按连续槽位合并为单次 VBO 提交。
- */
+/** Voxel hash map with versioned, bounded uploads. GL never waits for a map producer. */
 class FastLioVoxelMap {
 
     companion object {
@@ -33,36 +24,22 @@ class FastLioVoxelMap {
         private const val HASH_MASK = HASH_CAP - 1
         private const val EMPTY_KEY = Long.MIN_VALUE
         private const val TOMBSTONE_KEY = Long.MIN_VALUE + 1L
-
-        private const val RING_CAP = 65_536 // 2^16 无锁增量队列
-        private const val RING_MASK = RING_CAP - 1
     }
 
-    // 仅串行化后台生产者线程 (TcpRosNativeIO / EgoFastLioWorker)，GLThread 绝不触碰此锁
-    private val producerLock = Any()
+    private val pointStore = PagedPointStore(MAX_POINTS)
+    private val producerLock = pointStore.lock
+    private val uploadCursor = PointUploadCursor(MAX_POINTS)
+    private val pageSink = PointPageSink { start, count, values ->
+        GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, start * BYTES_PER_VERTEX, count * BYTES_PER_VERTEX, values)
+    }
+    val uploadedPointsLastFrame: Int get() = uploadCursor.uploadedPoints
+    val uploadedPagesLastFrame: Int get() = uploadCursor.uploadedPages
 
     private val tableKeys = LongArray(HASH_CAP) { EMPTY_KEY }
     private val tableSlots = IntArray(HASH_CAP) { -1 }
     private val slotToKey = LongArray(MAX_POINTS) { EMPTY_KEY }
 
-    private val vertexShadow = FloatArray(MAX_POINTS * FLOATS_PER_VERTEX)
-
-    // SPSC 无锁增量上传环形队列 (Producer -> GLThread)
-    private val ringSlots = IntArray(RING_CAP)
-    private val ringXyzi = FloatArray(RING_CAP * FLOATS_PER_VERTEX)
-    private val writeSeq = AtomicLong(0L)
-    private val readSeq = AtomicLong(0L)
-
-    // 世代戳：清空地图或 EGL Context 重建时触发干净的整块同步
-    private val clearEpoch = AtomicInteger(1)
-    private val fullSyncRequested = AtomicInteger(1)
-    private var glSeenEpoch = 0
-
-    private val chunkMaxVerts = 16_384
-    private val stagingBuffer: FloatBuffer = ByteBuffer
-        .allocateDirect(chunkMaxVerts * BYTES_PER_VERTEX)
-        .order(ByteOrder.nativeOrder())
-        .asFloatBuffer()
+    private val vertexShadow = pointStore.vertices
 
     @Volatile var activeVoxelSize: Float = 0.12f
         private set
@@ -115,7 +92,7 @@ class FastLioVoxelMap {
     }
 
     fun clear(newVoxelSize: Float = activeVoxelSize) {
-        synchronized(producerLock) {
+        producerLock.withLock {
             activeVoxelSize = newVoxelSize.coerceIn(0.05f, 0.50f)
             tableKeys.fill(EMPTY_KEY)
             tableSlots.fill(-1)
@@ -130,9 +107,7 @@ class FastLioVoxelMap {
             maxBoundY = 0f
             minBoundZ = 0f
             maxBoundZ = 0f
-            val seq = writeSeq.get()
-            readSeq.set(seq)
-            clearEpoch.incrementAndGet()
+            pointStore.clear()
         }
     }
 
@@ -146,7 +121,7 @@ class FastLioVoxelMap {
     fun exportBinaryPcd(outFile: File): Int {
         val snapshotCopy: FloatArray
         val count: Int
-        synchronized(producerLock) {
+        producerLock.withLock {
             count = pointCount
             if (count <= 0) return 0
             snapshotCopy = vertexShadow.copyOf(count * FLOATS_PER_VERTEX)
@@ -192,7 +167,7 @@ class FastLioVoxelMap {
 
     fun insertScan(xyzi: FloatArray, count: Int) {
         if (count <= 0) return
-        synchronized(producerLock) {
+        producerLock.withLock {
             val res = activeVoxelSize
             val invRes = 1.0f / res
             val limit = min(count, xyzi.size / 4)
@@ -200,9 +175,6 @@ class FastLioVoxelMap {
             if (tombstoneCount > 110_000) {
                 rehashLocked()
             }
-
-            var wSeq = writeSeq.get()
-            val rSeqSnap = readSeq.get()
 
             for (i in 0 until limit) {
                 val base = i * 4
@@ -315,22 +287,8 @@ class FastLioVoxelMap {
                 vertexShadow[vOff + 2] = pz
                 vertexShadow[vOff + 3] = inten
 
-                if (wSeq - rSeqSnap < RING_CAP - 8) {
-                    val rIdx = (wSeq.toInt()) and RING_MASK
-                    ringSlots[rIdx] = slot
-                    val rOff = rIdx * FLOATS_PER_VERTEX
-                    ringXyzi[rOff] = px
-                    ringXyzi[rOff + 1] = py
-                    ringXyzi[rOff + 2] = pz
-                    ringXyzi[rOff + 3] = inten
-                    wSeq++
-                } else {
-                    // 若后台极端突发积压超过 65,536 个新体素，标记一次整块恢复即可
-                    fullSyncRequested.set(1)
-                }
+                pointStore.written(slot, pointCount)
             }
-
-            writeSeq.lazySet(wSeq)
         }
     }
 
@@ -368,84 +326,12 @@ class FastLioVoxelMap {
     }
 
     fun notifyGlContextRecreated() {
-        fullSyncRequested.set(1)
+        uploadCursor.reset()
     }
 
-    /**
-     * 在 OpenGL ES 线程无锁执行：合并连续槽位为单次 glBufferSubData 提交，耗时低于 0.05ms
-     */
     fun syncToGpuVbo(vboId: Int): Int {
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
-        val epoch = clearEpoch.get()
-        val curTotal = pointCount
-
-        if (glSeenEpoch != epoch) {
-            glSeenEpoch = epoch
-            fullSyncRequested.set(0)
-            readSeq.lazySet(writeSeq.get())
-            if (curTotal > 0) {
-                uploadShadowRange(0, curTotal)
-            }
-            return curTotal
-        }
-
-        if (fullSyncRequested.compareAndSet(1, 0)) {
-            readSeq.lazySet(writeSeq.get())
-            if (curTotal > 0) {
-                uploadShadowRange(0, curTotal)
-            }
-            return curTotal
-        }
-
-        var r = readSeq.get()
-        val w = writeSeq.get()
-        if (r >= w) return curTotal
-
-        while (r < w) {
-            val firstIdx = r.toInt() and RING_MASK
-            val startSlot = ringSlots[firstIdx]
-            var expectedSlot = startSlot
-            var runCount = 0
-
-            stagingBuffer.clear()
-            while (r < w && runCount < chunkMaxVerts) {
-                val idx = r.toInt() and RING_MASK
-                val s = ringSlots[idx]
-                if (s != expectedSlot) break
-                val off = idx * FLOATS_PER_VERTEX
-                stagingBuffer.put(ringXyzi, off, FLOATS_PER_VERTEX)
-                expectedSlot++
-                runCount++
-                r++
-            }
-            stagingBuffer.position(0)
-            GLES20.glBufferSubData(
-                GLES20.GL_ARRAY_BUFFER,
-                startSlot * BYTES_PER_VERTEX,
-                runCount * BYTES_PER_VERTEX,
-                stagingBuffer
-            )
-        }
-        readSeq.lazySet(r)
-        return curTotal
-    }
-
-    private fun uploadShadowRange(startSlot: Int, totalVerts: Int) {
-        var cur = startSlot
-        val end = min(MAX_POINTS, startSlot + totalVerts)
-        while (cur < end) {
-            val batch = min(chunkMaxVerts, end - cur)
-            stagingBuffer.clear()
-            stagingBuffer.put(vertexShadow, cur * FLOATS_PER_VERTEX, batch * FLOATS_PER_VERTEX)
-            stagingBuffer.position(0)
-            GLES20.glBufferSubData(
-                GLES20.GL_ARRAY_BUFFER,
-                cur * BYTES_PER_VERTEX,
-                batch * BYTES_PER_VERTEX,
-                stagingBuffer
-            )
-            cur += batch
-        }
+        return uploadCursor.sync(pointStore, pageSink)
     }
 
     private fun packKey(ix: Int, iy: Int, iz: Int): Long {
