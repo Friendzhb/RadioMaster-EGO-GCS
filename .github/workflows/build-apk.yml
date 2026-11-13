@@ -109,8 +109,6 @@ jobs:
 
   render-scenario-tests:
     runs-on: ubuntu-24.04
-    env:
-      ANDROID_AVD_HOME: ${{ runner.temp }}/gcs-avd
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +127,7 @@ jobs:
           set -o pipefail
           "$SDKMANAGER" "platform-tools" "emulator" "platforms;android-34" "build-tools;34.0.0" "system-images;android-28;google_apis;x86_64"
           sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/gcs-avd"
           mkdir -p "$ANDROID_AVD_HOME"
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n gcs-api28 -k "system-images;android-28;google_apis;x86_64" --path "$ANDROID_AVD_HOME/gcs-api28.avd" --force
           test -f "$ANDROID_AVD_HOME/gcs-api28.avd/config.ini"
