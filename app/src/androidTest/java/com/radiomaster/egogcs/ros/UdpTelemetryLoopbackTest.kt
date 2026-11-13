@@ -11,6 +11,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.TimeUnit
 import java.util.zip.CRC32
 import org.junit.Assert.*
 import org.junit.Test
@@ -64,11 +65,11 @@ class UdpTelemetryLoopbackTest {
             Thread.sleep(800)
             assertFalse(hub.hasFreshUdpOdometry(SystemClock.elapsedRealtime()))
             assertTrue(hub.udpTelemetryStatus.contains("可靠链路"))
-            receiver.disconnect()
+            receiver.disconnect().get(1, TimeUnit.SECONDS)
             assertEquals(0L, hub.udpLastOdomMs)
             DatagramSocket(port).close() // Shutdown released the UDP port.
         } finally {
-            receiver.disconnect()
+            receiver.shutdown()
             engine.stop()
         }
     }

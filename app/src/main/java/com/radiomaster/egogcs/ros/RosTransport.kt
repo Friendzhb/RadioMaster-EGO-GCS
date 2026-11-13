@@ -133,6 +133,7 @@ class RosConnectionManager(
 
     fun shutdown() {
         disconnectAll(silent = true)
+        udpTelemetry.shutdown()
         debounceScheduler.shutdownNow()
     }
 }

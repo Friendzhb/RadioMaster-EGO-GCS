@@ -12,6 +12,8 @@ import java.net.SocketTimeoutException
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.asin
 import kotlin.math.atan2
@@ -22,7 +24,9 @@ class RosUdpTelemetryClient(private val hub: GcsSharedHub, private val engine: E
     private val sessionLock = Any()
 
     @Volatile private var socket: DatagramSocket? = null
-    private var worker: Thread? = null
+    private val io = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "RosUdpTelemetry").apply { isDaemon = true }
+    }
 
     fun connect(cfg: TopicConfig) {
         disconnect()
@@ -30,25 +34,27 @@ class RosUdpTelemetryClient(private val hub: GcsSharedHub, private val engine: E
         require(cfg.udpPort in 1024..65535 && cfg.udpPort != 14550)
         val token = generation.get()
         hub.udpTelemetryStatus = "UDP 等待机载桥接；位姿使用可靠链路"
-        worker = Thread({ receive(cfg, token) }, "RosUdpTelemetry").apply {
-            isDaemon = true
-            start()
-        }
+        io.execute { if (generation.get() == token) receive(cfg, token) }
     }
 
-    fun disconnect() {
+    /** Cancellation is immediate; the future completes after the old receiver has actually exited. */
+    fun disconnect(): Future<*> {
         val closing = synchronized(sessionLock) {
             generation.incrementAndGet()
             val previous = socket
             socket = null
-            worker?.interrupt()
-            worker = null
             previous
         }
         closing?.close()
         hub.udpLastOdomMs = 0L
         hub.udpLastCloudMs = 0L
         hub.udpTelemetryStatus = "UDP 未启用"
+        return io.submit { }
+    }
+
+    fun shutdown() {
+        disconnect()
+        io.shutdown()
     }
 
     private fun receive(cfg: TopicConfig, token: Int) {
