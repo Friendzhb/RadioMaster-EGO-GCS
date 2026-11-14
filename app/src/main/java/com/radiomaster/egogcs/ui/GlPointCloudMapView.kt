@@ -19,7 +19,9 @@ import com.radiomaster.egogcs.model.SwarmPalette
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.egl.EGLDisplay
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.PI
 import kotlin.math.abs
@@ -210,8 +212,9 @@ class GlPointCloudMapView(
                 float nz = sqrt(max(0.0, 1.0 - r2 * 4.0));
                 vec3 norm = vec3(uv.x * 2.0, -uv.y * 2.0, nz);
                 float diff = max(0.0, dot(norm, vec3(0.38, 0.48, 0.79)));
-                float edlRim = 1.0 - smoothstep(0.14, 0.25, r2) * 0.46;
-                vec3 litRgb = vColor.rgb * (0.56 + 0.58 * diff) * edlRim;
+                float spec = pow(diff, 12.0) * 0.14;
+                float edlRim = 1.0 - smoothstep(0.13, 0.25, r2) * 0.48;
+                vec3 litRgb = (vColor.rgb * (0.60 + 0.60 * diff) + vec3(spec)) * edlRim;
                 vec3 fogRgb = mix(litRgb, uFogColor, vFog);
                 gl_FragColor = vec4(fogRgb, vColor.a);
             }
@@ -705,10 +708,44 @@ class GlPointCloudMapView(
 
     init {
         setEGLContextClientVersion(2)
-        setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        setEGLConfigChooser(MsaaFallbackConfigChooser())
         preserveEGLContextOnPause = true
         setRenderer(this)
         renderMode = RENDERMODE_WHEN_DIRTY
+    }
+
+    private class MsaaFallbackConfigChooser : EGLConfigChooser {
+        override fun chooseConfig(egl: EGL10, display: EGLDisplay): EGLConfig {
+            val count = IntArray(1)
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val msaaSpec = intArrayOf(
+                EGL10.EGL_RED_SIZE, 8,
+                EGL10.EGL_GREEN_SIZE, 8,
+                EGL10.EGL_BLUE_SIZE, 8,
+                EGL10.EGL_ALPHA_SIZE, 8,
+                EGL10.EGL_DEPTH_SIZE, 16,
+                EGL10.EGL_RENDERABLE_TYPE, 4,
+                EGL10.EGL_SAMPLE_BUFFERS, 1,
+                EGL10.EGL_SAMPLES, 4,
+                EGL10.EGL_NONE
+            )
+            if (egl.eglChooseConfig(display, msaaSpec, configs, 1, count) && count[0] > 0 && configs[0] != null) {
+                return requireNotNull(configs[0])
+            }
+            val stdSpec = intArrayOf(
+                EGL10.EGL_RED_SIZE, 8,
+                EGL10.EGL_GREEN_SIZE, 8,
+                EGL10.EGL_BLUE_SIZE, 8,
+                EGL10.EGL_ALPHA_SIZE, 8,
+                EGL10.EGL_DEPTH_SIZE, 16,
+                EGL10.EGL_RENDERABLE_TYPE, 4,
+                EGL10.EGL_NONE
+            )
+            check(egl.eglChooseConfig(display, stdSpec, configs, 1, count) && count[0] > 0 && configs[0] != null) {
+                "No compatible GLES 2.0 EGLConfig found"
+            }
+            return requireNotNull(configs[0])
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -2285,16 +2322,18 @@ class GlPointCloudMapView(
         }
     }
 
+    private fun computeAdaptiveUavZoomScale(): Float = if (worldHalfSpan > 6.2f) {
+        (1.0f + (worldHalfSpan - 6.2f) * 0.048f).coerceAtMost(1.88f)
+    } else {
+        1.0f
+    }
+
     private fun drawVectorGlbModels(snap: RenderSnapshot, zScale: Float, occluded: Boolean) {
         if (!vectorGlb.ready) return
         val blend = projBlend
         val isLight = GcsTheme.of(hub.themeId).isLight
         val showVectors = blend > 0.08f
-        val zoomScale = if (worldHalfSpan > 8.5f) {
-            (1.0f + (worldHalfSpan - 8.5f) * 0.028f).coerceAtMost(1.38f)
-        } else {
-            1.0f
-        }
+        val zoomScale = computeAdaptiveUavZoomScale()
         if (snap.swarmCount > 1) {
             val count = snap.swarmCount.coerceIn(2, SwarmPalette.MAX_SWARM_DRONES)
             val focusMotors = snap.motorNorm4
@@ -2322,7 +2361,7 @@ class GlPointCloudMapView(
                     yaw = drone.yaw,
                     frontTilt = drone.tiltServo1Rad * blend,
                     rearTilt = drone.tiltServo2Rad * blend,
-                    displayScale = (if (isFocus) 0.48f else 0.45f) * zoomScale,
+                    displayScale = (if (isFocus) 0.58f else 0.52f) * zoomScale,
                     occluded = occluded,
                     spinPhase = spinState.phasesRad[0],
                     armed = drone.armed,
@@ -2339,7 +2378,7 @@ class GlPointCloudMapView(
                     tintR = col[0],
                     tintG = col[1],
                     tintB = col[2],
-                    tintStrength = if (isFocus) 0.30f else 0.22f,
+                    tintStrength = if (isFocus) 0.28f else 0.20f,
                     isTiltRig = drone.isTiltRig,
                     rotorPhases = spinState.phasesRad,
                     rotorBlur = spinState.blurStrength
@@ -2358,7 +2397,7 @@ class GlPointCloudMapView(
                 yaw = snap.yaw,
                 frontTilt = snap.tiltServo1Rad * blend,
                 rearTilt = snap.tiltServo2Rad * blend,
-                displayScale = 0.46f * zoomScale,
+                displayScale = 0.58f * zoomScale,
                 occluded = occluded,
                 spinPhase = spinState.phasesRad[0],
                 armed = snap.armed,
@@ -2398,25 +2437,25 @@ class GlPointCloudMapView(
         servo2Rad: Float = 0f
     ) {
         val rig = DroneVectorModel.rigFor(isTiltRig)
-        val zoomScale = if (worldHalfSpan > 8.5f) {
-            (1.0f + (worldHalfSpan - 8.5f) * 0.028f).coerceAtMost(1.38f)
-        } else {
-            1.0f
-        }
-        val worldScale = (if (isSelectedFocus) 0.48f else 0.45f) * zoomScale
+        val zoomScale = computeAdaptiveUavZoomScale()
+        val worldScale = (if (isSelectedFocus) 0.58f else 0.52f) * zoomScale
 
         if (blend > 0.05f) {
-            pushFxDiscXY(ux, uy, 0.008f, 0.32f * zoomScale, 18, 0f, 0f, 0f, 0.48f * blend)
-            pushActorLine(ux, uy, 0.015f, ux, uy, uz, armR, armG, armB, 0.52f, 0f, uz)
+            pushFxDiscXY(ux, uy, 0.008f, 0.38f * zoomScale, 20, 0f, 0f, 0f, 0.50f * blend)
+            pushActorLine(ux, uy, 0.015f, ux, uy, uz, armR, armG, armB, 0.58f, 0f, uz)
+            if (armed) {
+                val washFade = (1.0f - (uz / 3.2f).coerceIn(0f, 0.72f)) * blend
+                pushActorRingXY(ux, uy, 0.014f, 0.44f * zoomScale, 0.018f * zoomScale, 24, armR, armG, armB, 0.34f * washFade, -1f)
+            }
         }
 
         if (isSelectedFocus) {
-            pushActorRingXY(ux, uy, uz, 0.36f * zoomScale, 0.024f * zoomScale, 22, armR, armG, armB, 0.85f, -1f)
+            pushActorRingXY(ux, uy, uz, 0.44f * zoomScale, 0.025f * zoomScale, 26, armR, armG, armB, 0.86f, -1f)
         }
 
         if (droneOccludedBlend > 0.03f && isSelectedFocus) {
             val sonarPhase = ((animationTimeNanos() / 1_000_000L) % 1200L) / 1200f
-            val sonarR = (0.38f + sonarPhase * 0.48f) * zoomScale
+            val sonarR = (0.46f + sonarPhase * 0.52f) * zoomScale
             val sonarA = (1f - sonarPhase) * 0.68f * droneOccludedBlend
             pushActorRingXY(ux, uy, uz, sonarR, 0.030f * zoomScale, 24, 0.15f, 0.94f, 1.0f, sonarA, -1f)
         }

@@ -76,6 +76,8 @@ internal object VectorUavMeshBuilder {
         val rotorRing: AuxSpan,
         val rotorSweepCcw: AuxSpan,
         val rotorSweepCw: AuxSpan,
+        val rotorTipBandCcw: AuxSpan,
+        val rotorTipBandCw: AuxSpan,
         val thrustShaft: AuxSpan,
         val thrustCone: AuxSpan,
         val noseChevron: AuxSpan,
@@ -609,8 +611,8 @@ internal object VectorUavMeshBuilder {
         collector: FloatCollector,
         partFn: (name: String, group: Int, rotorIdx: Int, r: Float, g: Float, b: Float, spec: Float, emissive: Float, build: () -> Unit) -> Unit
     ) {
-        // 1. Matte woven carbon-fiber sandwich center plates, landing skids, roll-cage & antenna tubes
-        partFn("fuselage_carbon_visual", 0, 0, 0.15f, 0.18f, 0.23f, 0.36f, 0f) {
+        // 1. Satin gunmetal-blue woven carbon-fiber sandwich center plates, landing skids, roll-cage & antenna tubes
+        partFn("fuselage_carbon_visual", 0, 0, 0.23f, 0.28f, 0.36f, 0.48f, 0f) {
             // Lower structural carbon plate (2.4mm thick) + Upper avionics carbon deck (2.0mm thick)
             addOctagonalPlate(collector, -0.088f, 0.094f, 0.048f, 0.036f, 0.0388f)
             addOctagonalPlate(collector, -0.078f, 0.086f, 0.043f, 0.066f, 0.0684f)
@@ -652,7 +654,7 @@ internal object VectorUavMeshBuilder {
         }
 
         // 2. Gunmetal anodized onboard compute (Jetson Orin / NUC) heatsink fins & LiDAR base
-        partFn("compute_gunmetal_visual", 0, 0, 0.28f, 0.34f, 0.42f, 0.64f, 0f) {
+        partFn("compute_gunmetal_visual", 0, 0, 0.36f, 0.43f, 0.52f, 0.72f, 0f) {
             // Central compute brick between sandwich plates
             addBox(collector, -0.056f, 0.048f, -0.031f, 0.031f, 0.040f, 0.062f)
             // 7 CNC longitudinal heatsink cooling fins protruding through upper deck cutout
@@ -669,7 +671,7 @@ internal object VectorUavMeshBuilder {
         }
 
         // 3. Brushed titanium-silver CNC standoffs & Intel RealSense D435i aluminum stereo housing
-        partFn("avionics_titanium_visual", 0, 0, 0.62f, 0.68f, 0.76f, 0.82f, 0f) {
+        partFn("avionics_titanium_visual", 0, 0, 0.76f, 0.82f, 0.90f, 0.90f, 0.03f) {
             val standoffs = arrayOf(
                 floatArrayOf(0.068f, -0.030f),
                 floatArrayOf(0.068f, 0.030f),
@@ -679,7 +681,7 @@ internal object VectorUavMeshBuilder {
                 floatArrayOf(-0.064f, 0.030f)
             )
             for (st in standoffs) {
-                addSmoothCylinderZ(collector, st[0], st[1], 0.0388f, 0.0660f, 0.0031f, 0.0031f, 8)
+                addSmoothCylinderZ(collector, st[0], st[1], 0.0388f, 0.0660f, 0.0032f, 0.0032f, 8)
             }
             // Intel RealSense D435i machined aluminum stereo bar + rounded end-caps
             addBox(collector, 0.095f, 0.1145f, -0.031f, 0.031f, 0.047f, 0.0615f)
@@ -688,7 +690,7 @@ internal object VectorUavMeshBuilder {
         }
 
         // 4. Sapphire-cyan Livox Mid-360 optical emitter window & RealSense D435i triple camera lenses
-        partFn("sensor_optics_visual", 0, 0, 0.08f, 0.80f, 0.98f, 0.92f, 0.24f) {
+        partFn("sensor_optics_visual", 0, 0, 0.10f, 0.85f, 1.00f, 0.96f, 0.36f) {
             addSmoothCylinderZ(collector, -0.006f, 0f, 0.0845f, 0.1015f, 0.0266f, 0.0256f, 20)
             // Left IR, Center Projector/RGB, Right IR optical apertures
             for (ly in floatArrayOf(-0.020f, 0.0f, 0.020f)) {
@@ -739,7 +741,7 @@ internal object VectorUavMeshBuilder {
         val isFront = h.isFront
 
         // 1. Slotted CNC brushless outrunner bell + base mount + optional outer carbon bumper arc
-        partFn("motor_${mTag}_visual", grp, 0, 0.27f, 0.33f, 0.42f, 0.72f, 0f) {
+        partFn("motor_${mTag}_visual", grp, 0, 0.38f, 0.45f, 0.56f, 0.82f, 0f) {
             // CNC aluminum motor base plate & lower bearing cup
             addSmoothCylinderZ(collector, h.x, h.y, mountBaseZ - 0.004f, mountBaseZ + 0.003f, 0.0145f, 0.0155f, 14)
             // Lower & upper machined bell rings (exposing copper windings in the middle gap!)
@@ -800,25 +802,25 @@ internal object VectorUavMeshBuilder {
         }
 
         // 2. Exposed enamel-copper stator windings glowing inside the slotted bell
-        partFn("stator_${mTag}_visual", grp, 0, 0.92f, 0.46f, 0.14f, 0.78f, 0.08f) {
+        partFn("stator_${mTag}_visual", grp, 0, 0.96f, 0.50f, 0.15f, 0.84f, 0.16f) {
             addSmoothCylinderZ(collector, h.x, h.y, mountBaseZ + 0.0068f, mountBaseZ + 0.0152f, 0.0154f, 0.0154f, 16)
         }
 
         // 3. High-intensity aviation LED navigation beacon on outer nacelle/arm tip (Front Red / Rear Emerald)
         val navR = if (isFront) 1.00f else 0.06f
-        val navG = if (isFront) 0.22f else 0.95f
-        val navB = if (isFront) 0.18f else 0.48f
+        val navG = if (isFront) 0.24f else 0.96f
+        val navB = if (isFront) 0.18f else 0.50f
         val outDirX = if (isFront) 1f else -1f
         val outDirY = if (h.y >= 0f) 1f else -1f
-        partFn("nav_led_${mTag}_visual", grp, 0, navR, navG, navB, 0.65f, 0.62f) {
+        partFn("nav_led_${mTag}_visual", grp, 0, navR, navG, navB, 0.70f, 0.72f) {
             addSmoothCylinderZ(
                 collector,
                 h.x + outDirX * 0.0135f,
                 h.y + outDirY * 0.0135f,
                 mountBaseZ - 0.0055f,
                 mountBaseZ + 0.0045f,
-                0.0044f,
-                0.0038f,
+                0.0046f,
+                0.0040f,
                 10
             )
             if (includePartialGuardArc) {
@@ -839,23 +841,25 @@ internal object VectorUavMeshBuilder {
         }
 
         // 4. Spinning 3-blade twisted carbon-fiber airfoil propeller (`rotorIndex = h.motorId`)
-        partFn("propeller_${mTag}_visual", grp, h.motorId, 0.17f, 0.20f, 0.25f, 0.62f, 0f) {
+        partFn("propeller_${mTag}_visual", grp, h.motorId, 0.29f, 0.35f, 0.44f, 0.70f, 0f) {
             // Molded carbon prop hub ring
-            addSmoothCylinderZ(collector, h.x, h.y, h.z - 0.0028f, h.z + 0.0028f, 0.0086f, 0.0080f, 14)
-            // 3 cambered, pitch-twisted airfoil blades (0% -> 82% span in dark satin carbon)
-            addTwistedAirfoilPropellerBody(collector, h.x, h.y, h.z, h.radius * 0.98f, h.spinSign)
+            addSmoothCylinderZ(collector, h.x, h.y, h.z - 0.0028f, h.z + 0.0028f, 0.0088f, 0.0082f, 14)
+            // 3 cambered, pitch-twisted airfoil blades (0% -> 72% span in satin titanium-carbon)
+            addTwistedAirfoilPropellerBody(collector, h.x, h.y, h.z, h.radius * 0.985f, h.spinSign)
         }
 
-        // 5. Machined silver conical prop spinner nut + high-visibility painted blade tips (`rotorIndex = h.motorId`)
-        partFn("prop_spinner_${mTag}_visual", grp, h.motorId, 0.76f, 0.82f, 0.90f, 0.90f, 0.06f) {
-            addSmoothCylinderZ(collector, h.x, h.y, h.z + 0.0026f, h.z + 0.0118f, 0.0064f, 0.0012f, 12)
+        // 5. Machined silver conical prop spinner nut + inner crisp white blade stripe (`rotorIndex = h.motorId`)
+        partFn("prop_spinner_${mTag}_visual", grp, h.motorId, 0.90f, 0.94f, 0.99f, 0.92f, 0.18f) {
+            addSmoothCylinderZ(collector, h.x, h.y, h.z + 0.0026f, h.z + 0.0122f, 0.0066f, 0.0012f, 12)
+            addPropellerInnerWhiteStripe(collector, h.x, h.y, h.z, h.radius * 0.985f, h.spinSign)
         }
 
-        val tipR = if (isFront) 1.00f else 0.20f
-        val tipG = if (isFront) 0.58f else 0.96f
-        val tipB = if (isFront) 0.08f else 0.62f
-        partFn("prop_tip_${mTag}_visual", grp, h.motorId, tipR, tipG, tipB, 0.58f, 0.28f) {
-            addPropellerTipCapsOnly(collector, h.x, h.y, h.z, h.radius * 0.98f, h.spinSign)
+        // 6. Outer high-visibility luminous safety blade tips (`0.80R .. 1.00R`, `rotorIndex = h.motorId`)
+        val tipR = if (isFront) 1.00f else 0.12f
+        val tipG = if (isFront) 0.52f else 0.98f
+        val tipB = if (isFront) 0.08f else 0.58f
+        partFn("prop_tip_${mTag}_visual", grp, h.motorId, tipR, tipG, tipB, 0.64f, 0.38f) {
+            addPropellerTipCapsOnly(collector, h.x, h.y, h.z, h.radius * 0.985f, h.spinSign)
         }
     }
 
@@ -1072,8 +1076,10 @@ internal object VectorUavMeshBuilder {
     ): PreparedModel {
         val discSpan = appendAuxRotorDiscFeathered(collector)
         val ringSpan = appendAuxRotorRingFeathered(collector)
-        val sweepCcwSpan = appendAuxRotorSweep3Lobe(collector, spinSign = 1)
-        val sweepCwSpan = appendAuxRotorSweep3Lobe(collector, spinSign = -1)
+        val sweepCcwSpan = appendAuxRotorSweep3Lobe(collector, spinSign = 1, rInner = 0.16f, rOuter = 0.77f, wakeArcRad = 1.62f)
+        val sweepCwSpan = appendAuxRotorSweep3Lobe(collector, spinSign = -1, rInner = 0.16f, rOuter = 0.77f, wakeArcRad = 1.62f)
+        val tipBandCcwSpan = appendAuxRotorSweep3Lobe(collector, spinSign = 1, rInner = 0.77f, rOuter = 0.99f, wakeArcRad = 1.78f)
+        val tipBandCwSpan = appendAuxRotorSweep3Lobe(collector, spinSign = -1, rInner = 0.77f, rOuter = 0.99f, wakeArcRad = 1.78f)
         val shaftSpan = appendAuxUnitCylinderZ(collector)
         val coneSpan = appendAuxUnitConeZ(collector)
         val chevronSpan = appendAuxNoseChevron(collector)
@@ -1095,6 +1101,8 @@ internal object VectorUavMeshBuilder {
             rotorRing = ringSpan,
             rotorSweepCcw = sweepCcwSpan,
             rotorSweepCw = sweepCwSpan,
+            rotorTipBandCcw = tipBandCcwSpan,
+            rotorTipBandCw = tipBandCwSpan,
             thrustShaft = shaftSpan,
             thrustCone = coneSpan,
             noseChevron = chevronSpan,
@@ -1320,7 +1328,7 @@ internal object VectorUavMeshBuilder {
     }
 
     /**
-     * Sculpted 3-blade twisted carbon-fiber airfoil (root -> 45% -> 80% span; outer 80%..100% is the painted tip cap).
+     * Sculpted 3-blade twisted carbon-fiber airfoil (root -> 42% -> 72% span).
      */
     private fun addTwistedAirfoilPropellerBody(
         out: FloatCollector,
@@ -1331,16 +1339,15 @@ internal object VectorUavMeshBuilder {
         spinSign: Int
     ) {
         val sgn = if (spinSign >= 0) 1f else -1f
-        val stationsR = floatArrayOf(0.11f, 0.44f, 0.80f)
-        val stationsChord = floatArrayOf(0.115f, 0.168f, 0.118f)
-        val stationsPitchRad = floatArrayOf(0.44f, 0.28f, 0.17f)
-        val stationsSweep = floatArrayOf(0.00f, 0.025f, 0.010f)
+        val stationsR = floatArrayOf(0.11f, 0.42f, 0.72f)
+        val stationsChord = floatArrayOf(0.135f, 0.195f, 0.152f)
+        val stationsPitchRad = floatArrayOf(0.45f, 0.29f, 0.19f)
+        val stationsSweep = floatArrayOf(0.00f, 0.026f, 0.014f)
 
         for (b in 0..2) {
             val ang = (b * 2.0 * PI / 3.0).toFloat()
             val rx = cos(ang)
             val ry = sin(ang)
-            // Leading-edge tangent along rotation direction
             val lx = -ry * sgn
             val ly = rx * sgn
 
@@ -1351,6 +1358,32 @@ internal object VectorUavMeshBuilder {
                     stationsR[s + 1], stationsChord[s + 1], stationsPitchRad[s + 1], stationsSweep[s + 1]
                 )
             }
+        }
+    }
+
+    /**
+     * Crisp white warning stripe at 72%..80% span separating dark carbon airfoil from painted safety tip.
+     */
+    private fun addPropellerInnerWhiteStripe(
+        out: FloatCollector,
+        cx: Float,
+        cy: Float,
+        cz: Float,
+        radius: Float,
+        spinSign: Int
+    ) {
+        val sgn = if (spinSign >= 0) 1f else -1f
+        for (b in 0..2) {
+            val ang = (b * 2.0 * PI / 3.0).toFloat()
+            val rx = cos(ang)
+            val ry = sin(ang)
+            val lx = -ry * sgn
+            val ly = rx * sgn
+            addAirfoilSegment(
+                out, cx, cy, cz, rx, ry, lx, ly, radius,
+                0.72f, 0.152f, 0.19f, 0.014f,
+                0.80f, 0.136f, 0.16f, 0.006f
+            )
         }
     }
 
@@ -1374,8 +1407,8 @@ internal object VectorUavMeshBuilder {
             val ly = rx * sgn
             addAirfoilSegment(
                 out, cx, cy, cz, rx, ry, lx, ly, radius,
-                0.80f, 0.118f, 0.17f, 0.010f,
-                1.00f, 0.052f, 0.11f, -0.022f
+                0.80f, 0.136f, 0.16f, 0.006f,
+                1.00f, 0.068f, 0.11f, -0.020f
             )
         }
     }
@@ -1517,13 +1550,16 @@ internal object VectorUavMeshBuilder {
      * Each lobe starts right at the physical blade leading edge (`fade = 0.98`) and trails smoothly
      * behind the rotation direction (`-spinSign`) over `92 deg` down to `fade = 0.02`.
      */
-    private fun appendAuxRotorSweep3Lobe(out: FloatCollector, spinSign: Int): AuxSpan {
+    private fun appendAuxRotorSweep3Lobe(
+        out: FloatCollector,
+        spinSign: Int,
+        rInner: Float,
+        rOuter: Float,
+        wakeArcRad: Float
+    ): AuxSpan {
         val start = out.vertexCount
         val arcSegs = 8
-        val wakeArcRad = 1.60f
         val dir = if (spinSign >= 0) -1f else 1f
-        val rHub = 0.16f
-        val rTip = 0.98f
 
         for (blade in 0..2) {
             val leadAng = (blade * 2.0 * PI / 3.0).toFloat()
@@ -1538,16 +1574,17 @@ internal object VectorUavMeshBuilder {
                 val s0 = sin(a0)
                 val c1 = cos(a1)
                 val s1 = sin(a1)
-                val hubFade0 = min(1f, fade0 * 0.35f + 0.02f)
-                val hubFade1 = min(1f, fade1 * 0.35f + 0.02f)
+                val inScale = if (rInner > 0.5f) 0.85f else 0.35f
+                val hubFade0 = min(1f, fade0 * inScale + 0.02f)
+                val hubFade1 = min(1f, fade1 * inScale + 0.02f)
 
-                out.pushFadeVertexXY(c0 * rHub, s0 * rHub, 0f, hubFade0)
-                out.pushFadeVertexXY(c0 * rTip, s0 * rTip, 0f, fade0)
-                out.pushFadeVertexXY(c1 * rTip, s1 * rTip, 0f, fade1)
+                out.pushFadeVertexXY(c0 * rInner, s0 * rInner, 0f, hubFade0)
+                out.pushFadeVertexXY(c0 * rOuter, s0 * rOuter, 0f, fade0)
+                out.pushFadeVertexXY(c1 * rOuter, s1 * rOuter, 0f, fade1)
 
-                out.pushFadeVertexXY(c0 * rHub, s0 * rHub, 0f, hubFade0)
-                out.pushFadeVertexXY(c1 * rTip, s1 * rTip, 0f, fade1)
-                out.pushFadeVertexXY(c1 * rHub, s1 * rHub, 0f, hubFade1)
+                out.pushFadeVertexXY(c0 * rInner, s0 * rInner, 0f, hubFade0)
+                out.pushFadeVertexXY(c1 * rOuter, s1 * rOuter, 0f, fade1)
+                out.pushFadeVertexXY(c1 * rInner, s1 * rInner, 0f, hubFade1)
             }
         }
         return AuxSpan(start, out.vertexCount - start)

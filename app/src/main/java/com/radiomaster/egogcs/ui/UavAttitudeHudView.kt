@@ -7,7 +7,9 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.RectF
+import android.graphics.Shader
 import android.view.Choreographer
 import android.view.View
 import android.widget.FrameLayout
@@ -54,7 +56,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
 
     private var chaseFollowBlend: Float = 1.0f
     private var frontFlipBlend: Float = 0.0f
-    private var camElevRad: Float = 0.34f
+    private var camElevRad: Float = 0.42f
     private var camTransAnim: ValueAnimator? = null
 
     private var projCx = 0f
@@ -64,7 +66,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
     private var projCosEl = 1f
     private var projSinEl = 0f
     private var projFocal = 100f
-    private val projCamDist = 3.06f
+    private val projCamDist = 2.28f
 
     private var lastRoll = -999f
     private var lastPitch = -999f
@@ -142,6 +144,11 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
     private val tmpProj1 = FloatArray(3)
 
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val stageGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private var glowCachedCx = -1f
+    private var glowCachedCy = -1f
+    private var glowCachedR = -1f
+    private var glowCachedTheme = -1
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val horizonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val dashPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -237,19 +244,19 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             1 -> {
                 targetFollow = 0f
                 targetFront = 0f
-                targetElev = 0.50f
+                targetElev = 0.56f
                 tip = "姿态视窗：世界系等轴视角"
             }
             2 -> {
                 targetFollow = 1f
                 targetFront = 1f
-                targetElev = 0.25f
+                targetElev = 0.28f
                 tip = "姿态视窗：机头迎面正视视角"
             }
             else -> {
                 targetFollow = 1f
                 targetFront = 0f
-                targetElev = 0.34f
+                targetElev = 0.42f
                 tip = "姿态视窗：机尾追尾地平视角"
             }
         }
@@ -407,6 +414,18 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         borderPaint.strokeWidth = 1f
         canvas.drawLine(cardRect.left + 2f * d, headerBottom, cardRect.right - 2f * d, headerBottom, borderPaint)
 
+        val rotorActive = hudRotorSpin.isSpinning || snap.armed
+        val dotCy = headerBottom * 0.52f
+        val dotCx = 8.4f * d
+        bgPaint.color = if (rotorActive) {
+            Color.argb(68, 0, 230, 118)
+        } else {
+            Color.argb(40, 148, 168, 196)
+        }
+        canvas.drawCircle(dotCx, dotCy, 3.6f * d, bgPaint)
+        bgPaint.color = if (rotorActive) Color.rgb(0, 230, 118) else pal.textMuted
+        canvas.drawCircle(dotCx, dotCy, 2.0f * d, bgPaint)
+
         val prefixTitle = if (tiltOn) "倾转" else "姿态"
         val modeShort = when (inspectMode) {
             1 -> "$prefixTitle·等轴"
@@ -414,7 +433,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             else -> "$prefixTitle·追尾"
         }
         titlePaint.color = pal.textPrimary
-        canvas.drawText(modeShort, 7.2f * d, baselineCenteredY(headerBottom * 0.53f, titlePaint), titlePaint)
+        canvas.drawText(modeShort, 14.2f * d, baselineCenteredY(headerBottom * 0.53f, titlePaint), titlePaint)
 
         val srcTag = when {
             tiltOn && snap.hasLiveTiltTelemetry -> "INDI"
@@ -437,7 +456,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         clipStageRect.set(3f * d, headerBottom, w - 3f * d, footerTop)
         projCx = clipStageRect.centerX()
         projCy = clipStageRect.centerY() + 1.5f * d
-        val stageRadius = min(clipStageRect.width() * 0.42f, clipStageRect.height() * 0.47f)
+        val stageRadius = min(clipStageRect.width() * 0.44f, clipStageRect.height() * 0.48f)
         projFocal = stageRadius * 2.55f
 
         val roll = snap.smoothRoll
@@ -455,23 +474,48 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         canvas.save()
         canvas.clipRect(clipStageRect)
 
+        // Subtle radial stage spotlight behind the 3D UAV to boost silhouette contrast
+        val glowR = max(clipStageRect.width() * 0.52f, 12f)
+        if (abs(projCx - glowCachedCx) > 1f || abs(projCy - glowCachedCy) > 1f ||
+            abs(glowR - glowCachedR) > 1f || hub.themeId != glowCachedTheme
+        ) {
+            glowCachedCx = projCx
+            glowCachedCy = projCy
+            glowCachedR = glowR
+            glowCachedTheme = hub.themeId
+            val centerGlow = if (pal.isLight) {
+                Color.argb(56, Color.red(pal.accent), Color.green(pal.accent), Color.blue(pal.accent))
+            } else {
+                Color.argb(46, Color.red(pal.accentBright), Color.green(pal.accentBright), Color.blue(pal.accentBright))
+            }
+            stageGlowPaint.shader = RadialGradient(
+                projCx,
+                projCy,
+                glowR,
+                intArrayOf(centerGlow, Color.TRANSPARENT),
+                floatArrayOf(0.0f, 1.0f),
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawCircle(projCx, projCy, glowR, stageGlowPaint)
+
         if (chaseFollowBlend < 0.55f) {
             drawGyroWorldRing(canvas, pal)
         } else {
             drawArtificialHorizonAndBankScale(canvas, projCx, projCy, stageRadius, roll, pitch, frontFlipBlend, pal)
         }
 
-        projectWorldPoint(0f, 0f, -0.34f, tmpProj0)
+        projectWorldPoint(0f, 0f, -0.32f, tmpProj0)
         projectWorldPoint(0f, 0f, 0f, tmpProj1)
         dashPaint.color = pal.hsiTickMinor
         dashPaint.strokeWidth = 0.8f * d
         canvas.drawLine(tmpProj0[0], tmpProj0[1], tmpProj1[0], tmpProj1[1], dashPaint)
-        bgPaint.color = Color.argb(if (pal.isLight) 28 else 58, 0, 0, 0)
+        bgPaint.color = Color.argb(if (pal.isLight) 34 else 72, 0, 0, 0)
         canvas.drawOval(
-            tmpProj0[0] - stageRadius * 0.34f,
-            tmpProj0[1] - stageRadius * 0.10f,
-            tmpProj0[0] + stageRadius * 0.34f,
-            tmpProj0[1] + stageRadius * 0.10f,
+            tmpProj0[0] - stageRadius * 0.44f,
+            tmpProj0[1] - stageRadius * 0.13f,
+            tmpProj0[0] + stageRadius * 0.44f,
+            tmpProj0[1] + stageRadius * 0.13f,
             bgPaint
         )
 

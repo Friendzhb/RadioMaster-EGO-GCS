@@ -1897,7 +1897,8 @@ class MainActivity : Activity() {
             }
         }
         AnimHelper.attachSpringTouch(hsiView, GcsMotionSpec.PressRole.HUD_INSTRUMENT)
-        bottomLeftCluster.addView(hsiView, LinearLayout.LayoutParams(dp(96f), dp(96f)))
+        val bottomHudH = if (screenHeightDp >= 385f) 104f else 96f
+        bottomLeftCluster.addView(hsiView, LinearLayout.LayoutParams(dp(bottomHudH), dp(bottomHudH)))
 
         hdTelemetryBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2091,9 +2092,10 @@ class MainActivity : Activity() {
             }
         }
         AnimHelper.attachSpringTouch(attitudeHudView, GcsMotionSpec.PressRole.HUD_INSTRUMENT)
+        val attHudW = if (screenHeightDp >= 385f && screenWidthDp >= 680f) 160f else 148f
         cockpitRoot.addView(
             attitudeHudView,
-            FrameLayout.LayoutParams(dp(144f), dp(96f), Gravity.BOTTOM or Gravity.END).apply {
+            FrameLayout.LayoutParams(dp(attHudW), dp(bottomHudH), Gravity.BOTTOM or Gravity.END).apply {
                 rightMargin = dp(10f)
                 bottomMargin = dp(8f)
             }

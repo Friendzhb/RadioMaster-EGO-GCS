@@ -443,8 +443,8 @@ internal class VectorGlbRenderer(context: Context) {
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorDisc.firstVertex, loaded.rotorDisc.vertexCount)
 
                 val sweepSpan = if (hub.spinSign >= 0) loaded.rotorSweepCcw else loaded.rotorSweepCw
-                val sweepBase = if (isLightTheme) 0.24f else 0.90f
-                val sweepAlpha = (if (isLightTheme) 0.32f else 0.28f) * blur
+                val sweepBase = if (isLightTheme) 0.24f else 0.92f
+                val sweepAlpha = (if (isLightTheme) 0.34f else 0.32f) * blur
                 GLES20.glUniform4f(
                     uColor,
                     sweepBase,
@@ -454,7 +454,16 @@ internal class VectorGlbRenderer(context: Context) {
                 )
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLES, sweepSpan.firstVertex, sweepSpan.vertexCount)
 
-                val ringAlpha = (if (isLightTheme) 0.72f else 0.68f) * blur
+                // Luminous painted blade-tip streak arc (outer 77%..99% span)
+                val tipSpan = if (hub.spinSign >= 0) loaded.rotorTipBandCcw else loaded.rotorTipBandCw
+                val tipR = if (hub.isFront) 1.00f else 0.14f
+                val tipG = if (hub.isFront) 0.56f else 0.98f
+                val tipB = if (hub.isFront) 0.10f else 0.60f
+                val tipAlpha = (if (isLightTheme) 0.64f else 0.62f) * blur
+                GLES20.glUniform4f(uColor, tipR, tipG, tipB, tipAlpha)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, tipSpan.firstVertex, tipSpan.vertexCount)
+
+                val ringAlpha = (if (isLightTheme) 0.78f else 0.74f) * blur
                 GLES20.glUniform4f(uColor, navR, navG, navB, ringAlpha)
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorRing.firstVertex, loaded.rotorRing.vertexCount)
             }
@@ -639,20 +648,23 @@ internal class VectorGlbRenderer(context: Context) {
                 }
                 vec3 base = mix(uColor.rgb, uTint.rgb, uTint.a);
                 float liftMask = uParams.z * (1.0 - clamp(uParams.w, 0.0, 1.0));
-                base = max(base, vec3(0.12, 0.14, 0.19) * liftMask);
+                base = max(base, vec3(0.16, 0.20, 0.27) * liftMask);
                 float hemi = n.z * 0.5 + 0.5;
-                vec3 amb = mix(vec3(0.24, 0.28, 0.35), vec3(0.58, 0.65, 0.76), hemi);
-                vec3 lKey = normalize(vec3(0.44, -0.38, 0.81));
-                vec3 lFill = normalize(vec3(-0.56, 0.54, 0.30));
+                vec3 amb = mix(vec3(0.28, 0.33, 0.42), vec3(0.64, 0.72, 0.84), hemi);
+                vec3 lKey = normalize(vec3(0.42, -0.38, 0.82));
+                vec3 lFill = normalize(vec3(-0.56, 0.54, 0.34));
                 float diffKey = max(dot(n, lKey), 0.0);
                 float diffFill = max(dot(n, lFill), 0.0);
+                float camFill = max(dot(n, v), 0.0) * 0.16;
                 vec3 hVec = normalize(lKey + v);
                 float specDot = clamp(dot(n, hVec), 0.0001, 1.0);
-                float spec = (dot(n, hVec) > 0.0 ? pow(specDot, 34.0) : 0.0) * uParams.x;
-                float fres = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0001, 1.0), 2.85);
-                vec3 rim = mix(vec3(0.54, 0.82, 1.0), uTint.rgb, uTint.a * 0.65) * (fres * (0.18 + 0.15 * uParams.z));
-                vec3 lit = base * (amb + vec3(0.74, 0.72, 0.68) * diffKey + vec3(0.24, 0.30, 0.38) * diffFill + uParams.w) +
-                    vec3(0.92, 0.96, 1.0) * spec + rim;
+                float specBroad = (dot(n, hVec) > 0.0 ? pow(specDot, 9.0) : 0.0) * (0.14 + 0.16 * uParams.x);
+                float specSharp = (dot(n, hVec) > 0.0 ? pow(specDot, 42.0) : 0.0) * uParams.x * 1.15;
+                float fres = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0001, 1.0), 2.45);
+                vec3 rimCol = mix(vec3(0.62, 0.86, 1.0), uTint.rgb, uTint.a * 0.65);
+                vec3 rim = rimCol * (fres * (0.24 + 0.22 * uParams.z));
+                vec3 lit = base * (amb + vec3(0.76, 0.74, 0.70) * diffKey + vec3(0.28, 0.35, 0.44) * diffFill + camFill + uParams.w) +
+                    vec3(0.94, 0.97, 1.0) * (specBroad + specSharp) + rim;
                 gl_FragColor = vec4(min(lit, vec3(1.0)), uColor.a);
             }
         """

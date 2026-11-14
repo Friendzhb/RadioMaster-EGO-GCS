@@ -38,7 +38,7 @@ internal class VectorHudTextureView(
     private var cachedFrontTilt = 0f
     private var cachedRearTilt = 0f
     private var cachedAzimuth = 0f
-    private var cachedElevation = 0.33f
+    private var cachedElevation = 0.42f
     private var cachedTiltRig = true
     private var cachedPh0 = 0.18f
     private var cachedPh1 = 1.02f
@@ -162,7 +162,7 @@ internal class VectorHudTextureView(
         private var pFrontTilt = 0f
         private var pRearTilt = 0f
         private var pAzimuth = 0f
-        private var pElevation = 0.33f
+        private var pElevation = 0.42f
         private var pTiltRig = true
         private var pPh0 = 0.18f
         private var pPh1 = 1.02f
@@ -392,11 +392,11 @@ internal class VectorHudTextureView(
                     GLES20.glDepthMask(true)
                     GLES20.glDisable(GLES20.GL_BLEND)
 
-                    val distance = 3.06f
+                    val distance = 2.28f
                     val eyeX = distance * cos(fEl) * cos(fAz)
                     val eyeY = distance * cos(fEl) * sin(fAz)
                     val eyeZ = distance * sin(fEl)
-                    Matrix.setLookAtM(view, 0, eyeX, eyeY, eyeZ, 0f, 0f, 0.02f, 0f, 0f, 1f)
+                    Matrix.setLookAtM(view, 0, eyeX, eyeY, eyeZ, 0f, 0f, 0.032f, 0f, 0f, 1f)
                     val focal = min(w * 0.42f, h * 0.47f) * 2.55f
                     val fov = (2.0 * atan(h / (2.0 * focal.coerceAtLeast(1f))) * 180.0 / PI).toFloat()
                     Matrix.perspectiveM(projection, 0, fov, w.toFloat() / h, 0.1f, 50f)
@@ -412,7 +412,7 @@ internal class VectorHudTextureView(
                         yaw = fYaw,
                         frontTilt = fFront,
                         rearTilt = fRear,
-                        displayScale = 0.94f,
+                        displayScale = 1.08f,
                         occluded = false,
                         spinPhase = rotorPhases[0],
                         armed = fArmed,
