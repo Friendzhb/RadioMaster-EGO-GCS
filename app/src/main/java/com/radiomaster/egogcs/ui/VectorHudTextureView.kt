@@ -18,7 +18,9 @@ import kotlin.math.sin
 /**
  * Transparent 60 FPS OpenGL ES 2.0 layer over the attitude HUD card:
  * - Requests 4x MSAA with automatic fallback for software/older GPUs.
- * - Uses zero-allocation primitive pose transfer between UI Choreographer and the EGL worker thread.
+ * - Renders both 4M2S Dual-Servo Tilt-Rotor and X4 Standard Research Quadrotor 3D rigs.
+ * - Uses zero-allocation primitive pose and per-motor rotor spin/blur transfer between UI
+ *   Choreographer and the EGL worker thread.
  */
 internal class VectorHudTextureView(
     context: Context,
@@ -37,12 +39,20 @@ internal class VectorHudTextureView(
     private var cachedRearTilt = 0f
     private var cachedAzimuth = 0f
     private var cachedElevation = 0.33f
-    private var cachedSpinPhase = 0f
+    private var cachedTiltRig = true
+    private var cachedPh0 = 0.18f
+    private var cachedPh1 = 1.02f
+    private var cachedPh2 = 2.15f
+    private var cachedPh3 = 0.64f
+    private var cachedBl0 = 0f
+    private var cachedBl1 = 0f
+    private var cachedBl2 = 0f
+    private var cachedBl3 = 0f
     private var cachedArmed = false
-    private var cachedM0 = 0.35f
-    private var cachedM1 = 0.35f
-    private var cachedM2 = 0.35f
-    private var cachedM3 = 0.35f
+    private var cachedM0 = 0f
+    private var cachedM1 = 0f
+    private var cachedM2 = 0f
+    private var cachedM3 = 0f
     private var cachedLightTheme = false
 
     init {
@@ -58,7 +68,15 @@ internal class VectorHudTextureView(
         rearTilt: Float,
         cameraAzimuth: Float,
         cameraElevation: Float,
-        spinPhase: Float,
+        isTiltRig: Boolean,
+        ph0: Float,
+        ph1: Float,
+        ph2: Float,
+        ph3: Float,
+        bl0: Float,
+        bl1: Float,
+        bl2: Float,
+        bl3: Float,
         armed: Boolean,
         m0: Float,
         m1: Float,
@@ -74,7 +92,15 @@ internal class VectorHudTextureView(
         cachedRearTilt = rearTilt
         cachedAzimuth = cameraAzimuth
         cachedElevation = cameraElevation
-        cachedSpinPhase = spinPhase
+        cachedTiltRig = isTiltRig
+        cachedPh0 = ph0
+        cachedPh1 = ph1
+        cachedPh2 = ph2
+        cachedPh3 = ph3
+        cachedBl0 = bl0
+        cachedBl1 = bl1
+        cachedBl2 = bl2
+        cachedBl3 = bl3
         cachedArmed = armed
         cachedM0 = m0
         cachedM1 = m1
@@ -83,7 +109,8 @@ internal class VectorHudTextureView(
         cachedLightTheme = isLightTheme
         worker?.request(
             roll, pitch, yaw, frontTilt, rearTilt, cameraAzimuth, cameraElevation,
-            spinPhase, armed, m0, m1, m2, m3, isLightTheme
+            isTiltRig, ph0, ph1, ph2, ph3, bl0, bl1, bl2, bl3,
+            armed, m0, m1, m2, m3, isLightTheme
         )
     }
 
@@ -94,8 +121,10 @@ internal class VectorHudTextureView(
         if (hasCachedPose) {
             thread.request(
                 cachedRoll, cachedPitch, cachedYaw, cachedFrontTilt, cachedRearTilt,
-                cachedAzimuth, cachedElevation, cachedSpinPhase, cachedArmed,
-                cachedM0, cachedM1, cachedM2, cachedM3, cachedLightTheme
+                cachedAzimuth, cachedElevation, cachedTiltRig,
+                cachedPh0, cachedPh1, cachedPh2, cachedPh3,
+                cachedBl0, cachedBl1, cachedBl2, cachedBl3,
+                cachedArmed, cachedM0, cachedM1, cachedM2, cachedM3, cachedLightTheme
             )
         }
     }
@@ -134,12 +163,20 @@ internal class VectorHudTextureView(
         private var pRearTilt = 0f
         private var pAzimuth = 0f
         private var pElevation = 0.33f
-        private var pSpinPhase = 0f
+        private var pTiltRig = true
+        private var pPh0 = 0.18f
+        private var pPh1 = 1.02f
+        private var pPh2 = 2.15f
+        private var pPh3 = 0.64f
+        private var pBl0 = 0f
+        private var pBl1 = 0f
+        private var pBl2 = 0f
+        private var pBl3 = 0f
         private var pArmed = false
-        private var pM0 = 0.35f
-        private var pM1 = 0.35f
-        private var pM2 = 0.35f
-        private var pM3 = 0.35f
+        private var pM0 = 0f
+        private var pM1 = 0f
+        private var pM2 = 0f
+        private var pM3 = 0f
         private var pLightTheme = false
 
         fun request(
@@ -150,7 +187,15 @@ internal class VectorHudTextureView(
             rearTilt: Float,
             az: Float,
             el: Float,
-            spinPhase: Float,
+            isTiltRig: Boolean,
+            ph0: Float,
+            ph1: Float,
+            ph2: Float,
+            ph3: Float,
+            bl0: Float,
+            bl1: Float,
+            bl2: Float,
+            bl3: Float,
             armed: Boolean,
             m0: Float,
             m1: Float,
@@ -165,7 +210,15 @@ internal class VectorHudTextureView(
             pRearTilt = rearTilt
             pAzimuth = az
             pElevation = el
-            pSpinPhase = spinPhase
+            pTiltRig = isTiltRig
+            pPh0 = ph0
+            pPh1 = ph1
+            pPh2 = ph2
+            pPh3 = ph3
+            pBl0 = bl0
+            pBl1 = bl1
+            pBl2 = bl2
+            pBl3 = bl3
             pArmed = armed
             pM0 = m0
             pM1 = m1
@@ -277,6 +330,9 @@ internal class VectorHudTextureView(
                 val view = FloatArray(16)
                 val projection = FloatArray(16)
                 val viewProjection = FloatArray(16)
+                val rotorPhases = FloatArray(4)
+                val rotorBlur = FloatArray(4)
+
                 while (true) {
                     var w = 1
                     var h = 1
@@ -287,12 +343,12 @@ internal class VectorHudTextureView(
                     var fRear = 0f
                     var fAz = 0f
                     var fEl = 0.33f
-                    var fSpin = 0f
+                    var fTiltRig = true
                     var fArmed = false
-                    var fM0 = 0.35f
-                    var fM1 = 0.35f
-                    var fM2 = 0.35f
-                    var fM3 = 0.35f
+                    var fM0 = 0f
+                    var fM1 = 0f
+                    var fM2 = 0f
+                    var fM3 = 0f
                     var fLight = false
                     val stopped: Boolean
                     synchronized(lock) {
@@ -308,7 +364,15 @@ internal class VectorHudTextureView(
                             fRear = pRearTilt
                             fAz = pAzimuth
                             fEl = pElevation
-                            fSpin = pSpinPhase
+                            fTiltRig = pTiltRig
+                            rotorPhases[0] = pPh0
+                            rotorPhases[1] = pPh1
+                            rotorPhases[2] = pPh2
+                            rotorPhases[3] = pPh3
+                            rotorBlur[0] = pBl0
+                            rotorBlur[1] = pBl1
+                            rotorBlur[2] = pBl2
+                            rotorBlur[3] = pBl3
                             fArmed = pArmed
                             fM0 = pM0
                             fM1 = pM1
@@ -350,7 +414,7 @@ internal class VectorHudTextureView(
                         rearTilt = fRear,
                         displayScale = 0.94f,
                         occluded = false,
-                        spinPhase = fSpin,
+                        spinPhase = rotorPhases[0],
                         armed = fArmed,
                         m0 = fM0,
                         m1 = fM1,
@@ -361,7 +425,10 @@ internal class VectorHudTextureView(
                         eyeX = eyeX,
                         eyeY = eyeY,
                         eyeZ = eyeZ,
-                        isLightTheme = fLight
+                        isLightTheme = fLight,
+                        isTiltRig = fTiltRig,
+                        rotorPhases = rotorPhases,
+                        rotorBlur = rotorBlur
                     )
                     check(EGL14.eglSwapBuffers(display, surface)) { "HUD EGL swap failed" }
                 }

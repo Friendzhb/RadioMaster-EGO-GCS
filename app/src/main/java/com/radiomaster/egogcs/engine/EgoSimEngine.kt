@@ -195,6 +195,8 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     private var simServoSaturated = false
     private var rosHasLiveTilt = false
     private var rosLastTiltRxMs = 0L
+    private var rosHasLiveMotorTelemetry = false
+    private var rosLastMotorRxMs = 0L
     private var rosTiltS1Rad = 0f
     private var rosTiltS2Rad = 0f
     private val rawBins60 = FloatArray(60) { 9.5f }
@@ -246,7 +248,8 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     private var rosLioPathCount = 0
 
     private var rosPx4Mode = "OFFBOARD"
-    private var rosArmed = true
+    private var rosArmed = false
+    private var rosHasExplicitArmState = false
     private var hasLiveBatteryTelemetry = false
     private var rosBatVolt = 16.2f
     private var rosBatCurrentAmps = 12.6f
@@ -1777,6 +1780,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         synchronized(lock) {
             rosPx4Mode = mode
             rosArmed = armed
+            rosHasExplicitArmState = true
         }
     }
 
@@ -1790,7 +1794,23 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         synchronized(lock) {
             rosPx4Mode = mode
             rosArmed = armed
+            rosHasExplicitArmState = true
         }
+    }
+
+    private fun resolveEffectiveRosArmedLocked(nowElapsedMs: Long): Boolean {
+        val linkAlive = hub.rosConnected || (nowElapsedMs - hub.lastRosOdomWallMs < 2500L)
+        if (rosHasExplicitArmState && linkAlive) {
+            return rosArmed
+        }
+        if (rosHasLiveMotorTelemetry && (nowElapsedMs - rosLastMotorRxMs < 1500L)) {
+            return simMotorNorm[0] > 0.045f || simMotorNorm[1] > 0.045f ||
+                simMotorNorm[2] > 0.045f || simMotorNorm[3] > 0.045f
+        }
+        if (nowElapsedMs - hub.lastRosOdomWallMs < 2000L) {
+            return uavZ > 0.22f || hypot(vx, vy) > 0.14f || abs(vz) > 0.12f
+        }
+        return false
     }
 
     fun onMavlinkAttitudeFallback(rollFlu: Float, pitchFlu: Float, yawEnu: Float) {
@@ -1883,6 +1903,9 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         if (!hub.isDroneTiltRig(0)) {
             if (isActuatorFallback && m0 >= 0f) {
                 synchronized(lock) {
+                    val now = SystemClock.elapsedRealtime()
+                    rosHasLiveMotorTelemetry = true
+                    rosLastMotorRxMs = now
                     simMotorNorm[0] = m0.coerceIn(0f, 1f)
                     if (m1 >= 0f) simMotorNorm[1] = m1.coerceIn(0f, 1f)
                     if (m2 >= 0f) simMotorNorm[2] = m2.coerceIn(0f, 1f)
@@ -1904,7 +1927,11 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             }
             rosHasLiveTilt = true
             rosLastTiltRxMs = now
-            if (m0 >= 0f) simMotorNorm[0] = m0.coerceIn(0f, 1f)
+            if (m0 >= 0f) {
+                rosHasLiveMotorTelemetry = true
+                rosLastMotorRxMs = now
+                simMotorNorm[0] = m0.coerceIn(0f, 1f)
+            }
             if (m1 >= 0f) simMotorNorm[1] = m1.coerceIn(0f, 1f)
             if (m2 >= 0f) simMotorNorm[2] = m2.coerceIn(0f, 1f)
             if (m3 >= 0f) simMotorNorm[3] = m3.coerceIn(0f, 1f)
@@ -2782,7 +2809,8 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         frame.tiltManipulability = simManipulability
         frame.tiltThrustMarginPct = if (hub.isDroneTiltRig(0)) simThrustMarginPct else (100 - ((simMotorNorm[0] + simMotorNorm[1] + simMotorNorm[2] + simMotorNorm[3]) * 25f).roundToInt()).coerceIn(5, 90)
         frame.tiltServoSaturated = simServoSaturated
-        frame.hasLiveTiltTelemetry = hub.isRosMode && rosHasLiveTilt && (SystemClock.elapsedRealtime() - rosLastTiltRxMs < 3000L)
+        val nowElapsed = SystemClock.elapsedRealtime()
+        frame.hasLiveTiltTelemetry = hub.isRosMode && rosHasLiveTilt && (nowElapsed - rosLastTiltRxMs < 3000L)
         frame.homeX = homeX
         frame.homeY = homeY
         frame.goalX = goalX
@@ -2790,7 +2818,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         frame.goalZ = goalZ
         frame.fsmState = fsmState
         frame.px4Mode = if (hub.isRosMode) rosPx4Mode else "OFFBOARD"
-        frame.armed = if (hub.isRosMode) rosArmed else true
+        frame.armed = if (hub.isRosMode) resolveEffectiveRosArmedLocked(nowElapsed) else true
 
         val useRealBat = hub.isRosMode || hasLiveBatteryTelemetry
         frame.batVolt = if (useRealBat) rosBatVolt else 16.24f
@@ -2870,13 +2898,16 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         }
 
         // 填充 1..3 号僚机槽位
-        val nowElapsed = SystemClock.elapsedRealtime()
         for (id in 1 until swCnt) {
             val src = peerUnits[id]
             val dst = frame.swarmAgents[id]
             val peerIsTilt = hub.isDroneTiltRig(id)
             dst.online = if (hub.isRosMode) (nowElapsed - src.lastRosRxMs < 4000L) else true
-            dst.armed = frame.armed
+            dst.armed = if (hub.isRosMode) {
+                dst.online && (frame.armed || src.uavZ > 0.22f || hypot(src.vx, src.vy) > 0.14f)
+            } else {
+                true
+            }
             dst.isTiltRig = peerIsTilt
             dst.uavX = src.uavX
             dst.uavY = src.uavY
@@ -3137,17 +3168,31 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         }
 
         // 一阶无刷电机推力分配更新 (tau_m = 28ms, W-DLS 高频姿态力矩由四电机差动承担)
-        if (!liveTiltFresh) {
-            val cosMean = max(0.50f, (cos(simServo1Rad - smoothPitch) + cos(simServo2Rad - smoothPitch)) * 0.5f)
-            val baseHover = (0.50f / cosMean + vz * 0.06f).coerceIn(0.28f, 0.86f)
-            val rollDiff = (-smoothRoll * 0.22f).coerceIn(-0.18f, 0.18f)
-            val pitchDiff = (smoothPitch * 0.20f).coerceIn(-0.18f, 0.18f)
-            val yawDiffM = (yawRate * 0.045f).coerceIn(-0.12f, 0.12f)
-            // PX4 X4: M1(右前CCW), M2(左后CCW), M3(左前CW), M4(右后CW)
-            val desM0 = (baseHover - rollDiff + pitchDiff - yawDiffM).coerceIn(0.10f, 0.98f)
-            val desM1 = (baseHover + rollDiff - pitchDiff - yawDiffM).coerceIn(0.10f, 0.98f)
-            val desM2 = (baseHover + rollDiff + pitchDiff + yawDiffM).coerceIn(0.10f, 0.98f)
-            val desM3 = (baseHover - rollDiff - pitchDiff + yawDiffM).coerceIn(0.10f, 0.98f)
+        val nowTickMs = SystemClock.elapsedRealtime()
+        val motorTelemetryFresh = hub.isRosMode && rosHasLiveMotorTelemetry && (nowTickMs - rosLastMotorRxMs < 1500L)
+        if (!motorTelemetryFresh) {
+            val effectivelyArmed = if (hub.isRosMode) resolveEffectiveRosArmedLocked(nowTickMs) else true
+            val desM0: Float
+            val desM1: Float
+            val desM2: Float
+            val desM3: Float
+            if (!effectivelyArmed) {
+                desM0 = 0f
+                desM1 = 0f
+                desM2 = 0f
+                desM3 = 0f
+            } else {
+                val cosMean = max(0.50f, (cos(simServo1Rad - smoothPitch) + cos(simServo2Rad - smoothPitch)) * 0.5f)
+                val baseHover = (0.50f / cosMean + vz * 0.06f).coerceIn(0.28f, 0.86f)
+                val rollDiff = (-smoothRoll * 0.22f).coerceIn(-0.18f, 0.18f)
+                val pitchDiff = (smoothPitch * 0.20f).coerceIn(-0.18f, 0.18f)
+                val yawDiffM = (yawRate * 0.045f).coerceIn(-0.12f, 0.12f)
+                // PX4 X4: M1(右前CCW), M2(左后CCW), M3(左前CW), M4(右后CW)
+                desM0 = (baseHover - rollDiff + pitchDiff - yawDiffM).coerceIn(0.10f, 0.98f)
+                desM1 = (baseHover + rollDiff - pitchDiff - yawDiffM).coerceIn(0.10f, 0.98f)
+                desM2 = (baseHover + rollDiff + pitchDiff + yawDiffM).coerceIn(0.10f, 0.98f)
+                desM3 = (baseHover - rollDiff - pitchDiff + yawDiffM).coerceIn(0.10f, 0.98f)
+            }
             val kMot = 1f - exp(-dt / TiltConfigSpec.TAU_MOTOR_SEC)
             simMotorNorm[0] += (desM0 - simMotorNorm[0]) * kMot
             simMotorNorm[1] += (desM1 - simMotorNorm[1]) * kMot

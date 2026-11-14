@@ -416,6 +416,7 @@ class GlPointCloudMapView(
     private val uavTmpB = FloatArray(3)
     private val vectorGlb = VectorGlbRenderer(context)
     internal val vectorGlbReady: Boolean get() = vectorGlb.ready
+    private val droneRotorSpins = Array(SwarmPalette.MAX_SWARM_DRONES) { RotorSpinState() }
     private var droneOccludedBlend = 0f
     private var shaderClockSec = 0f
 
@@ -1056,6 +1057,7 @@ class GlPointCloudMapView(
             actorLineVerts = 0
             actorTriVerts = 0
 
+            stepDroneRotorSpins(dt, snap)
             buildSceneBatches(dt, snap)
 
             val zFlat = 0.08f + 0.92f * projBlend
@@ -2259,6 +2261,30 @@ class GlPointCloudMapView(
         }
     }
 
+    private fun stepDroneRotorSpins(dt: Float, snap: RenderSnapshot) {
+        if (snap.swarmCount > 1) {
+            val count = snap.swarmCount.coerceIn(2, SwarmPalette.MAX_SWARM_DRONES)
+            val focusMotors = snap.motorNorm4
+            for (id in 0 until count) {
+                val drone = snap.swarmAgents[id]
+                val isFocus = id == snap.activeDroneId
+                val wingThr = if (drone.armed) {
+                    (0.36f + (abs(drone.tiltServo1Rad) + abs(drone.tiltServo2Rad)) * 0.28f).coerceIn(0.25f, 0.92f)
+                } else {
+                    0f
+                }
+                val m0 = if (isFocus) focusMotors[0] else wingThr
+                val m1 = if (isFocus) focusMotors[1] else wingThr
+                val m2 = if (isFocus) focusMotors[2] else wingThr
+                val m3 = if (isFocus) focusMotors[3] else wingThr
+                droneRotorSpins[id].step(dt, drone.armed, m0, m1, m2, m3)
+            }
+        } else {
+            val mn = snap.motorNorm4
+            droneRotorSpins[0].step(dt, snap.armed, mn[0], mn[1], mn[2], mn[3])
+        }
+    }
+
     private fun drawVectorGlbModels(snap: RenderSnapshot, zScale: Float, occluded: Boolean) {
         if (!vectorGlb.ready) return
         val blend = projBlend
@@ -2274,10 +2300,9 @@ class GlPointCloudMapView(
             val focusMotors = snap.motorNorm4
             for (id in 0 until count) {
                 val drone = snap.swarmAgents[id]
-                if (!drone.isTiltRig) continue
                 val isFocus = id == snap.activeDroneId
                 val col = SwarmPalette.RGB_FLOAT[id]
-                val spin = if (drone.armed) shaderClockSec * 24.0f + id * 0.85f else 0f
+                val spinState = droneRotorSpins[id]
                 val wingThr = if (drone.armed) {
                     (0.36f + (abs(drone.tiltServo1Rad) + abs(drone.tiltServo2Rad)) * 0.28f).coerceIn(0.25f, 0.92f)
                 } else {
@@ -2299,7 +2324,7 @@ class GlPointCloudMapView(
                     rearTilt = drone.tiltServo2Rad * blend,
                     displayScale = (if (isFocus) 0.48f else 0.45f) * zoomScale,
                     occluded = occluded,
-                    spinPhase = spin,
+                    spinPhase = spinState.phasesRad[0],
                     armed = drone.armed,
                     m0 = m0,
                     m1 = m1,
@@ -2314,12 +2339,15 @@ class GlPointCloudMapView(
                     tintR = col[0],
                     tintG = col[1],
                     tintB = col[2],
-                    tintStrength = if (isFocus) 0.30f else 0.22f
+                    tintStrength = if (isFocus) 0.30f else 0.22f,
+                    isTiltRig = drone.isTiltRig,
+                    rotorPhases = spinState.phasesRad,
+                    rotorBlur = spinState.blurStrength
                 )
             }
-        } else if (snap.activeIsTiltRig) {
+        } else {
             val mn = snap.motorNorm4
-            val spin = if (snap.armed) shaderClockSec * 24.0f else 0f
+            val spinState = droneRotorSpins[0]
             vectorGlb.draw(
                 viewProjection = vpMatrix,
                 x = snap.uavX,
@@ -2332,7 +2360,7 @@ class GlPointCloudMapView(
                 rearTilt = snap.tiltServo2Rad * blend,
                 displayScale = 0.46f * zoomScale,
                 occluded = occluded,
-                spinPhase = spin,
+                spinPhase = spinState.phasesRad[0],
                 armed = snap.armed,
                 m0 = mn[0],
                 m1 = mn[1],
@@ -2343,7 +2371,10 @@ class GlPointCloudMapView(
                 eyeX = curEyeX,
                 eyeY = curEyeY,
                 eyeZ = curEyeZ,
-                isLightTheme = isLight
+                isLightTheme = isLight,
+                isTiltRig = snap.activeIsTiltRig,
+                rotorPhases = spinState.phasesRad,
+                rotorBlur = spinState.blurStrength
             )
         }
     }
@@ -2390,8 +2421,8 @@ class GlPointCloudMapView(
             pushActorRingXY(ux, uy, uz, sonarR, 0.030f * zoomScale, 24, 0.15f, 0.94f, 1.0f, sonarA, -1f)
         }
 
-        // The 3D tilt-UAV renderer draws in the same depth passes after these auxiliary rings/lines.
-        if (isTiltRig && vectorGlb.ready) return
+        // The 3D research UAV renderer draws both 4M2S and X4 rigs in the same depth passes after these auxiliary rings/lines.
+        if (vectorGlb.ready) return
 
         for (face in rig.faces) {
             val pts = face.pts

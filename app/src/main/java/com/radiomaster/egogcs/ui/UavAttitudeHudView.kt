@@ -35,7 +35,8 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
     private var loopDesired = true
     private var loopPosted = false
     private var lastFrameNs = 0L
-    private var hudSpinPhase = 0.4f
+    private val hudRotorSpin = RotorSpinState()
+    private var wasRotorSpinning = false
 
     companion object {
         private const val RING_SEGS = 24
@@ -285,10 +286,11 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
     }
 
     private fun pushGlPoseFromSnapshot(s: RenderSnapshot) {
-        if (!s.activeIsTiltRig) return
         val pal = GcsTheme.of(hub.themeId)
         val camAz = computeCameraAzimuth(s.yaw)
         val mn = s.motorNorm4
+        val ph = hudRotorSpin.phasesRad
+        val bl = hudRotorSpin.blurStrength
         modelTexture.updatePose(
             roll = s.smoothRoll,
             pitch = s.smoothPitch,
@@ -297,7 +299,15 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             rearTilt = s.tiltServo2Rad,
             cameraAzimuth = camAz,
             cameraElevation = camElevRad,
-            spinPhase = hudSpinPhase,
+            isTiltRig = s.activeIsTiltRig,
+            ph0 = ph[0],
+            ph1 = ph[1],
+            ph2 = ph[2],
+            ph3 = ph[3],
+            bl0 = bl[0],
+            bl1 = bl[1],
+            bl2 = bl[2],
+            bl3 = bl[3],
             armed = s.armed,
             m0 = mn[0],
             m1 = mn[1],
@@ -311,11 +321,10 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         val s = hub.snapshots.readInto(readSnapshot)
         val tid = hub.themeId
         val tiltOn = s.activeIsTiltRig
-        if (s.armed && dt > 0f) {
-            val meanThrottle = (s.motorNorm4[0] + s.motorNorm4[1] + s.motorNorm4[2] + s.motorNorm4[3]) * 0.25f
-            val omega = 18.0f + meanThrottle.coerceIn(0f, 1f) * 14.0f
-            hudSpinPhase = (hudSpinPhase + dt * omega) % (PI.toFloat() * 200f)
-        }
+        val mn = s.motorNorm4
+        val spinning = hudRotorSpin.step(dt, s.armed, mn[0], mn[1], mn[2], mn[3])
+        val stoppedEdge = wasRotorSpinning && !spinning
+        wasRotorSpinning = spinning
 
         val attChanged = abs(s.smoothRoll - lastRoll) > 0.0020f ||
             abs(s.smoothPitch - lastPitch) > 0.0020f ||
@@ -328,11 +337,11 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             s.hasLiveAttitudeQuat != lastQuatFlag ||
             s.hasLiveTiltTelemetry != lastLiveTiltFlag
 
-        if (tiltOn && (attChanged || s.armed)) {
+        if (attChanged || spinning || stoppedEdge) {
             pushGlPoseFromSnapshot(s)
         }
 
-        val needCanvasRedraw = attChanged || (!tiltOn && s.armed && hub.perfMode != 2)
+        val needCanvasRedraw = attChanged || (!modelTexture.modelReady && (spinning || stoppedEdge) && hub.perfMode != 2)
         if (needCanvasRedraw) {
             lastRoll = s.smoothRoll
             lastPitch = s.smoothPitch
@@ -373,8 +382,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         val pal = GcsTheme.of(hub.themeId)
         val tiltOn = snap.activeIsTiltRig
         val rig = DroneVectorModel.rigFor(tiltOn)
-        val textureVisibility = if (tiltOn) View.VISIBLE else View.INVISIBLE
-        if (modelTexture.visibility != textureVisibility) modelTexture.visibility = textureVisibility
+        if (modelTexture.visibility != View.VISIBLE) modelTexture.visibility = View.VISIBLE
 
         val pad = 1.0f * d
         cardRect.set(pad, pad, w - pad, h - pad)
@@ -437,25 +445,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         val yaw = snap.yaw
         val camAz = computeCameraAzimuth(yaw)
 
-        if (tiltOn) {
-            val mn = snap.motorNorm4
-            modelTexture.updatePose(
-                roll = roll,
-                pitch = pitch,
-                yaw = yaw,
-                frontTilt = snap.tiltServo1Rad,
-                rearTilt = snap.tiltServo2Rad,
-                cameraAzimuth = camAz,
-                cameraElevation = camElevRad,
-                spinPhase = hudSpinPhase,
-                armed = snap.armed,
-                m0 = mn[0],
-                m1 = mn[1],
-                m2 = mn[2],
-                m3 = mn[3],
-                isLightTheme = pal.isLight
-            )
-        }
+        pushGlPoseFromSnapshot(snap)
 
         projCosAz = cos(camAz)
         projSinAz = sin(camAz)
@@ -485,7 +475,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             bgPaint
         )
 
-        if (!tiltOn || !modelTexture.modelReady) {
+        if (!modelTexture.modelReady) {
             drawFallbackCanvasRig(canvas, rig, snap, pal, roll, pitch, yaw)
         }
 
@@ -717,7 +707,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             }
             canvas.drawPath(polyPath, rotorFillPaint)
 
-            val bladeAng = hudSpinPhase * rot.spinSign
+            val bladeAng = hudRotorSpin.phasesRad[rIdx.coerceIn(0, 3)] * rot.spinSign
             val ca = cos(bladeAng) * rot.radius * 0.92f
             val sa = sin(bladeAng) * rot.radius * 0.92f
             DroneVectorModel.transformNacellePointToWorld(rot.cx, rot.cy, rot.cz, ca, sa, 0.03f, tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld0)

@@ -7,19 +7,30 @@ import android.util.Log
 import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.nio.channels.FileChannel
+import kotlin.math.max
 
 /**
- * Renders the articulated `Friendzhb/tilt-uav-indi` 4M2S vector UAV in GLES 2.0:
- * - Uses decimated `vector_uav.glb` when bundled, or seamlessly synthesizes a solid 3D URDF-scale CAD rig.
- * - Provides 3-point hemisphere + Blinn-Phong metallic shading, grazing Fresnel rim light, X-Ray hologram
- *   mode, real-time M1..M4 propeller rotation, swept rotor discs, and 3D tilted thrust vector arrows.
+ * Renders both research UAV configurations in GLES 2.0:
+ * - **4M2S Dual-Servo Tilt-Rotor** (`isTiltRig = true`): uses `vector_uav.glb` when bundled, or
+ *   synthesizes the full solid 3D research rig (`buildProceduralTiltUav`) with woven carbon chassis,
+ *   Livox Mid-360 LiDAR + roll-cage, RealSense D435i stereo camera, Orin heatsink, LiPo + XT60,
+ *   anodized gold servo linkages, slotted outrunner motors with copper stator windings, and 3-blade
+ *   twisted carbon propellers with high-visibility painted tips.
+ * - **X4 Standard Research Quadrotor** (`isTiltRig = false`): shares the same research avionics core
+ *   paired with rigid 45-degree tubular carbon booms (`buildProceduralStandardQuad`).
+ * - Supports 3-point hemisphere + sharp Blinn-Phong metallic/emissive shading, X-Ray Fresnel hologram
+ *   pass, per-motor inertia-driven propeller rotation, directional 3-lobe motion-blur wake fans, and
+ *   throttle-scaled 3D thrust vector arrows.
  */
 internal class VectorGlbRenderer(context: Context) {
     private val assets = context.applicationContext.assets
 
-    @Volatile private var model: VectorUavMeshBuilder.PreparedModel? = null
+    @Volatile private var tiltModel: VectorUavMeshBuilder.PreparedModel? = null
+
+    @Volatile private var quadModel: VectorUavMeshBuilder.PreparedModel? = null
     private var program = 0
-    private var vertexBuffer = 0
+    private var tiltVertexBuffer = 0
+    private var quadVertexBuffer = 0
     private var aPosition = -1
     private var aNormal = -1
     private var uMvp = -1
@@ -37,14 +48,19 @@ internal class VectorGlbRenderer(context: Context) {
     private val partMatrix = FloatArray(16)
     private val mvp = FloatArray(16)
 
-    val ready: Boolean get() = model != null && program != 0 && vertexBuffer != 0
+    val ready: Boolean
+        get() = tiltModel != null && quadModel != null &&
+            program != 0 && tiltVertexBuffer != 0 && quadVertexBuffer != 0
 
     fun create() {
-        model = null
+        tiltModel = null
+        quadModel = null
         program = 0
-        vertexBuffer = 0
+        tiltVertexBuffer = 0
+        quadVertexBuffer = 0
         try {
-            val prepared = loadPreparedModel()
+            val preparedTilt = loadTiltModel()
+            val preparedQuad = loadQuadModel()
             program = createProgram()
             aPosition = GLES20.glGetAttribLocation(program, "aPosition")
             aNormal = GLES20.glGetAttribLocation(program, "aNormal")
@@ -59,32 +75,44 @@ internal class VectorGlbRenderer(context: Context) {
                     uColor >= 0 && uEyePos >= 0 && uTint >= 0 && uParams >= 0
             )
 
-            val ids = IntArray(1)
-            GLES20.glGenBuffers(1, ids, 0)
-            vertexBuffer = ids[0]
-            check(vertexBuffer != 0) { "Could not allocate UAV GL buffer" }
-            val byteCount = prepared.totalVertices * VectorUavMeshBuilder.STRIDE_BYTES
-            val uploadBuffer = prepared.vertexBuffer.duplicate().apply { position(0) }
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vertexBuffer)
-            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, byteCount, uploadBuffer, GLES20.GL_STATIC_DRAW)
-            val error = GLES20.glGetError()
-            check(error == GLES20.GL_NO_ERROR) { "UAV GL buffer upload failed: $error" }
+            val ids = IntArray(2)
+            GLES20.glGenBuffers(2, ids, 0)
+            tiltVertexBuffer = ids[0]
+            quadVertexBuffer = ids[1]
+            check(tiltVertexBuffer != 0 && quadVertexBuffer != 0) { "Could not allocate UAV GL buffers" }
+
+            uploadStaticModelVbo(tiltVertexBuffer, preparedTilt)
+            uploadStaticModelVbo(quadVertexBuffer, preparedQuad)
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
-            model = prepared
+
+            tiltModel = preparedTilt
+            quadModel = preparedQuad
         } catch (e: Exception) {
-            Log.e("VectorGlbRenderer", "Could not initialize 3D vector UAV renderer", e)
-            if (vertexBuffer != 0) GLES20.glDeleteBuffers(1, intArrayOf(vertexBuffer), 0)
+            Log.e("VectorGlbRenderer", "Could not initialize 3D research UAV renderer", e)
+            if (tiltVertexBuffer != 0) GLES20.glDeleteBuffers(1, intArrayOf(tiltVertexBuffer), 0)
+            if (quadVertexBuffer != 0) GLES20.glDeleteBuffers(1, intArrayOf(quadVertexBuffer), 0)
             if (program != 0) GLES20.glDeleteProgram(program)
-            vertexBuffer = 0
+            tiltVertexBuffer = 0
+            quadVertexBuffer = 0
             program = 0
-            model = null
+            tiltModel = null
+            quadModel = null
         }
     }
 
-    private fun loadPreparedModel(): VectorUavMeshBuilder.PreparedModel {
-        cachedPreparedModel?.let { return it }
+    private fun uploadStaticModelVbo(vboId: Int, prepared: VectorUavMeshBuilder.PreparedModel) {
+        val byteCount = prepared.totalVertices * VectorUavMeshBuilder.STRIDE_BYTES
+        val uploadBuffer = prepared.vertexBuffer.duplicate().apply { position(0) }
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, byteCount, uploadBuffer, GLES20.GL_STATIC_DRAW)
+        val error = GLES20.glGetError()
+        check(error == GLES20.GL_NO_ERROR) { "UAV GL buffer upload failed: $error" }
+    }
+
+    private fun loadTiltModel(): VectorUavMeshBuilder.PreparedModel {
+        cachedTiltModel?.let { return it }
         synchronized(MODEL_CACHE_LOCK) {
-            cachedPreparedModel?.let { return it }
+            cachedTiltModel?.let { return it }
             val built = try {
                 assets.openFd("vector_uav.glb").use { descriptor ->
                     FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
@@ -99,10 +127,20 @@ internal class VectorGlbRenderer(context: Context) {
             } catch (_: FileNotFoundException) {
                 VectorUavMeshBuilder.buildProceduralTiltUav()
             } catch (e: Exception) {
-                Log.w("VectorGlbRenderer", "Falling back to built-in 3D CAD vector UAV rig", e)
+                Log.w("VectorGlbRenderer", "Falling back to built-in 3D CAD tilt-rotor UAV rig", e)
                 VectorUavMeshBuilder.buildProceduralTiltUav()
             }
-            cachedPreparedModel = built
+            cachedTiltModel = built
+            return built
+        }
+    }
+
+    private fun loadQuadModel(): VectorUavMeshBuilder.PreparedModel {
+        cachedQuadModel?.let { return it }
+        synchronized(MODEL_CACHE_LOCK) {
+            cachedQuadModel?.let { return it }
+            val built = VectorUavMeshBuilder.buildProceduralStandardQuad()
+            cachedQuadModel = built
             return built
         }
     }
@@ -134,10 +172,10 @@ internal class VectorGlbRenderer(context: Context) {
             occluded = occluded,
             spinPhase = 0f,
             armed = false,
-            m0 = 0.35f,
-            m1 = 0.35f,
-            m2 = 0.35f,
-            m3 = 0.35f,
+            m0 = 0f,
+            m1 = 0f,
+            m2 = 0f,
+            m3 = 0f,
             showThrustVectors = false,
             showHeadingCue = false,
             eyeX = x + 2.2f,
@@ -174,10 +212,14 @@ internal class VectorGlbRenderer(context: Context) {
         tintR: Float = 0f,
         tintG: Float = 0.90f,
         tintB: Float = 0.46f,
-        tintStrength: Float = 0f
+        tintStrength: Float = 0f,
+        isTiltRig: Boolean = true,
+        rotorPhases: FloatArray? = null,
+        rotorBlur: FloatArray? = null
     ) {
-        val loaded = model ?: return
-        if (!ready || !x.isFinite() || !y.isFinite() || !z.isFinite() ||
+        val loaded = (if (isTiltRig) tiltModel else quadModel) ?: return
+        val activeVbo = if (isTiltRig) tiltVertexBuffer else quadVertexBuffer
+        if (!ready || activeVbo == 0 || !x.isFinite() || !y.isFinite() || !z.isFinite() ||
             !roll.isFinite() || !pitch.isFinite() || !yaw.isFinite() ||
             !frontTilt.isFinite() || !rearTilt.isFinite()
         ) {
@@ -192,11 +234,16 @@ internal class VectorGlbRenderer(context: Context) {
         val scale = displayScale / VectorUavMeshBuilder.ARM_SPAN_RADIUS
         Matrix.scaleM(body, 0, scale, scale, scale)
         Matrix.translateM(body, 0, 0f, 0f, -0.05f)
-        rotateGroup(front, body, loaded.frontPivot, frontTilt)
-        rotateGroup(rear, body, loaded.rearPivot, rearTilt)
+        if (isTiltRig) {
+            rotateGroup(front, body, loaded.frontPivot, frontTilt)
+            rotateGroup(rear, body, loaded.rearPivot, rearTilt)
+        } else {
+            System.arraycopy(body, 0, front, 0, 16)
+            System.arraycopy(body, 0, rear, 0, 16)
+        }
 
         GLES20.glUseProgram(program)
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vertexBuffer)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, activeVbo)
         GLES20.glEnableVertexAttribArray(aPosition)
         GLES20.glEnableVertexAttribArray(aNormal)
         GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, VectorUavMeshBuilder.STRIDE_BYTES, 0)
@@ -213,6 +260,16 @@ internal class VectorGlbRenderer(context: Context) {
             GLES20.glDepthMask(true)
         }
 
+        val hasPhaseArr = rotorPhases != null && rotorPhases.size >= 4
+        val hasBlurArr = rotorBlur != null && rotorBlur.size >= 4
+        var maxRotorBlur = 0f
+        if (hasBlurArr) {
+            val rb = requireNotNull(rotorBlur)
+            maxRotorBlur = max(max(rb[0], rb[1]), max(rb[2], rb[3]))
+        } else if (armed) {
+            maxRotorBlur = 0.72f
+        }
+
         val parts = loaded.parts
         var pIdx = 0
         while (pIdx < parts.size) {
@@ -224,14 +281,20 @@ internal class VectorGlbRenderer(context: Context) {
                 else -> body
             }
             val rIdx = part.rotorIndex
-            if (rIdx in 1..4 && (armed || spinPhase != 0f)) {
-                val hub = loaded.rotorHubs[rIdx - 1]
-                val deg = (spinPhase * hub.spinSign * RAD_TO_DEG) % 360f
-                System.arraycopy(group, 0, spinTemp, 0, 16)
-                Matrix.translateM(spinTemp, 0, hub.x, hub.y, 0f)
-                Matrix.rotateM(spinTemp, 0, deg, 0f, 0f, 1f)
-                Matrix.translateM(spinTemp, 0, -hub.x, -hub.y, 0f)
-                Matrix.multiplyMM(partMatrix, 0, spinTemp, 0, part.transform, 0)
+            if (rIdx in 1..4) {
+                val mIdx = rIdx - 1
+                val phase = if (hasPhaseArr) requireNotNull(rotorPhases)[mIdx] else spinPhase
+                if (phase != 0f) {
+                    val hub = loaded.rotorHubs[mIdx]
+                    val deg = (phase * hub.spinSign * RAD_TO_DEG) % 360f
+                    System.arraycopy(group, 0, spinTemp, 0, 16)
+                    Matrix.translateM(spinTemp, 0, hub.x, hub.y, 0f)
+                    Matrix.rotateM(spinTemp, 0, deg, 0f, 0f, 1f)
+                    Matrix.translateM(spinTemp, 0, -hub.x, -hub.y, 0f)
+                    Matrix.multiplyMM(partMatrix, 0, spinTemp, 0, part.transform, 0)
+                } else {
+                    Matrix.multiplyMM(partMatrix, 0, group, 0, part.transform, 0)
+                }
             } else {
                 Matrix.multiplyMM(partMatrix, 0, group, 0, part.transform, 0)
             }
@@ -239,18 +302,26 @@ internal class VectorGlbRenderer(context: Context) {
             GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
             GLES20.glUniformMatrix4fv(uModel, 1, false, partMatrix, 0)
             if (occluded) {
-                GLES20.glUniform3f(uParams, 0f, 1f, darkCarbonLift)
+                GLES20.glUniform4f(uParams, 0f, 1f, darkCarbonLift, 0f)
                 GLES20.glUniform4f(uColor, 0.16f, 0.88f, 1.0f, 0.38f)
             } else {
-                val partTintBoost = if (part.group == 0 && tintStrength > 0.01f) tintStrength else tintStrength * 0.35f
+                val partTintBoost = when {
+                    part.rotorIndex > 0 -> 0f
+                    part.emissive > 0.25f -> tintStrength * 0.15f
+                    part.group == 0 && tintStrength > 0.01f -> tintStrength
+                    else -> tintStrength * 0.35f
+                }
                 GLES20.glUniform4f(uTint, tintR, tintG, tintB, partTintBoost)
-                GLES20.glUniform3f(uParams, part.specular, 0f, darkCarbonLift)
+                GLES20.glUniform4f(uParams, part.specular, 0f, darkCarbonLift, part.emissive)
                 GLES20.glUniform4fv(uColor, 1, part.color, 0)
             }
             GLES20.glDrawArrays(GLES20.GL_TRIANGLES, part.firstVertex, part.vertexCount)
         }
 
-        if (!occluded && (armed || showThrustVectors || showHeadingCue)) {
+        val anyRotorActive = maxRotorBlur > 0.008f
+        val drawActiveThrust = showThrustVectors && (armed || anyRotorActive)
+
+        if (!occluded && (anyRotorActive || drawActiveThrust || showHeadingCue)) {
             GLES20.glEnable(GLES20.GL_BLEND)
             GLES20.glBlendFuncSeparate(
                 GLES20.GL_SRC_ALPHA,
@@ -259,27 +330,30 @@ internal class VectorGlbRenderer(context: Context) {
                 GLES20.GL_ONE_MINUS_SRC_ALPHA
             )
             GLES20.glDepthMask(false)
-            GLES20.glUniform3f(uParams, 0f, 2f, darkCarbonLift)
             GLES20.glUniform4f(uTint, 0f, 0f, 0f, 0f)
 
-            if (armed || showThrustVectors) {
+            if (anyRotorActive || drawActiveThrust) {
                 drawRotorOverlaysAndThrustVectors(
                     loaded = loaded,
                     viewProjection = viewProjection,
                     spinPhase = spinPhase,
+                    rotorPhases = rotorPhases,
+                    rotorBlur = rotorBlur,
                     armed = armed,
                     m0 = m0,
                     m1 = m1,
                     m2 = m2,
                     m3 = m3,
-                    showThrustVectors = showThrustVectors,
-                    isLightTheme = isLightTheme
+                    drawActiveThrust = drawActiveThrust,
+                    isLightTheme = isLightTheme,
+                    darkCarbonLift = darkCarbonLift
                 )
             }
 
             if (showHeadingCue) {
+                GLES20.glUniform4f(uParams, 0f, 2f, darkCarbonLift, 0f)
                 Matrix.setIdentityM(auxLocal, 0)
-                Matrix.translateM(auxLocal, 0, 0.114f, 0f, 0.054f)
+                Matrix.translateM(auxLocal, 0, 0.118f, 0f, 0.056f)
                 Matrix.scaleM(auxLocal, 0, 0.068f, 0.042f, 1f)
                 Matrix.multiplyMM(partMatrix, 0, body, 0, auxLocal, 0)
                 Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
@@ -294,8 +368,8 @@ internal class VectorGlbRenderer(context: Context) {
 
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
             GLES20.glDepthMask(true)
-        } else if (occluded && showThrustVectors) {
-            GLES20.glUniform3f(uParams, 0f, 2f, darkCarbonLift)
+        } else if (occluded && drawActiveThrust) {
+            GLES20.glUniform4f(uParams, 0f, 2f, darkCarbonLift, 0f)
             drawOccludedThrustVectors(loaded, viewProjection, m0, m1, m2, m3)
         }
 
@@ -308,65 +382,107 @@ internal class VectorGlbRenderer(context: Context) {
         loaded: VectorUavMeshBuilder.PreparedModel,
         viewProjection: FloatArray,
         spinPhase: Float,
+        rotorPhases: FloatArray?,
+        rotorBlur: FloatArray?,
         armed: Boolean,
         m0: Float,
         m1: Float,
         m2: Float,
         m3: Float,
-        showThrustVectors: Boolean,
-        isLightTheme: Boolean
+        drawActiveThrust: Boolean,
+        isLightTheme: Boolean,
+        darkCarbonLift: Float
     ) {
         val hubs = loaded.rotorHubs
+        val hasPhases = rotorPhases != null && rotorPhases.size >= 4
+        val hasBlurs = rotorBlur != null && rotorBlur.size >= 4
+
         var i = 0
         while (i < 4) {
             val hub = hubs[i]
-            val group = if (hub.group == 1) front else rear
+            val group = when (hub.group) {
+                1 -> front
+                2 -> rear
+                else -> body
+            }
             val throttle = when (i) {
                 0 -> m0
                 1 -> m1
                 2 -> m2
                 else -> m3
             }.coerceIn(0f, 1f)
+            val phase = if (hasPhases) requireNotNull(rotorPhases)[i] else spinPhase
+            val blur = if (hasBlurs) {
+                requireNotNull(rotorBlur)[i].coerceIn(0f, 1f)
+            } else if (armed) {
+                (0.45f + throttle * 0.50f).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
             i++
 
-            val navR = if (hub.isFront) 1.00f else 0.06f
-            val navG = if (hub.isFront) 0.30f else 0.90f
-            val navB = if (hub.isFront) 0.24f else 0.50f
+            if (blur > 0.008f) {
+                // Mode 3.0: Per-vertex feathered motion-blur disc, directional 3-blade wake & tip-vortex ring
+                GLES20.glUniform4f(uParams, 0f, 3f, darkCarbonLift, 0f)
 
-            Matrix.setIdentityM(auxLocal, 0)
-            Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.0014f)
-            Matrix.rotateM(auxLocal, 0, (spinPhase * hub.spinSign * RAD_TO_DEG) % 360f, 0f, 0f, 1f)
-            Matrix.scaleM(auxLocal, 0, hub.radius, hub.radius, 1f)
-            Matrix.multiplyMM(partMatrix, 0, group, 0, auxLocal, 0)
-            Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
-            GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
-            GLES20.glUniformMatrix4fv(uModel, 1, false, partMatrix, 0)
-
-            val discAlpha = if (armed) (if (isLightTheme) 0.19f else 0.14f) else 0.06f
-            GLES20.glUniform4f(uColor, navR, navG, navB, discAlpha)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorDisc.firstVertex, loaded.rotorDisc.vertexCount)
-
-            if (armed) {
-                val sweepCol = if (isLightTheme) 0.22f else 0.92f
-                val sweepAlpha = if (isLightTheme) 0.22f else 0.20f
-                GLES20.glUniform4f(uColor, sweepCol, sweepCol + 0.04f, minOf(1f, sweepCol + 0.08f), sweepAlpha)
-                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorSweep.firstVertex, loaded.rotorSweep.vertexCount)
-            }
-
-            val ringAlpha = if (armed) 0.62f else 0.36f
-            GLES20.glUniform4f(uColor, navR, navG, navB, ringAlpha)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorRing.firstVertex, loaded.rotorRing.vertexCount)
-
-            if (showThrustVectors) {
-                val shaftLen = 0.038f + throttle * 0.056f
-                val vr = if (hub.group == 1) 1.00f else 0.14f
-                val vg = if (hub.group == 1) 0.78f else 0.80f
-                val vb = if (hub.group == 1) 0.06f else 1.00f
-                val va = if (armed) 0.88f else 0.48f
+                val navR = if (hub.isFront) 1.00f else 0.08f
+                val navG = if (hub.isFront) 0.36f else 0.94f
+                val navB = if (hub.isFront) 0.14f else 0.54f
 
                 Matrix.setIdentityM(auxLocal, 0)
-                Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.003f)
-                Matrix.scaleM(auxLocal, 0, 0.0029f, 0.0029f, shaftLen)
+                Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.0018f)
+                Matrix.rotateM(auxLocal, 0, (phase * hub.spinSign * RAD_TO_DEG) % 360f, 0f, 0f, 1f)
+                Matrix.scaleM(auxLocal, 0, hub.radius, hub.radius, 1f)
+                Matrix.multiplyMM(partMatrix, 0, group, 0, auxLocal, 0)
+                Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
+                GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+                GLES20.glUniformMatrix4fv(uModel, 1, false, partMatrix, 0)
+
+                val discAlpha = (if (isLightTheme) 0.20f else 0.16f) * blur
+                GLES20.glUniform4f(uColor, navR, navG, navB, discAlpha)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorDisc.firstVertex, loaded.rotorDisc.vertexCount)
+
+                val sweepSpan = if (hub.spinSign >= 0) loaded.rotorSweepCcw else loaded.rotorSweepCw
+                val sweepBase = if (isLightTheme) 0.24f else 0.90f
+                val sweepAlpha = (if (isLightTheme) 0.32f else 0.28f) * blur
+                GLES20.glUniform4f(
+                    uColor,
+                    sweepBase,
+                    minOf(1f, sweepBase + 0.04f),
+                    minOf(1f, sweepBase + 0.08f),
+                    sweepAlpha
+                )
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, sweepSpan.firstVertex, sweepSpan.vertexCount)
+
+                val ringAlpha = (if (isLightTheme) 0.72f else 0.68f) * blur
+                GLES20.glUniform4f(uColor, navR, navG, navB, ringAlpha)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.rotorRing.firstVertex, loaded.rotorRing.vertexCount)
+            }
+
+            if (drawActiveThrust && (armed || blur > 0.02f)) {
+                GLES20.glUniform4f(uParams, 0f, 2f, darkCarbonLift, 0f)
+                val effThrottle = max(throttle, blur * 0.42f)
+                val shaftLen = 0.034f + effThrottle * 0.058f
+                val vr = when (hub.group) {
+                    1 -> 1.00f
+                    2 -> 0.14f
+                    else -> if (hub.isFront) 1.00f else 0.10f
+                }
+                val vg = when (hub.group) {
+                    1 -> 0.78f
+                    2 -> 0.80f
+                    else -> if (hub.isFront) 0.56f else 0.92f
+                }
+                val vb = when (hub.group) {
+                    1 -> 0.06f
+                    2 -> 1.00f
+                    else -> if (hub.isFront) 0.16f else 0.62f
+                }
+                val va = (if (armed) 0.86f else 0.72f * blur).coerceIn(0f, 0.90f)
+
+                Matrix.setIdentityM(auxLocal, 0)
+                Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.004f)
+                Matrix.scaleM(auxLocal, 0, 0.0028f, 0.0028f, shaftLen)
                 Matrix.multiplyMM(partMatrix, 0, group, 0, auxLocal, 0)
                 Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
                 GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
@@ -375,8 +491,8 @@ internal class VectorGlbRenderer(context: Context) {
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLES, loaded.thrustShaft.firstVertex, loaded.thrustShaft.vertexCount)
 
                 Matrix.setIdentityM(auxLocal, 0)
-                Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.003f + shaftLen)
-                Matrix.scaleM(auxLocal, 0, 0.0072f, 0.0072f, 0.019f)
+                Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.004f + shaftLen)
+                Matrix.scaleM(auxLocal, 0, 0.0070f, 0.0070f, 0.018f)
                 Matrix.multiplyMM(partMatrix, 0, group, 0, auxLocal, 0)
                 Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
                 GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
@@ -399,7 +515,11 @@ internal class VectorGlbRenderer(context: Context) {
         var i = 0
         while (i < 4) {
             val hub = hubs[i]
-            val group = if (hub.group == 1) front else rear
+            val group = when (hub.group) {
+                1 -> front
+                2 -> rear
+                else -> body
+            }
             val throttle = when (i) {
                 0 -> m0
                 1 -> m1
@@ -407,13 +527,13 @@ internal class VectorGlbRenderer(context: Context) {
                 else -> m3
             }.coerceIn(0f, 1f)
             i++
-            val shaftLen = 0.038f + throttle * 0.056f
-            val vr = if (hub.group == 1) 1.00f else 0.18f
-            val vg = if (hub.group == 1) 0.80f else 0.86f
-            val vb = if (hub.group == 1) 0.12f else 1.00f
+            val shaftLen = 0.036f + throttle * 0.056f
+            val vr = if (hub.isFront) 1.00f else 0.18f
+            val vg = if (hub.isFront) 0.78f else 0.86f
+            val vb = if (hub.isFront) 0.12f else 1.00f
 
             Matrix.setIdentityM(auxLocal, 0)
-            Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.003f)
+            Matrix.translateM(auxLocal, 0, hub.x, hub.y, hub.z + 0.004f)
             Matrix.scaleM(auxLocal, 0, 0.0028f, 0.0028f, shaftLen)
             Matrix.multiplyMM(partMatrix, 0, group, 0, auxLocal, 0)
             Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
@@ -467,7 +587,9 @@ internal class VectorGlbRenderer(context: Context) {
         private const val RAD_TO_DEG = 57.2957795f
         private val MODEL_CACHE_LOCK = Any()
 
-        @Volatile private var cachedPreparedModel: VectorUavMeshBuilder.PreparedModel? = null
+        @Volatile private var cachedTiltModel: VectorUavMeshBuilder.PreparedModel? = null
+
+        @Volatile private var cachedQuadModel: VectorUavMeshBuilder.PreparedModel? = null
 
         private const val VERTEX_SHADER = """
             attribute vec3 aPosition;
@@ -476,10 +598,12 @@ internal class VectorGlbRenderer(context: Context) {
             uniform mat4 uModel;
             varying vec3 vWorldPos;
             varying vec3 vWorldNormal;
+            varying float vFade;
             void main() {
                 vec4 wp = uModel * vec4(aPosition, 1.0);
                 vWorldPos = wp.xyz;
                 vWorldNormal = (uModel * vec4(aNormal, 0.0)).xyz;
+                vFade = clamp(aNormal.z, 0.0, 1.0);
                 gl_Position = uMvp * vec4(aPosition, 1.0);
             }
         """
@@ -488,10 +612,15 @@ internal class VectorGlbRenderer(context: Context) {
             uniform vec4 uColor;
             uniform vec3 uEyePos;
             uniform vec4 uTint;
-            uniform vec3 uParams;
+            uniform vec4 uParams;
             varying vec3 vWorldPos;
             varying vec3 vWorldNormal;
+            varying float vFade;
             void main() {
+                if (uParams.y > 2.5) {
+                    gl_FragColor = vec4(uColor.rgb, uColor.a * vFade);
+                    return;
+                }
                 vec3 n = normalize(vWorldNormal);
                 vec3 v = normalize(uEyePos - vWorldPos);
                 if (uParams.y > 1.5) {
@@ -509,20 +638,21 @@ internal class VectorGlbRenderer(context: Context) {
                     n = -n;
                 }
                 vec3 base = mix(uColor.rgb, uTint.rgb, uTint.a);
-                base = max(base, vec3(0.15, 0.18, 0.23) * uParams.z);
+                float liftMask = uParams.z * (1.0 - clamp(uParams.w, 0.0, 1.0));
+                base = max(base, vec3(0.12, 0.14, 0.19) * liftMask);
                 float hemi = n.z * 0.5 + 0.5;
-                vec3 amb = mix(vec3(0.26, 0.30, 0.36), vec3(0.58, 0.64, 0.74), hemi);
-                vec3 lKey = normalize(vec3(0.42, -0.36, 0.83));
-                vec3 lFill = normalize(vec3(-0.58, 0.52, 0.28));
+                vec3 amb = mix(vec3(0.24, 0.28, 0.35), vec3(0.58, 0.65, 0.76), hemi);
+                vec3 lKey = normalize(vec3(0.44, -0.38, 0.81));
+                vec3 lFill = normalize(vec3(-0.56, 0.54, 0.30));
                 float diffKey = max(dot(n, lKey), 0.0);
                 float diffFill = max(dot(n, lFill), 0.0);
                 vec3 hVec = normalize(lKey + v);
                 float specDot = clamp(dot(n, hVec), 0.0001, 1.0);
-                float spec = (dot(n, hVec) > 0.0 ? pow(specDot, 26.0) : 0.0) * uParams.x;
-                float fres = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0001, 1.0), 2.8);
-                vec3 rim = mix(vec3(0.52, 0.80, 1.0), uTint.rgb, uTint.a * 0.65) * (fres * (0.20 + 0.16 * uParams.z));
-                vec3 lit = base * (amb + vec3(0.70, 0.68, 0.65) * diffKey + vec3(0.24, 0.30, 0.38) * diffFill) +
-                    vec3(0.88, 0.94, 1.0) * spec + rim;
+                float spec = (dot(n, hVec) > 0.0 ? pow(specDot, 34.0) : 0.0) * uParams.x;
+                float fres = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0001, 1.0), 2.85);
+                vec3 rim = mix(vec3(0.54, 0.82, 1.0), uTint.rgb, uTint.a * 0.65) * (fres * (0.18 + 0.15 * uParams.z));
+                vec3 lit = base * (amb + vec3(0.74, 0.72, 0.68) * diffKey + vec3(0.24, 0.30, 0.38) * diffFill + uParams.w) +
+                    vec3(0.92, 0.96, 1.0) * spec + rim;
                 gl_FragColor = vec4(min(lit, vec3(1.0)), uColor.a);
             }
         """

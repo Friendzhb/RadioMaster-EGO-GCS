@@ -64,4 +64,59 @@ class RenderSchedulingTest {
         assertEquals(200f, metrics.lastCpuMs, 0.001f)
         assertEquals(200f, metrics.p95CpuMs(), 0.001f)
     }
+
+    @Test fun rotorSpinStaysCompletelyStillWhenDisarmedAndZeroThrottle() {
+        val rotor = RotorSpinState()
+        val initialPhases = rotor.phasesRad.clone()
+        repeat(60) {
+            assertFalse(rotor.step(1f / 60f, armed = false, m0 = 0f, m1 = 0f, m2 = 0f, m3 = 0f))
+        }
+        assertFalse(rotor.isSpinning)
+        assertArrayEquals(initialPhases, rotor.phasesRad, 0.0f)
+        for (i in 0..3) {
+            assertEquals(0f, rotor.omegaNorm[i], 0.0f)
+            assertEquals(0f, rotor.blurStrength[i], 0.0f)
+        }
+    }
+
+    @Test fun rotorSpinSpoolsUpWithInertiaAndCoastsToZeroOnDisarm() {
+        val rotor = RotorSpinState()
+        val p0Before = rotor.phasesRad[0]
+        assertTrue(rotor.step(1f / 60f, armed = true, m0 = 0.55f, m1 = 0.55f, m2 = 0.55f, m3 = 0.55f))
+        val firstOmega = rotor.omegaNorm[0]
+        assertTrue("First step should spool up gradually with inertia", firstOmega > 0.02f && firstOmega < 0.45f)
+        assertNotEquals(p0Before, rotor.phasesRad[0], 0.0001f)
+
+        repeat(45) {
+            assertTrue(rotor.step(1f / 60f, armed = true, m0 = 0.55f, m1 = 0.55f, m2 = 0.55f, m3 = 0.55f))
+        }
+        assertTrue(rotor.omegaNorm[0] > 0.65f)
+        assertTrue(rotor.blurStrength[0] > 0.60f)
+
+        // Frozen clock (dt == 0f) must never drift phases or blur (preserves GL cache benchmark parity)
+        val frozenPhases = rotor.phasesRad.clone()
+        val frozenBlurs = rotor.blurStrength.clone()
+        assertTrue(rotor.step(0f, armed = true, m0 = 0.55f, m1 = 0.55f, m2 = 0.55f, m3 = 0.55f))
+        assertArrayEquals(frozenPhases, rotor.phasesRad, 0.0f)
+        assertArrayEquals(frozenBlurs, rotor.blurStrength, 0.0f)
+
+        // Disarming must coast down over multiple frames before snapping cleanly to exact rest
+        assertTrue(
+            "Immediately after disarming, rotors should still coast with inertia",
+            rotor.step(1f / 60f, armed = false, m0 = 0f, m1 = 0f, m2 = 0f, m3 = 0f)
+        )
+        assertTrue(rotor.omegaNorm[0] > 0.1f)
+        repeat(90) {
+            rotor.step(1f / 60f, armed = false, m0 = 0f, m1 = 0f, m2 = 0f, m3 = 0f)
+        }
+        assertFalse("Rotors must come to a full stop after coast-down", rotor.isSpinning)
+        for (i in 0..3) {
+            assertEquals(0f, rotor.omegaNorm[i], 0.0f)
+            assertEquals(0f, rotor.blurStrength[i], 0.0f)
+        }
+
+        // Direct motor throttle > threshold without explicit arm flag should also spin rotors
+        assertTrue(rotor.step(1f / 60f, armed = false, m0 = 0.35f, m1 = 0.35f, m2 = 0.35f, m3 = 0.35f))
+        assertTrue(rotor.isSpinning)
+    }
 }

@@ -54,7 +54,28 @@ class VectorGlbAssetTest {
 
         val rotorIds = prepared.parts.filter { it.rotorIndex > 0 }.map { it.rotorIndex }.toSet()
         assertEquals(setOf(1, 2, 3, 4), rotorIds)
+        assertTrue(prepared.parts.any { it.name.startsWith("prop_tip_") && it.emissive > 0.1f })
 
+        assertAllVertexNormalsUnitLength(prepared)
+    }
+
+    @Test fun proceduralStandardQuadHasRigidAvionicsAndFourSpinningRotors() {
+        val prepared = VectorUavMeshBuilder.buildProceduralStandardQuad()
+        assertTrue(prepared.isProceduralFallback)
+        assertEquals(4, prepared.rotorHubs.size)
+        assertTrue(prepared.parts.all { it.group == 0 })
+        assertTrue(prepared.rotorHubs.all { it.group == 0 })
+
+        val rotorIds = prepared.parts.filter { it.rotorIndex > 0 }.map { it.rotorIndex }.toSet()
+        assertEquals(setOf(1, 2, 3, 4), rotorIds)
+        assertTrue(prepared.parts.any { it.name == "sensor_optics_visual" })
+        assertTrue(prepared.parts.any { it.name == "stator_m1_visual" })
+        assertTrue(prepared.parts.any { it.name.startsWith("prop_tip_") && it.emissive > 0.1f })
+
+        assertAllVertexNormalsUnitLength(prepared)
+    }
+
+    private fun assertAllVertexNormalsUnitLength(prepared: VectorUavMeshBuilder.PreparedModel) {
         val buf = prepared.vertexBuffer.duplicate()
         assertEquals(prepared.totalVertices * VectorUavMeshBuilder.STRIDE_FLOATS, buf.limit())
         for (v in 0 until prepared.totalVertices) {
