@@ -6,6 +6,7 @@ ROS1/TCPROS 与 rosbridge 通信、MAVLink 遥测、EGO 航线显示及本地仿
 3.12.0 增加保留画质的渲染缓存、点云分块上传及可选的 ROS→UDP 点云/位姿入口。
 UDP 设置和机载桥接用法见 [ROS UDP 说明](docs/ROS_UDP.md)。
 矢量无人机原始 GLB 模型和前后倾转轴的接入说明见 [模型说明](docs/VECTOR_UAV_GLB.md)。
+全局物理弹簧动效架构、操作映射及后期迭代准入标准见 [交互动效规范](docs/MOTION_DESIGN_SYSTEM.md)。
 
 仓库直接维护 Android 源码。应用功能说明的原始版本见
 [原工程说明](docs/ORIGINAL_PROJECT_README.md)，此次源码迁移及构建修复见

@@ -64,9 +64,9 @@ internal class VectorGlbRenderer(context: Context) {
             vertexBuffer = ids[0]
             check(vertexBuffer != 0) { "Could not allocate UAV GL buffer" }
             val byteCount = prepared.totalVertices * VectorUavMeshBuilder.STRIDE_BYTES
-            prepared.vertexBuffer.position(0)
+            val uploadBuffer = prepared.vertexBuffer.duplicate().apply { position(0) }
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vertexBuffer)
-            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, byteCount, prepared.vertexBuffer, GLES20.GL_STATIC_DRAW)
+            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, byteCount, uploadBuffer, GLES20.GL_STATIC_DRAW)
             val error = GLES20.glGetError()
             check(error == GLES20.GL_NO_ERROR) { "UAV GL buffer upload failed: $error" }
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
@@ -82,22 +82,28 @@ internal class VectorGlbRenderer(context: Context) {
     }
 
     private fun loadPreparedModel(): VectorUavMeshBuilder.PreparedModel {
-        return try {
-            assets.openFd("vector_uav.glb").use { descriptor ->
-                FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
-                    val mapped = channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.length)
-                    val parsed = VectorGlbAsset.parse(mapped)
-                    val binary = mapped.duplicate()
-                    binary.position(parsed.binaryOffset)
-                    binary.limit(parsed.binaryOffset + parsed.binaryLength)
-                    VectorUavMeshBuilder.prepareFromGlb(parsed, binary.slice())
+        cachedPreparedModel?.let { return it }
+        synchronized(MODEL_CACHE_LOCK) {
+            cachedPreparedModel?.let { return it }
+            val built = try {
+                assets.openFd("vector_uav.glb").use { descriptor ->
+                    FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
+                        val mapped = channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.length)
+                        val parsed = VectorGlbAsset.parse(mapped)
+                        val binary = mapped.duplicate()
+                        binary.position(parsed.binaryOffset)
+                        binary.limit(parsed.binaryOffset + parsed.binaryLength)
+                        VectorUavMeshBuilder.prepareFromGlb(parsed, binary.slice())
+                    }
                 }
+            } catch (_: FileNotFoundException) {
+                VectorUavMeshBuilder.buildProceduralTiltUav()
+            } catch (e: Exception) {
+                Log.w("VectorGlbRenderer", "Falling back to built-in 3D CAD vector UAV rig", e)
+                VectorUavMeshBuilder.buildProceduralTiltUav()
             }
-        } catch (_: FileNotFoundException) {
-            VectorUavMeshBuilder.buildProceduralTiltUav()
-        } catch (e: Exception) {
-            Log.w("VectorGlbRenderer", "Falling back to built-in 3D CAD vector UAV rig", e)
-            VectorUavMeshBuilder.buildProceduralTiltUav()
+            cachedPreparedModel = built
+            return built
         }
     }
 
@@ -208,8 +214,10 @@ internal class VectorGlbRenderer(context: Context) {
         }
 
         val parts = loaded.parts
-        for (pIdx in parts.indices) {
+        var pIdx = 0
+        while (pIdx < parts.size) {
             val part = parts[pIdx]
+            pIdx++
             val group = when (part.group) {
                 1 -> front
                 2 -> rear
@@ -293,6 +301,7 @@ internal class VectorGlbRenderer(context: Context) {
 
         GLES20.glDisableVertexAttribArray(aPosition)
         GLES20.glDisableVertexAttribArray(aNormal)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
     }
 
     private fun drawRotorOverlaysAndThrustVectors(
@@ -308,7 +317,8 @@ internal class VectorGlbRenderer(context: Context) {
         isLightTheme: Boolean
     ) {
         val hubs = loaded.rotorHubs
-        for (i in 0..3) {
+        var i = 0
+        while (i < 4) {
             val hub = hubs[i]
             val group = if (hub.group == 1) front else rear
             val throttle = when (i) {
@@ -317,6 +327,7 @@ internal class VectorGlbRenderer(context: Context) {
                 2 -> m2
                 else -> m3
             }.coerceIn(0f, 1f)
+            i++
 
             val navR = if (hub.isFront) 1.00f else 0.06f
             val navG = if (hub.isFront) 0.30f else 0.90f
@@ -385,7 +396,8 @@ internal class VectorGlbRenderer(context: Context) {
         m3: Float
     ) {
         val hubs = loaded.rotorHubs
-        for (i in 0..3) {
+        var i = 0
+        while (i < 4) {
             val hub = hubs[i]
             val group = if (hub.group == 1) front else rear
             val throttle = when (i) {
@@ -394,6 +406,7 @@ internal class VectorGlbRenderer(context: Context) {
                 2 -> m2
                 else -> m3
             }.coerceIn(0f, 1f)
+            i++
             val shaftLen = 0.038f + throttle * 0.056f
             val vr = if (hub.group == 1) 1.00f else 0.18f
             val vg = if (hub.group == 1) 0.80f else 0.86f
@@ -452,6 +465,10 @@ internal class VectorGlbRenderer(context: Context) {
 
     companion object {
         private const val RAD_TO_DEG = 57.2957795f
+        private val MODEL_CACHE_LOCK = Any()
+
+        @Volatile private var cachedPreparedModel: VectorUavMeshBuilder.PreparedModel? = null
+
         private const val VERTEX_SHADER = """
             attribute vec3 aPosition;
             attribute vec3 aNormal;
@@ -483,7 +500,7 @@ internal class VectorGlbRenderer(context: Context) {
                     return;
                 }
                 if (uParams.y > 0.5) {
-                    float fres = pow(1.0 - abs(dot(n, v)), 1.75);
+                    float fres = pow(clamp(1.0 - abs(dot(n, v)), 0.0001, 1.0), 1.75);
                     vec3 holo = mix(vec3(0.15, 0.88, 1.0), uTint.rgb, uTint.a * 0.65);
                     gl_FragColor = vec4(min(holo * (0.72 + 0.52 * fres), vec3(1.0)), clamp(0.24 + 0.46 * fres, 0.22, 0.72));
                     return;
@@ -500,8 +517,9 @@ internal class VectorGlbRenderer(context: Context) {
                 float diffKey = max(dot(n, lKey), 0.0);
                 float diffFill = max(dot(n, lFill), 0.0);
                 vec3 hVec = normalize(lKey + v);
-                float spec = pow(max(dot(n, hVec), 0.0), 26.0) * uParams.x;
-                float fres = pow(1.0 - max(dot(n, v), 0.0), 2.8);
+                float specDot = clamp(dot(n, hVec), 0.0001, 1.0);
+                float spec = (dot(n, hVec) > 0.0 ? pow(specDot, 26.0) : 0.0) * uParams.x;
+                float fres = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0001, 1.0), 2.8);
                 vec3 rim = mix(vec3(0.52, 0.80, 1.0), uTint.rgb, uTint.a * 0.65) * (fres * (0.20 + 0.16 * uParams.z));
                 vec3 lit = base * (amb + vec3(0.70, 0.68, 0.65) * diffKey + vec3(0.24, 0.30, 0.38) * diffFill) +
                     vec3(0.88, 0.94, 1.0) * spec + rim;

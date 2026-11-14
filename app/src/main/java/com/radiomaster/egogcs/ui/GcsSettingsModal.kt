@@ -12,7 +12,6 @@ import android.text.TextUtils
 import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -23,9 +22,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
-import androidx.dynamicanimation.animation.DynamicAnimation
-import androidx.dynamicanimation.animation.SpringAnimation
-import androidx.dynamicanimation.animation.SpringForce
 import com.radiomaster.egogcs.model.GcsSharedHub
 import com.radiomaster.egogcs.model.RenderSnapshot
 import com.radiomaster.egogcs.model.TiltConfigSpec
@@ -148,6 +144,7 @@ class GcsSettingsModal(
 
     private val themeSegBtns = mutableListOf<TextView>()
     private val perfModeSegBtns = mutableListOf<TextView>()
+    private val animStyleSegBtns = mutableListOf<TextView>()
     private val voxelResBtns = mutableListOf<TextView>()
     private lateinit var swXray: ToggleSyncHandle
     private lateinit var swHaptics: ToggleSyncHandle
@@ -158,6 +155,7 @@ class GcsSettingsModal(
     private val cancelFactoryConfirmRunnable = Runnable {
         factoryResetConfirmPending = false
         if (::btnResetFactory.isInitialized) {
+            AnimHelper.animateArmedConfirm(btnResetFactory, armed = false)
             GcsIcons.bind(btnResetFactory, Type.UNDO, "恢复默认", d, iconDp = 11.5f)
             btnResetFactory.background = pillBg(Color.argb(42, 255, 59, 48), Color.parseColor("#FF3B30"), radiusDp = 6f)
         }
@@ -176,9 +174,8 @@ class GcsSettingsModal(
             val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             hub.themeId = sp.getInt("themeId", GcsTheme.THEME_AERO_CARBON).coerceIn(0, 3)
             hub.perfMode = sp.getInt("perfMode", 0).coerceIn(0, 2)
-            hub.animStyle = 0
-            AnimHelper.animStyle = 0
-            hub.cameraDampingScale = 1.0f
+            hub.animStyle = sp.getInt("animStyle", GcsMotionSpec.PROFILE_STANDARD).coerceIn(0, 2)
+            hub.cameraDampingScale = AnimHelper.syncMotionContext(hub.animStyle, hub.perfMode)
 
             hub.obstaclesInflation = sp.getFloat("obstaclesInflation", 0.30f).coerceIn(0.10f, 0.65f)
             hub.maxVel = sp.getFloat("maxVel", 2.0f).coerceIn(0.5f, 4.5f)
@@ -247,6 +244,7 @@ class GcsSettingsModal(
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
                 .putInt("themeId", hub.themeId)
                 .putInt("perfMode", hub.perfMode)
+                .putInt("animStyle", hub.animStyle)
                 .putFloat("obstaclesInflation", hub.obstaclesInflation)
                 .putFloat("maxVel", hub.maxVel)
                 .putFloat("maxAcc", hub.maxAcc)
@@ -361,7 +359,7 @@ class GcsSettingsModal(
                 setVisible(false)
             }
         }
-        AnimHelper.attachSpringTouch(btnCloseHeader)
+        AnimHelper.attachSpringTouch(btnCloseHeader, GcsMotionSpec.PressRole.ICON_CONTROL)
 
         header.addView(titleTv)
         header.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
@@ -415,6 +413,7 @@ class GcsSettingsModal(
                     switchCategory(i)
                 }
             }
+            AnimHelper.attachSpringTouch(itemRow, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             val bar = View(context)
             val lbl = TextView(context).apply {
                 maxLines = 1
@@ -504,6 +503,7 @@ class GcsSettingsModal(
         syncOtaChannelButtons()
         syncThemeSegButtons()
         syncPerfModeButtons()
+        syncAnimStyleButtons()
         syncVoxelResButtons()
         renderOtaSnapshot(otaManager.currentSnapshot)
     }
@@ -562,6 +562,7 @@ class GcsSettingsModal(
 
         syncThemeSegButtons()
         syncPerfModeButtons()
+        syncAnimStyleButtons()
         syncVoxelResButtons()
         swXray.syncFromState(hub.xrayOcclusionEnabled)
         swHaptics.syncFromState(hub.hapticFeedbackEnabled)
@@ -611,7 +612,7 @@ class GcsSettingsModal(
             snap.phase == OtaUpdateManager.Phase.READY_TO_INSTALL ||
             snap.phase == OtaUpdateManager.Phase.CHECKING ||
             snap.phase == OtaUpdateManager.Phase.SYNCING_MIRRORS
-        otaProgressTrack.visibility = if (showBar) View.VISIBLE else View.GONE
+        AnimHelper.animateCollapsibleSection(otaProgressTrack, showBar, d)
         if (showBar) {
             otaProgressTrack.background = roundedColor(pal.wellFill, dp(4f))
             val fillCol = when (snap.phase) {
@@ -725,28 +726,17 @@ class GcsSettingsModal(
     }
 
     private fun switchCategory(idx: Int, animate: Boolean = true) {
+        val prevCat = activeCategory
         activeCategory = idx.coerceIn(0, catPages.lastIndex)
         syncCategoryNavVisuals()
-        for (i in catPages.indices) {
-            val page = catPages[i]
-            if (i == activeCategory) {
-                page.visibility = View.VISIBLE
-                if (animate) {
-                    page.alpha = 0f
-                    page.translationY = dp(5f).toFloat()
-                    page.animate()
-                        .alpha(1f)
-                        .translationY(0f)
-                        .setDuration(170L)
-                        .setInterpolator(AnimHelper.EASE_OUT_EXPO)
-                        .start()
-                    AnimHelper.animateStaggeredChildren(page, d)
-                } else {
-                    page.alpha = 1f
-                    page.translationY = 0f
-                }
-            } else {
-                page.visibility = View.GONE
+        if (animate) {
+            AnimHelper.animateVerticalCategorySwitch(catPages, catNavBars, activeCategory, prevCat, d)
+        } else {
+            for (i in catPages.indices) {
+                val page = catPages[i]
+                page.visibility = if (i == activeCategory) View.VISIBLE else View.GONE
+                page.alpha = 1f
+                page.translationY = 0f
             }
         }
         if (activeCategory == CAT_COMMS) refreshTopicSummaryBox()
@@ -1329,15 +1319,36 @@ class GcsSettingsModal(
             val (ic, title, tip) = perfSpecs[i]
             val b = segmentBtn(ic, title) {
                 hub.perfMode = i
+                hub.cameraDampingScale = AnimHelper.syncMotionContext(hub.animStyle, hub.perfMode)
                 persistAllSettings(context, hub)
                 syncPerfModeButtons()
+                syncAnimStyleButtons()
                 refreshSystemDiagnostics()
                 onShowToast("已切换帧率档位：$tip")
             }
             perfModeSegBtns.add(b)
             perfSeg.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
-        dispCard.addView(perfSeg)
+        dispCard.addView(perfSeg, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(7f) })
+
+        dispCard.addView(subFieldLabel("全局交互动效档位 (省电 30帧自动协同极简瞬态)"))
+        val animSeg = segmentedTrack()
+        val animIcons = arrayOf(Type.SPARK_MOTION, Type.GAUGE_HIGH, Type.GAUGE_LOW)
+        animStyleSegBtns.clear()
+        for (i in GcsMotionSpec.SHORT_PROFILE_NAMES.indices) {
+            val title = GcsMotionSpec.SHORT_PROFILE_NAMES[i]
+            val tip = GcsMotionSpec.PROFILE_TIPS[i]
+            val b = segmentBtn(animIcons[i], title) {
+                hub.animStyle = i
+                hub.cameraDampingScale = AnimHelper.syncMotionContext(hub.animStyle, hub.perfMode)
+                persistAllSettings(context, hub)
+                syncAnimStyleButtons()
+                onShowToast("已切换动效档位：$title ($tip)")
+            }
+            animStyleSegBtns.add(b)
+            animSeg.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }
+        dispCard.addView(animSeg)
         col.addView(dispCard, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8f) })
 
         // ---- 卡片 C：三维地图辅助显示 ----
@@ -1423,7 +1434,7 @@ class GcsSettingsModal(
             GcsIcons.bind(this, Type.UNDO, "恢复默认", d, iconDp = 11.5f)
             setOnClickListener { handleFactoryResetTap() }
         }
-        AnimHelper.attachSpringTouch(btnResetFactory)
+        AnimHelper.attachSpringTouch(btnResetFactory, GcsMotionSpec.PressRole.CRITICAL_SAFETY)
         maintRow.addView(btnResetFactory, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.05f).apply { leftMargin = dp(5f) })
         sysCard.addView(maintRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(7f) })
         col.addView(sysCard, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8f) })
@@ -1438,7 +1449,7 @@ class GcsSettingsModal(
             styleSegmentSelection(otaChannelBtns[i], hub.otaChannelMode == i, pal.accent, pal)
         }
         if (::customUrlWrap.isInitialized) {
-            customUrlWrap.visibility = if (hub.otaChannelMode == 2) View.VISIBLE else View.GONE
+            AnimHelper.animateCollapsibleSection(customUrlWrap, hub.otaChannelMode == 2, d)
         }
     }
 
@@ -1454,6 +1465,14 @@ class GcsSettingsModal(
         val pal = GcsTheme.of(hub.themeId)
         for (i in perfModeSegBtns.indices) {
             styleSegmentSelection(perfModeSegBtns[i], hub.perfMode == i, pal.accent, pal)
+        }
+    }
+
+    private fun syncAnimStyleButtons() {
+        val pal = GcsTheme.of(hub.themeId)
+        val effective = GcsMotionSpec.resolveEffectiveProfile(hub.animStyle, hub.perfMode)
+        for (i in animStyleSegBtns.indices) {
+            styleSegmentSelection(animStyleSegBtns[i], effective == i, pal.accent, pal)
         }
     }
 
@@ -1499,7 +1518,7 @@ class GcsSettingsModal(
     private fun handleFactoryResetTap() {
         if (!factoryResetConfirmPending) {
             factoryResetConfirmPending = true
-            AnimHelper.triggerHaptic(btnResetFactory)
+            AnimHelper.animateArmedConfirm(btnResetFactory, armed = true)
             GcsIcons.bind(btnResetFactory, Type.WARNING, "再点重置", d, iconDp = 11.5f)
             btnResetFactory.background = pillBg(Color.argb(145, 255, 59, 48), Color.parseColor("#FFD54F"), radiusDp = 6f)
             uiHandler.removeCallbacks(cancelFactoryConfirmRunnable)
@@ -1508,10 +1527,12 @@ class GcsSettingsModal(
         }
         uiHandler.removeCallbacks(cancelFactoryConfirmRunnable)
         cancelFactoryConfirmRunnable.run()
-        AnimHelper.triggerHaptic(btnResetFactory, HapticFeedbackConstants.LONG_PRESS)
+        AnimHelper.triggerRoleHaptic(btnResetFactory, GcsMotionSpec.HapticRole.CRITICAL_COMMIT)
 
         hub.themeId = GcsTheme.THEME_AERO_CARBON
         hub.perfMode = 0
+        hub.animStyle = GcsMotionSpec.PROFILE_STANDARD
+        hub.cameraDampingScale = AnimHelper.syncMotionContext(hub.animStyle, hub.perfMode)
         hub.obstaclesInflation = 0.30f
         hub.maxVel = 2.0f
         hub.maxAcc = 3.0f
@@ -1611,9 +1632,10 @@ class GcsSettingsModal(
         typeface = Typeface.DEFAULT_BOLD
         GcsIcons.bind(this, icon, title, d, iconDp = 11f, gapDp = 3f)
         setOnClickListener {
-            AnimHelper.triggerHaptic(it)
+            AnimHelper.animateStateFlip(it)
             onClick()
         }
+        AnimHelper.attachSpringTouch(this, GcsMotionSpec.PressRole.SEGMENT_CHIP)
     }
 
     private fun styleSegmentSelection(btn: TextView, selected: Boolean, activeColor: Int, pal: GcsTheme.Palette) {
@@ -1680,29 +1702,19 @@ class GcsSettingsModal(
                 if (cur) pal.accentStroke else pal.cardStroke,
                 radiusDp = 11f
             )
-            val targetTx = if (cur) dp(16f).toFloat() else 0f
-            if (animate) {
-                SpringAnimation(thumb, DynamicAnimation.TRANSLATION_X, targetTx).apply {
-                    spring = SpringForce(targetTx).apply {
-                        stiffness = 520f
-                        dampingRatio = 0.78f
-                    }
-                    start()
-                }
-            } else {
-                thumb.translationX = targetTx
-            }
+            AnimHelper.animateSwitchThumb(thumb, cur, dp(16f).toFloat(), animate)
         }
         renderState(false)
 
         val toggleAction = {
             cur = !cur
-            AnimHelper.triggerHaptic(row)
+            AnimHelper.triggerRoleHaptic(row, GcsMotionSpec.HapticRole.DETENT_SELECT)
             renderState(true)
             onToggle(cur)
         }
         row.setOnClickListener { toggleAction() }
         pillSwitch.setOnClickListener { toggleAction() }
+        AnimHelper.attachSpringTouch(pillSwitch, GcsMotionSpec.PressRole.SEGMENT_CHIP)
 
         row.addView(textCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         row.addView(pillSwitch, LinearLayout.LayoutParams(dp(36f), dp(20f)))
@@ -1786,10 +1798,17 @@ class GcsSettingsModal(
                     if (!fromUser) return
                     val v = (minI + progress) * scale
                     tvVal.text = String.format(Locale.US, fmt, v)
+                    AnimHelper.triggerSliderStepTick(this@apply)
                     onChanged(v)
                 }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {
+                    AnimHelper.animateSliderBadgeFocus(tvVal, tracking = true)
+                }
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    AnimHelper.animateSliderBadgeFocus(tvVal, tracking = false)
+                }
             })
         }
         allSeekBars.add(sb)

@@ -195,22 +195,9 @@ internal class VectorHudTextureView(
             }
         }
 
-        private fun chooseHudConfig(display: EGLDisplay): EGLConfig {
+        private fun chooseStandardConfig(display: EGLDisplay): EGLConfig {
             val configs = arrayOfNulls<EGLConfig>(1)
             val count = IntArray(1)
-            val msaaAttrs = intArrayOf(
-                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
-                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
-                EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_DEPTH_SIZE, 16,
-                EGL14.EGL_SAMPLE_BUFFERS, 1,
-                EGL14.EGL_SAMPLES, 4,
-                EGL14.EGL_NONE
-            )
-            if (EGL14.eglChooseConfig(display, msaaAttrs, 0, configs, 0, 1, count, 0) && count[0] > 0 && configs[0] != null) {
-                return requireNotNull(configs[0])
-            }
             val stdAttrs = intArrayOf(
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
@@ -223,6 +210,26 @@ internal class VectorHudTextureView(
             return requireNotNull(configs[0])
         }
 
+        private fun chooseMsaaConfigOrNull(display: EGLDisplay): EGLConfig? {
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val count = IntArray(1)
+            val msaaAttrs = intArrayOf(
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_DEPTH_SIZE, 16,
+                EGL14.EGL_SAMPLE_BUFFERS, 1,
+                EGL14.EGL_SAMPLES, 4,
+                EGL14.EGL_NONE
+            )
+            return if (EGL14.eglChooseConfig(display, msaaAttrs, 0, configs, 0, 1, count, 0) && count[0] > 0) {
+                configs[0]
+            } else {
+                null
+            }
+        }
+
         override fun run() {
             var display = EGL14.EGL_NO_DISPLAY
             var eglContext = EGL14.EGL_NO_CONTEXT
@@ -231,17 +238,33 @@ internal class VectorHudTextureView(
                 display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
                 check(display != EGL14.EGL_NO_DISPLAY)
                 check(EGL14.eglInitialize(display, IntArray(2), 0, IntArray(2), 0))
-                val config = chooseHudConfig(display)
-                eglContext = EGL14.eglCreateContext(
-                    display,
-                    config,
-                    EGL14.EGL_NO_CONTEXT,
-                    intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
-                    0
-                )
-                check(eglContext != EGL14.EGL_NO_CONTEXT)
-                surface = EGL14.eglCreateWindowSurface(display, config, texture, intArrayOf(EGL14.EGL_NONE), 0)
-                check(surface != EGL14.EGL_NO_SURFACE && EGL14.eglMakeCurrent(display, surface, surface, eglContext))
+                val ctxAttrs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+                val surfAttrs = intArrayOf(EGL14.EGL_NONE)
+                val msaaCfg = chooseMsaaConfigOrNull(display)
+                if (msaaCfg != null) {
+                    val tryCtx = EGL14.eglCreateContext(display, msaaCfg, EGL14.EGL_NO_CONTEXT, ctxAttrs, 0)
+                    val trySurf = if (tryCtx != EGL14.EGL_NO_CONTEXT) {
+                        EGL14.eglCreateWindowSurface(display, msaaCfg, texture, surfAttrs, 0)
+                    } else {
+                        EGL14.EGL_NO_SURFACE
+                    }
+                    if (tryCtx != EGL14.EGL_NO_CONTEXT && trySurf != EGL14.EGL_NO_SURFACE &&
+                        EGL14.eglMakeCurrent(display, trySurf, trySurf, tryCtx)
+                    ) {
+                        eglContext = tryCtx
+                        surface = trySurf
+                    } else {
+                        if (trySurf != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, trySurf)
+                        if (tryCtx != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(display, tryCtx)
+                    }
+                }
+                if (eglContext == EGL14.EGL_NO_CONTEXT || surface == EGL14.EGL_NO_SURFACE) {
+                    val stdCfg = chooseStandardConfig(display)
+                    eglContext = EGL14.eglCreateContext(display, stdCfg, EGL14.EGL_NO_CONTEXT, ctxAttrs, 0)
+                    check(eglContext != EGL14.EGL_NO_CONTEXT)
+                    surface = EGL14.eglCreateWindowSurface(display, stdCfg, texture, surfAttrs, 0)
+                    check(surface != EGL14.EGL_NO_SURFACE && EGL14.eglMakeCurrent(display, surface, surface, eglContext))
+                }
                 val renderer = VectorGlbRenderer(context)
                 renderer.create()
                 check(renderer.ready) { "The HUD 3D UAV model did not load" }

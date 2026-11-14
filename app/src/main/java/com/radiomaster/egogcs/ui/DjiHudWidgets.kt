@@ -155,7 +155,7 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
     private fun animateNorthBlend(target: Float) {
         modeAnim?.cancel()
         modeAnim = ValueAnimator.ofFloat(rotBlend, target).apply {
-            duration = 320L
+            duration = AnimHelper.dur(GcsMotionSpec.DurationToken.EMPHASIZED)
             interpolator = AnimHelper.EASE_OUT_EXPO
             addUpdateListener { a ->
                 rotBlend = a.animatedValue as Float
@@ -168,7 +168,7 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
     private fun animateRangeScale(target: Float) {
         rangeAnim?.cancel()
         rangeAnim = ValueAnimator.ofFloat(dispRangeAnim, target).apply {
-            duration = 280L
+            duration = AnimHelper.dur(GcsMotionSpec.DurationToken.SPATIAL)
             interpolator = AnimHelper.EASE_OUT_EXPO
             addUpdateListener { a ->
                 dispRangeAnim = a.animatedValue as Float

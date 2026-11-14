@@ -255,7 +255,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
 
         camTransAnim?.cancel()
         camTransAnim = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 250L
+            duration = AnimHelper.dur(GcsMotionSpec.DurationToken.SPATIAL)
             interpolator = AnimHelper.EASE_OUT_EXPO
             addUpdateListener { a ->
                 val t = a.animatedValue as Float

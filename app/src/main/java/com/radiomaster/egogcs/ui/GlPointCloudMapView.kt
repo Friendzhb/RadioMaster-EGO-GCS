@@ -11,7 +11,6 @@ import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
-import android.view.animation.OvershootInterpolator
 import com.radiomaster.egogcs.engine.FastLioVoxelMap
 import com.radiomaster.egogcs.model.GcsSharedHub
 import com.radiomaster.egogcs.model.RenderSnapshot
@@ -747,10 +746,14 @@ class GlPointCloudMapView(
 
     fun triggerPinSpringAnim() {
         pinAnimator?.cancel()
+        if (GcsMotionSpec.isMinimalMotion()) {
+            pinAnimScale = 1.0f
+            return
+        }
         pinAnimScale = 0.15f
         pinAnimator = ValueAnimator.ofFloat(0.15f, 1.0f).apply {
-            duration = 250L
-            interpolator = OvershootInterpolator(1.55f)
+            duration = AnimHelper.dur(GcsMotionSpec.DurationToken.SPATIAL)
+            interpolator = GcsMotionSpec.EASE_PIN_DROP
             addUpdateListener { anim -> pinAnimScale = anim.animatedValue as Float }
             start()
         }
@@ -761,7 +764,7 @@ class GlPointCloudMapView(
         is3DMode = target3D
         blendAnimator?.cancel()
         blendAnimator = ValueAnimator.ofFloat(projBlend, if (target3D) 1f else 0f).apply {
-            duration = 400L
+            duration = AnimHelper.dur(GcsMotionSpec.DurationToken.EMPHASIZED)
             interpolator = AnimHelper.EASE_OUT_EXPO
             addUpdateListener { anim -> projBlend = anim.animatedValue as Float }
             start()

@@ -57,6 +57,7 @@ import com.radiomaster.egogcs.ui.DroneVectorModel
 import com.radiomaster.egogcs.ui.FastHudFormatter
 import com.radiomaster.egogcs.ui.GcsIcons
 import com.radiomaster.egogcs.ui.GcsIcons.Type
+import com.radiomaster.egogcs.ui.GcsMotionSpec
 import com.radiomaster.egogcs.ui.GcsSettingsModal
 import com.radiomaster.egogcs.ui.GcsTheme
 import com.radiomaster.egogcs.ui.GcsTheme.Role
@@ -224,6 +225,7 @@ class MainActivity : Activity() {
     private val resetRthConfirmRunnable = Runnable {
         rthConfirmPending = false
         if (::btnRth.isInitialized) {
+            AnimHelper.animateArmedConfirm(btnRth, armed = false)
             styleRthDefault()
         }
     }
@@ -232,6 +234,7 @@ class MainActivity : Activity() {
     private val resetClearMapConfirmRunnable = Runnable {
         clearMapConfirmPending = false
         if (::btnClearMapInPopover.isInitialized) {
+            AnimHelper.animateArmedConfirm(btnClearMapInPopover, armed = false)
             val pal = GcsTheme.of(hub.themeId)
             btnClearMapInPopover.setTextColor(pal.textPrimary)
             GcsIcons.bind(btnClearMapInPopover, Type.TRASH, "清建图", d, iconDp = 11.5f)
@@ -804,48 +807,19 @@ class MainActivity : Activity() {
         val hideTelemetryForDrawer = (drawerOpen && drawerLeftEdge < bottomClusterRightApprox + dp(10f))
         val shouldHideTelemetry = hideTelemetryForDock || hideTelemetryForDrawer
 
-        if (shouldHideTelemetry) {
-            if (hdTelemetryBox.visibility == View.VISIBLE) {
-                hdTelemetryBox.animate().cancel()
-                hdTelemetryBox.animate()
-                    .alpha(0f)
-                    .setDuration(130L)
-                    .withEndAction {
-                        if (hdTelemetryBox.alpha < 0.05f) hdTelemetryBox.visibility = View.INVISIBLE
-                    }
-                    .start()
-            }
-        } else {
-            if (hdTelemetryBox.visibility != View.VISIBLE || hdTelemetryBox.alpha < 0.95f) {
-                hdTelemetryBox.animate().cancel()
-                hdTelemetryBox.visibility = View.VISIBLE
-                hdTelemetryBox.animate()
-                    .alpha(1f)
-                    .setDuration(160L)
-                    .start()
-            }
-        }
+        AnimHelper.animateHudAvoidance(
+            hdTelemetryBox,
+            show = !shouldHideTelemetry,
+            hideOffsetY = dp(6f).toFloat()
+        )
 
         val hideAttitudeForPopover = (layerPopoverOpen && screenHeightDp < 395f)
         if (!drawerOpen) {
-            if (hideAttitudeForPopover) {
-                attitudeHudView.animate().cancel()
-                attitudeHudView.animate()
-                    .alpha(0f)
-                    .setDuration(130L)
-                    .withEndAction {
-                        if (layerPopoverOpen) attitudeHudView.visibility = View.INVISIBLE
-                    }
-                    .start()
-            } else if (attitudeHudView.visibility != View.VISIBLE || attitudeHudView.alpha < 0.95f) {
-                attitudeHudView.animate().cancel()
-                attitudeHudView.visibility = View.VISIBLE
-                attitudeHudView.translationX = 0f
-                attitudeHudView.animate()
-                    .alpha(1f)
-                    .setDuration(170L)
-                    .start()
-            }
+            AnimHelper.animateHudAvoidance(
+                attitudeHudView,
+                show = !hideAttitudeForPopover,
+                hideOffsetX = dp(6f).toFloat()
+            )
         }
     }
 
@@ -1019,7 +993,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun setWideTerminalMode(wide: Boolean, applyImmediately: Boolean = true) {
+    private fun setWideTerminalMode(wide: Boolean, applyImmediately: Boolean = true, animateWidth: Boolean = false) {
         drawerWideMode = wide
         if (::btnWideTerminal.isInitialized) {
             val pal = GcsTheme.of(hub.themeId)
@@ -1039,12 +1013,24 @@ class MainActivity : Activity() {
         }
         if (applyImmediately) {
             val newW = currentDrawerWidthPx()
-            val lp = drawerRoot.layoutParams as FrameLayout.LayoutParams
-            lp.width = newW
-            drawerRoot.layoutParams = lp
-            drawerRoot.post { syncMeasuredTabGlider(animate = false) }
-            if (drawerOpen) {
-                topCenterStack.translationX = computeOpenMapCenterOffsetPx(newW)
+            if (animateWidth && drawerOpen) {
+                AnimHelper.animateDrawerWidthMorph(
+                    drawer = drawerRoot,
+                    targetWidthPx = newW,
+                    centerShiftViews = listOf(topCenterStack),
+                    targetCenterOffsetPx = computeOpenMapCenterOffsetPx(newW),
+                    drawerOpen = drawerOpen
+                ) {
+                    syncMeasuredTabGlider(animate = false)
+                }
+            } else {
+                val lp = drawerRoot.layoutParams as FrameLayout.LayoutParams
+                lp.width = newW
+                drawerRoot.layoutParams = lp
+                drawerRoot.post { syncMeasuredTabGlider(animate = false) }
+                if (drawerOpen) {
+                    topCenterStack.translationX = computeOpenMapCenterOffsetPx(newW)
+                }
             }
             syncBottomHudAvoidance()
         }
@@ -1053,7 +1039,7 @@ class MainActivity : Activity() {
     /**
      * 基于实际测量的标签按钮坐标精确对齐底部高亮滑块，彻底消除硬编码宽度带来的偏移错位
      */
-    private fun syncMeasuredTabGlider(animate: Boolean) {
+    private fun syncMeasuredTabGlider(animate: Boolean, prevTabIndex: Int = activeTabIndex) {
         if (!::tabGlider.isInitialized || activeTabIndex !in tabBtns.indices) return
         val targetBtn = tabBtns[activeTabIndex]
         val btnW = targetBtn.width
@@ -1073,7 +1059,7 @@ class MainActivity : Activity() {
 
         val targetX = targetBtn.left.toFloat()
         if (animate) {
-            AnimHelper.animateTabSwitch(tabGlider, targetX, tabPanels, activeTabIndex, d)
+            AnimHelper.animateTabSwitch(tabGlider, targetX, tabPanels, activeTabIndex, d, prevTabIndex)
         } else {
             tabGlider.translationX = targetX
         }
@@ -1081,6 +1067,7 @@ class MainActivity : Activity() {
 
     private fun switchTab(idx: Int, animatePanel: Boolean = true) {
         hideSoftKeyboard()
+        val prevTab = activeTabIndex
         if (activeTabIndex == TAB_TOPICS && idx != TAB_TOPICS) {
             topicInspector.stopActiveSession()
             isDetailCurrentlyStreaming = false
@@ -1098,11 +1085,12 @@ class MainActivity : Activity() {
 
         val targetBtn = tabBtns.getOrNull(idx)
         if (animatePanel && targetBtn != null && targetBtn.width > 0) {
-            syncMeasuredTabGlider(animate = true)
+            syncMeasuredTabGlider(animate = true, prevTabIndex = prevTab)
         } else {
             for (i in tabPanels.indices) {
                 tabPanels[i].visibility = if (i == idx) View.VISIBLE else View.GONE
                 tabPanels[i].alpha = 1f
+                tabPanels[i].translationX = 0f
                 tabPanels[i].translationY = 0f
             }
             tabRowRef.post { syncMeasuredTabGlider(animate = false) }
@@ -1175,9 +1163,9 @@ class MainActivity : Activity() {
         btnFollowRef.setTextColor(pal.textPrimary)
         GcsIcons.bind(btnFollowRef, Type.COMPASS_AIM, followTxt, d, iconDp = 11.5f, gapDp = 3f)
         btnFollowRef.background = camPillBg(fMode != 0)
-        recenterBanner.visibility = if (fMode == 0) View.VISIBLE else View.GONE
         recenterBanner.setTextColor(pal.accentBright)
         recenterBanner.background = pillBg(pal.glassPopoverFill, pal.accent)
+        AnimHelper.animateFloatingBadge(recenterBanner, show = (fMode == 0), density = d, slideDp = -4.5f)
 
         val xrayOn = hub.xrayOcclusionEnabled
         btnXrayRef.setTextColor(pal.textPrimary)
@@ -1231,30 +1219,7 @@ class MainActivity : Activity() {
         val pal = GcsTheme.of(hub.themeId)
         occlusionBadge.setTextColor(if (pal.isLight) pal.accent else Color.parseColor("#64FFDA"))
         occlusionBadge.background = pillBg(pal.glassPopoverFill, pal.accent)
-
-        occlusionBadge.animate().cancel()
-        if (occluded) {
-            occlusionBadge.visibility = View.VISIBLE
-            occlusionBadge.alpha = 0f
-            occlusionBadge.translationY = -dp(4f).toFloat()
-            occlusionBadge.animate()
-                .alpha(1f)
-                .translationY(0f)
-                .setDuration(180L)
-                .setInterpolator(AnimHelper.EASE_OUT_EXPO)
-                .start()
-        } else {
-            occlusionBadge.animate()
-                .alpha(0f)
-                .translationY(-dp(3f).toFloat())
-                .setDuration(165L)
-                .withEndAction {
-                    if (!lastOccludedHudState) {
-                        occlusionBadge.visibility = View.GONE
-                    }
-                }
-                .start()
-        }
+        AnimHelper.animateFloatingBadge(occlusionBadge, show = occluded, density = d, slideDp = -4f)
     }
 
     private fun syncPatrolPillUi() {
@@ -1278,7 +1243,12 @@ class MainActivity : Activity() {
         val rosNow = hub.isRosMode
         if (!force && rosNow == lastIsRosModeUi) return
         lastIsRosModeUi = rosNow
-        demoControlGroup.visibility = if (!rosNow) View.VISIBLE else View.GONE
+        if (force) {
+            demoControlGroup.visibility = if (!rosNow) View.VISIBLE else View.GONE
+            demoControlGroup.tag = if (!rosNow) "SEC_OPEN" else "SEC_CLOSED"
+        } else {
+            AnimHelper.animateCollapsibleSection(demoControlGroup, expand = !rosNow, density = d)
+        }
     }
 
     private fun refreshCommandDockUi(latestPin: EgoSimEngine.PinInspectResult? = null, pulseDock: Boolean = false) {
@@ -1304,8 +1274,10 @@ class MainActivity : Activity() {
             val clr = latestPin?.clearance ?: snap.previewClearance
             val safe = latestPin?.isSafe ?: snap.previewSafe
 
+            val switchedRow = dockPinRow.visibility != View.VISIBLE && dockLogicalActive
             dockPinRow.visibility = View.VISIBLE
             dockRouteRow.visibility = View.GONE
+            if (switchedRow) AnimHelper.animateStateFlip(dockPinRow)
             AnimHelper.animateCommandDock(commandDock, show = true, density = d, pulseOnUpdate = pulseDock)
             syncBottomHudAvoidance()
 
@@ -1347,9 +1319,11 @@ class MainActivity : Activity() {
         }
 
         if (routeCnt > 0) {
+            val switchedRow = dockRouteRow.visibility != View.VISIBLE && dockLogicalActive
             dockLogicalActive = true
             dockPinRow.visibility = View.GONE
             dockRouteRow.visibility = View.VISIBLE
+            if (switchedRow) AnimHelper.animateStateFlip(dockRouteRow)
             AnimHelper.animateCommandDock(commandDock, show = true, density = d, pulseOnUpdate = pulseDock)
             syncBottomHudAvoidance()
 
@@ -1395,13 +1369,16 @@ class MainActivity : Activity() {
         val (_, pinInfo) = simEngine.nudgeGoalZ(delta)
         GcsSettingsModal.persistAllSettings(this, hub)
         mapView.triggerPinSpringAnim()
+        if (::tvDockAltVal.isInitialized && commandDock.visibility == View.VISIBLE) {
+            AnimHelper.animateValueStepNudge(tvDockAltVal, sign, d)
+        }
         refreshCommandDockUi(pinInfo, pulseDock = true)
     }
 
     private fun handleRthButtonTap() {
         if (hub.rthDoubleConfirm && !rthConfirmPending) {
             rthConfirmPending = true
-            AnimHelper.triggerHaptic(btnRth)
+            AnimHelper.animateArmedConfirm(btnRth, armed = true)
             btnRth.setTextColor(Color.WHITE)
             GcsIcons.bind(btnRth, Type.WARNING, "再点返航", d, iconDp = 11.5f)
             btnRth.background = pillBg(Color.argb(175, 255, 145, 0), Color.parseColor("#FFD54F"))
@@ -1413,7 +1390,8 @@ class MainActivity : Activity() {
 
         uiHandler.removeCallbacks(resetRthConfirmRunnable)
         resetRthConfirmRunnable.run()
-        AnimHelper.triggerHaptic(btnRth, HapticFeedbackConstants.LONG_PRESS)
+        AnimHelper.triggerRoleHaptic(btnRth, GcsMotionSpec.HapticRole.CRITICAL_COMMIT)
+        AnimHelper.animateStateFlip(btnRth)
 
         val cmds = simEngine.dispatchSwarmReturnToHome()
         syncPatrolPillUi()
@@ -1434,7 +1412,7 @@ class MainActivity : Activity() {
     private fun handleClearMapTap() {
         if (!clearMapConfirmPending) {
             clearMapConfirmPending = true
-            AnimHelper.triggerHaptic(btnClearMapInPopover)
+            AnimHelper.animateArmedConfirm(btnClearMapInPopover, armed = true)
             btnClearMapInPopover.setTextColor(Color.WHITE)
             GcsIcons.bind(btnClearMapInPopover, Type.WARNING, "再点清图", d, iconDp = 11.5f)
             btnClearMapInPopover.background = pillBg(Color.argb(165, 255, 59, 48), Color.parseColor("#FF6961"))
@@ -1445,7 +1423,7 @@ class MainActivity : Activity() {
         }
         uiHandler.removeCallbacks(resetClearMapConfirmRunnable)
         resetClearMapConfirmRunnable.run()
-        AnimHelper.triggerHaptic(btnClearMapInPopover, HapticFeedbackConstants.LONG_PRESS)
+        AnimHelper.triggerRoleHaptic(btnClearMapInPopover, GcsMotionSpec.HapticRole.CRITICAL_COMMIT)
         simEngine.clearVoxelMap()
         setLayerPopoverVisible(false)
         AnimHelper.showDjiToast(toastBanner, "已清空全局 FAST-LIO 点云地图", d)
@@ -1454,7 +1432,7 @@ class MainActivity : Activity() {
     private fun executeEmergencyHover(viewForHaptic: View) {
         uiHandler.removeCallbacks(resetRthConfirmRunnable)
         resetRthConfirmRunnable.run()
-        AnimHelper.triggerHaptic(viewForHaptic, HapticFeedbackConstants.LONG_PRESS)
+        AnimHelper.animateEmergencyBrake(viewForHaptic)
 
         val cmds = simEngine.dispatchSwarmEmergencyHover()
         syncPatrolPillUi()
@@ -1501,6 +1479,7 @@ class MainActivity : Activity() {
             },
             onSingleTapPreviewPin = { wx, wy ->
                 if (hub.hudTouchLocked) {
+                    AnimHelper.animateRejectShake(btnLayerPopupToggle, d)
                     AnimHelper.showDjiToast(toastBanner, "地图防误触已锁定 · 可在右侧「图层」浮窗解锁", d)
                 } else {
                     val pickedDrone = simEngine.tryPickSwarmDroneAt(wx, wy)
@@ -1525,11 +1504,13 @@ class MainActivity : Activity() {
             },
             onLongPressQuickFly = { wx, wy ->
                 if (hub.hudTouchLocked) {
+                    AnimHelper.animateRejectShake(btnLayerPopupToggle, d)
                     AnimHelper.showDjiToast(toastBanner, "地图防误触已锁定 · 长按直飞已安全拦截", d)
                 } else {
                     val cmds = simEngine.dispatchFlyCommand(wx, wy)
                     if (cmds.isEmpty()) {
                         AnimHelper.showDjiToast(toastBanner, "长按目标位于障碍物内部，已安全拦截", d)
+                        AnimHelper.animateRejectShake(toastBanner, d)
                     } else {
                         syncPatrolPillUi()
                         refreshCommandDockUi()
@@ -1627,7 +1608,7 @@ class MainActivity : Activity() {
             setPadding(dp(6.5f), dp(4f), dp(6.5f), dp(4f))
             GcsIcons.bind(this, Type.DRONE_QUAD, "单机", d, iconDp = 11.5f, gapDp = 3f)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 setSwarmModeEnabledLive(!hub.swarmModeEnabled)
             }
             setOnLongClickListener {
@@ -1649,7 +1630,7 @@ class MainActivity : Activity() {
             setPadding(dp(6.5f), dp(4f), dp(6.5f), dp(4f))
             GcsIcons.bind(this, Type.TILT_VECTOR, "矢量 4M2S", d, iconDp = 11.5f, gapDp = 3f)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 cycleTopRigModeQuick()
             }
             setOnLongClickListener {
@@ -1765,7 +1746,7 @@ class MainActivity : Activity() {
                 setSettingsModalOpen(!settingsModal.isOpen)
             }
         }
-        AnimHelper.attachSpringTouch(btnSettingsToggle)
+        AnimHelper.attachSpringTouch(btnSettingsToggle, GcsMotionSpec.PressRole.ICON_CONTROL)
         topBarView.addView(btnSettingsToggle, LinearLayout.LayoutParams(dp(28f), dp(26f)).apply { leftMargin = dp(4f) })
 
         cockpitRoot.addView(topBarView, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP))
@@ -1865,16 +1846,19 @@ class MainActivity : Activity() {
         btnBrake = createActionPill(Type.BRAKE_HOLD, "紧急悬停", "#FF3B30", true).apply {
             setOnClickListener { executeEmergencyHover(it) }
         }
+        AnimHelper.attachSpringTouch(btnBrake, GcsMotionSpec.PressRole.CRITICAL_SAFETY)
         leftSafetyRail.addView(btnBrake)
 
         btnRth = createActionPill(Type.HOME_RTH, "返航起点", "#FFAB00", true).apply {
             setOnClickListener { handleRthButtonTap() }
         }
+        AnimHelper.attachSpringTouch(btnRth, GcsMotionSpec.PressRole.CRITICAL_SAFETY)
         leftSafetyRail.addView(btnRth, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(5f) })
 
         demoControlGroup = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         btnPatrol = createActionPill(Type.PLAY, "巡航: 开", "#00E676", true).apply {
             setOnClickListener {
+                AnimHelper.animateStateFlip(it)
                 hub.autoPatrol = !hub.autoPatrol
                 if (hub.autoPatrol) simEngine.clearPreviewPin()
                 syncPatrolPillUi()
@@ -1884,6 +1868,7 @@ class MainActivity : Activity() {
         }
         btnDemoScene = createActionPill(Type.CUBE_3D, "场景: 体素柱阵", "#69B7FF", false).apply {
             setOnClickListener {
+                AnimHelper.animateStateFlip(it)
                 applyDemoSceneByIndex((sceneIdx + 1) % sceneCycle.size)
             }
         }
@@ -1911,7 +1896,7 @@ class MainActivity : Activity() {
                 AnimHelper.showDjiToast(toastBanner, msg, d)
             }
         }
-        AnimHelper.attachSpringTouch(hsiView)
+        AnimHelper.attachSpringTouch(hsiView, GcsMotionSpec.PressRole.HUD_INSTRUMENT)
         bottomLeftCluster.addView(hsiView, LinearLayout.LayoutParams(dp(96f), dp(96f)))
 
         hdTelemetryBox = LinearLayout(this).apply {
@@ -1924,7 +1909,7 @@ class MainActivity : Activity() {
                 AnimHelper.showDjiToast(toastBanner, "已回中锁定无人机视角", d)
             }
         }
-        AnimHelper.attachSpringTouch(hdTelemetryBox)
+        AnimHelper.attachSpringTouch(hdTelemetryBox, GcsMotionSpec.PressRole.HUD_INSTRUMENT)
 
         fun buildHudMetricCell(microLabel: String, valueView: TextView): LinearLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1986,8 +1971,10 @@ class MainActivity : Activity() {
                     toastTxt = "已切为「常规固定 X4 普通四旋翼构型」"
                 }
                 applyOperatingModeChangeLive(toastTxt)
+                AnimHelper.animateStateFlip(it)
             }
         }
+        AnimHelper.attachSpringTouch(tvOsdTilt, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         hdTelemetryBox.addView(row1, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         hdTelemetryBox.addView(row2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(3f) })
         hdTelemetryBox.addView(tvOsdSubXyz)
@@ -2022,6 +2009,7 @@ class MainActivity : Activity() {
         }
         btn3DRef = createCamPillBtn(Type.CUBE_3D, "3D视图", true).apply {
             setOnClickListener {
+                AnimHelper.animateStateFlip(it)
                 val now3D = mapView.toggle3D2DWithAnimation()
                 syncCameraControlLabels()
                 AnimHelper.showDjiToast(toastBanner, if (now3D) "已切换至 3D 透视地图" else "已切换至 2D 正射俯视地图", d)
@@ -2029,6 +2017,7 @@ class MainActivity : Activity() {
         }
         btnFollowRef = createCamPillBtn(Type.COMPASS_AIM, "环视", true).apply {
             setOnClickListener {
+                AnimHelper.animateStateFlip(it)
                 val (_, tip) = mapView.cycleFollowMode()
                 syncCameraControlLabels()
                 AnimHelper.showDjiToast(toastBanner, tip, d)
@@ -2036,7 +2025,7 @@ class MainActivity : Activity() {
         }
         btnXrayRef = createCamPillBtn(Type.XRAY_EYE, "透视", hub.xrayOcclusionEnabled).apply {
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 setXrayOcclusionState(!hub.xrayOcclusionEnabled)
             }
         }
@@ -2059,10 +2048,10 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             GcsTheme.markRole(this, Role.TEXT_PRIMARY)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
                 mapView.zoomBy(0.80f)
             }
         }
+        AnimHelper.attachSpringTouch(btnZOut, GcsMotionSpec.PressRole.ICON_CONTROL)
         val btnZIn = TextView(this).apply {
             text = "+"
             gravity = Gravity.CENTER
@@ -2070,10 +2059,10 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             GcsTheme.markRole(this, Role.TEXT_PRIMARY)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
                 mapView.zoomBy(1.25f)
             }
         }
+        AnimHelper.attachSpringTouch(btnZIn, GcsMotionSpec.PressRole.ICON_CONTROL)
         zoomPair.addView(btnZOut, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
         zoomPair.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, MATCH_PARENT))
         zoomPair.addView(btnZIn, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
@@ -2101,7 +2090,7 @@ class MainActivity : Activity() {
                 AnimHelper.showDjiToast(toastBanner, tip, d)
             }
         }
-        AnimHelper.attachSpringTouch(attitudeHudView)
+        AnimHelper.attachSpringTouch(attitudeHudView, GcsMotionSpec.PressRole.HUD_INSTRUMENT)
         cockpitRoot.addView(
             attitudeHudView,
             FrameLayout.LayoutParams(dp(144f), dp(96f), Gravity.BOTTOM or Gravity.END).apply {
@@ -2217,12 +2206,13 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.5f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.pointColorMode = i
                     GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
                     syncLayerPopoverControls()
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             colorSegBtns.add(b)
             colorRow.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -2324,9 +2314,10 @@ class MainActivity : Activity() {
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
         typeface = Typeface.DEFAULT_BOLD
         setOnClickListener {
-            AnimHelper.triggerHaptic(it)
+            AnimHelper.animateStateFlip(it)
             onClick()
         }
+        AnimHelper.attachSpringTouch(this, GcsMotionSpec.PressRole.SEGMENT_CHIP)
     }
 
     private fun buildContextualCommandDock(): LinearLayout {
@@ -2367,10 +2358,10 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val cmds = simEngine.dispatchFlyCommand()
                 if (cmds.isEmpty()) {
-                    AnimHelper.triggerHaptic(it, HapticFeedbackConstants.LONG_PRESS)
+                    AnimHelper.animateRejectShake(it, d)
                     AnimHelper.showDjiToast(toastBanner, "选点位于障碍物内部，请重选或调高高度", d)
                 } else {
-                    AnimHelper.triggerHaptic(it, HapticFeedbackConstants.LONG_PRESS)
+                    AnimHelper.triggerRoleHaptic(it, GcsMotionSpec.HapticRole.CRITICAL_COMMIT)
                     syncPatrolPillUi()
                     refreshCommandDockUi()
                     refreshWaypointOrchestratorList()
@@ -2404,9 +2395,10 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val (ok, total, _) = simEngine.appendPreviewPinToRoute()
                 if (!ok) {
+                    AnimHelper.animateRejectShake(it, d)
                     AnimHelper.showDjiToast(toastBanner, "选点位于障碍内部，无法加入航线", d)
                 } else {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.triggerRoleHaptic(it, GcsMotionSpec.HapticRole.DETENT_SELECT)
                     refreshCommandDockUi(pulseDock = true)
                     refreshWaypointOrchestratorList()
                     AnimHelper.showDjiToast(toastBanner, "已加入航点 #$total", d)
@@ -2429,10 +2421,10 @@ class MainActivity : Activity() {
             setPadding(dp(8f), dp(3.5f), dp(8f), dp(3.5f))
             GcsTheme.markRole(this, Role.TEXT_PRIMARY)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
                 adjustTargetAltitudeByStep(-1f)
             }
         }
+        AnimHelper.attachSpringTouch(btnMinus, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         tvDockAltVal = monoLabel(String.format(Locale.US, "高 %.1fm", hub.goalZ), "#69B7FF", 9.8f, Role.TEXT_ACCENT).apply {
             setPadding(dp(6f), 0, dp(6f), 0)
         }
@@ -2444,10 +2436,10 @@ class MainActivity : Activity() {
             setPadding(dp(8f), dp(3.5f), dp(8f), dp(3.5f))
             GcsTheme.markRole(this, Role.TEXT_PRIMARY)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
                 adjustTargetAltitudeByStep(+1f)
             }
         }
+        AnimHelper.attachSpringTouch(btnPlus, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         altInline.addView(btnMinus)
         altInline.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, dp(14f)))
         altInline.addView(tvDockAltVal)
@@ -2463,6 +2455,7 @@ class MainActivity : Activity() {
                 refreshCommandDockUi()
             }
         }
+        AnimHelper.attachSpringTouch(btnCancelPin, GcsMotionSpec.PressRole.ICON_CONTROL)
 
         dockPinRow.addView(btnDockFlyNow)
         dockPinRow.addView(btnAddRoute, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(5f) })
@@ -2583,10 +2576,10 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 GcsIcons.bind(this, ic, title, d, iconDp = 12f, gapDp = 3.5f)
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
                     switchTab(i)
                 }
             }
+            AnimHelper.attachSpringTouch(tb, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             tabBtns.add(tb)
             tb.minimumHeight = dp(38f)
             tb.setPadding(dp(4f), dp(5f), dp(4f), dp(5f))
@@ -2599,6 +2592,7 @@ class MainActivity : Activity() {
             setPadding(dp(8f), 0, dp(9f), 0)
             setOnClickListener { setDrawerOpenState(false) }
         }
+        AnimHelper.attachSpringTouch(btnCloseDrawer, GcsMotionSpec.PressRole.ICON_CONTROL)
         tabRowRef.addView(btnCloseDrawer, LinearLayout.LayoutParams(dp(34f), dp(38f)))
         tabBarWrap.addView(tabRowRef, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
@@ -2675,8 +2669,10 @@ class MainActivity : Activity() {
                     AnimHelper.showDjiToast(toastBanner, "已切换回三维膨胀体素仿真演练", d)
                 }
                 syncConnModeSectionsUi(showRosEditor = false)
+                AnimHelper.animateStateFlip(it)
             }
         }
+        AnimHelper.attachSpringTouch(segModeDemoBtn, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         segModeRosBtn = TextView(this).apply {
             gravity = Gravity.CENTER
             maxLines = 1
@@ -2686,10 +2682,11 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             GcsIcons.bind(this, Type.DRONE_QUAD, "实机 ROS1 联飞", d, iconDp = 12.5f)
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 syncConnModeSectionsUi(showRosEditor = true)
             }
         }
+        AnimHelper.attachSpringTouch(segModeRosBtn, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         modeSegBar.addView(segModeDemoBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         modeSegBar.addView(segModeRosBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         col.addView(modeSegBar)
@@ -2718,10 +2715,11 @@ class MainActivity : Activity() {
                     setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.0f)
                     typeface = Typeface.DEFAULT_BOLD
                     setOnClickListener {
-                        AnimHelper.triggerHaptic(it)
+                        AnimHelper.animateStateFlip(it)
                         applyDemoSceneByIndex(i)
                     }
                 }
+                AnimHelper.attachSpringTouch(sb, GcsMotionSpec.PressRole.SEGMENT_CHIP)
                 demoSceneSegBtns.add(sb)
                 val targetRow = if (i < 2) sceneRowTop else sceneRowBot
                 targetRow.addView(
@@ -2813,10 +2811,12 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.8f)
             typeface = Typeface.DEFAULT_BOLD
             setOnClickListener {
+                AnimHelper.animateStateFlip(it)
                 rosManager.topics.protocol = "tcpros"
                 syncProtoInputsVisibility()
             }
         }
+        AnimHelper.attachSpringTouch(segProtoTcpBtn, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         segProtoWsBtn = TextView(this).apply {
             text = "rosbridge (:9090)"
             maxLines = 1
@@ -2827,10 +2827,12 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.8f)
             typeface = Typeface.DEFAULT_BOLD
             setOnClickListener {
+                AnimHelper.animateStateFlip(it)
                 rosManager.topics.protocol = "rosbridge"
                 syncProtoInputsVisibility()
             }
         }
+        AnimHelper.attachSpringTouch(segProtoWsBtn, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         protoSeg.addView(segProtoTcpBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         protoSeg.addView(segProtoWsBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         directCard.addView(protoSeg)
@@ -2882,11 +2884,12 @@ class MainActivity : Activity() {
         )
         val toggleUdp = {
             udpTelemetryEnabledUi = !udpTelemetryEnabledUi
-            AnimHelper.triggerHaptic(udpToggleRow)
+            AnimHelper.triggerRoleHaptic(udpToggleRow, GcsMotionSpec.HapticRole.DETENT_SELECT)
             syncUdpSwitchVisual(animate = true)
         }
         udpToggleRow.setOnClickListener { toggleUdp() }
         udpSwitchPill.setOnClickListener { toggleUdp() }
+        AnimHelper.attachSpringTouch(udpSwitchPill, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         udpToggleRow.addView(udpTxtCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         udpToggleRow.addView(udpSwitchPill, LinearLayout.LayoutParams(dp(36f), dp(20f)))
         directCard.addView(udpToggleRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(7f) })
@@ -2944,8 +2947,7 @@ class MainActivity : Activity() {
             GcsIcons.bind(this, Type.SLIDERS, "高级话题映射配置", d, iconDp = 11.5f, trailing = Type.CHEVRON_DOWN)
             setOnClickListener {
                 topicMapExpanded = !topicMapExpanded
-                topicMapAccordionBody.visibility = if (topicMapExpanded) View.VISIBLE else View.GONE
-                if (topicMapExpanded) AnimHelper.animateStaggeredChildren(topicMapAccordionBody, d)
+                AnimHelper.animateCollapsibleSection(topicMapAccordionBody, topicMapExpanded, d, staggerChildren = topicMapExpanded)
                 GcsIcons.bind(
                     btnExpandTopicMap,
                     Type.SLIDERS,
@@ -2956,6 +2958,7 @@ class MainActivity : Activity() {
                 )
             }
         }
+        AnimHelper.attachSpringTouch(btnExpandTopicMap, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         topicCard.addView(btnExpandTopicMap)
 
         topicMapAccordionBody = LinearLayout(this).apply {
@@ -3176,16 +3179,7 @@ class MainActivity : Activity() {
             if (udpTelemetryEnabledUi) pal.accentStroke else pal.cardStroke,
             radiusDp = 11f
         )
-        val targetTx = if (udpTelemetryEnabledUi) dp(16f).toFloat() else 0f
-        if (animate) {
-            udpSwitchThumb.animate()
-                .translationX(targetTx)
-                .setDuration(165L)
-                .setInterpolator(AnimHelper.EASE_OUT_EXPO)
-                .start()
-        } else {
-            udpSwitchThumb.translationX = targetTx
-        }
+        AnimHelper.animateSwitchThumb(udpSwitchThumb, udpTelemetryEnabledUi, dp(16f).toFloat(), animate)
     }
 
     // ==================== Tab 1: 纯粹专注的航线任务编排面板 ====================
@@ -3268,13 +3262,14 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.routeLoopMode = i
                     GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
                     syncMissionStrategyButtons()
                     refreshCommandDockUi()
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             loopModeSegBtns.add(b)
             loopSeg.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -3297,12 +3292,13 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.routeFinishAction = i
                     GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
                     syncMissionStrategyButtons()
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             finishActSegBtns.add(b)
             finishSeg.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -3373,6 +3369,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val (cnt, isStaged, _) = simEngine.routeStatusSummary()
                 if (cnt <= 0) {
+                    AnimHelper.animateRejectShake(it, d)
                     AnimHelper.showDjiToast(toastBanner, "请先在地图选点加入航线或点击上方模板", d)
                 } else if (isStaged) {
                     startCommittedRouteExecution(it)
@@ -3485,10 +3482,10 @@ class MainActivity : Activity() {
                 isEnabled = enabled
                 setOnClickListener {
                     if (enabled) {
-                        AnimHelper.triggerHaptic(it)
                         onTap()
                     }
                 }
+                if (enabled) AnimHelper.attachSpringTouch(this, GcsMotionSpec.PressRole.ICON_CONTROL)
             }
 
             fun tinyTextStepBtn(lbl: String, onTap: () -> Unit): TextView = TextView(this).apply {
@@ -3499,9 +3496,9 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 background = roundedColor(pal.accentSoftFill, dp(4.5f))
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
                     onTap()
                 }
+                AnimHelper.attachSpringTouch(this, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             }
 
             val btnUp = tinySquareIcon(Type.ARROW_UP, i > 0) {
@@ -3666,7 +3663,7 @@ class MainActivity : Activity() {
         titleCol.addView(tvDetailTopicType)
 
         btnWideTerminal = createSmallIconBtn(Type.EXPAND_WIDTH, "宽屏") {
-            setWideTerminalMode(!drawerWideMode, applyImmediately = true)
+            setWideTerminalMode(!drawerWideMode, applyImmediately = true, animateWidth = true)
         }
         val btnCopyEcho = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER
@@ -3686,7 +3683,7 @@ class MainActivity : Activity() {
                 AnimHelper.showDjiToast(toastBanner, "已复制当前话题数据", d)
             }
         }
-        AnimHelper.attachSpringTouch(btnCopyEcho)
+        AnimHelper.attachSpringTouch(btnCopyEcho, GcsMotionSpec.PressRole.ICON_CONTROL)
 
         detailNavRow.addView(btnBackList)
         detailNavRow.addView(titleCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -3962,7 +3959,7 @@ class MainActivity : Activity() {
                     openTopicDetail(entry)
                 }
             }
-            AnimHelper.attachSpringTouch(row)
+            AnimHelper.attachSpringTouch(row, GcsMotionSpec.PressRole.HUD_INSTRUMENT)
 
             val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             val nameTv = TextView(this).apply {
@@ -4008,9 +4005,7 @@ class MainActivity : Activity() {
 
     private fun openTopicDetail(entry: RosTopicEntry) {
         selectedTopicEntry = entry
-        topicListPage.visibility = View.GONE
-        topicDetailPage.visibility = View.VISIBLE
-        AnimHelper.animateStaggeredChildren(topicDetailPage, d)
+        AnimHelper.animateHierarchicalPage(topicListPage, topicDetailPage, enterDetail = true, density = d)
         setTextIfChanged(tvDetailTopicName, entry.name)
         setTextIfChanged(tvDetailTopicType, entry.type)
         updateSmartBindButtonForTopic(entry)
@@ -4027,11 +4022,9 @@ class MainActivity : Activity() {
         isDetailCurrentlyStreaming = false
         syncDetailStreamButtonUi()
         if (drawerWideMode) {
-            setWideTerminalMode(false, applyImmediately = true)
+            setWideTerminalMode(false, applyImmediately = true, animateWidth = true)
         }
-        topicDetailPage.visibility = View.GONE
-        topicListPage.visibility = View.VISIBLE
-        AnimHelper.animateStaggeredChildren(topicListPage, d)
+        AnimHelper.animateHierarchicalPage(topicListPage, topicDetailPage, enterDetail = false, density = d)
     }
 
     private fun syncDetailStreamButtonUi() {
@@ -4806,7 +4799,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(6.5f), dp(2.5f), dp(6.5f), dp(2.5f))
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 hub.swarmCommandScope = if (hub.swarmCommandScope == 1) 0 else 1
                 GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
                 syncSwarmAllControlsUi()
@@ -4819,6 +4812,7 @@ class MainActivity : Activity() {
                 AnimHelper.showDjiToast(toastBanner, tip, d)
             }
         }
+        AnimHelper.attachSpringTouch(btnSwarmScopeHud, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         bar.addView(btnSwarmScopeHud)
 
         swarmDroneHudChips.clear()
@@ -4833,7 +4827,7 @@ class MainActivity : Activity() {
                 typeface = Typeface.MONOSPACE
                 setPadding(dp(6f), dp(2.5f), dp(6f), dp(2.5f))
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     simEngine.selectSwarmDrone(id)
                     DroneVectorModel.activeRig = DroneVectorModel.rigFor(hub.activeFocusIsTiltRig())
                     GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
@@ -4856,6 +4850,7 @@ class MainActivity : Activity() {
                     true
                 }
             }
+            AnimHelper.attachSpringTouch(chip, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             swarmDroneHudChips.add(chip)
             bar.addView(chip, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(3.5f) })
         }
@@ -4869,7 +4864,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(6.5f), dp(2.5f), dp(6.5f), dp(2.5f))
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 hub.swarmFormationType = (hub.swarmFormationType + 1) % 4
                 GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
                 syncSwarmAllControlsUi()
@@ -4879,6 +4874,7 @@ class MainActivity : Activity() {
                 AnimHelper.showDjiToast(toastBanner, "编队切换：${SwarmPalette.FORMATION_FULL_NAMES[hub.swarmFormationType]}", d)
             }
         }
+        AnimHelper.attachSpringTouch(btnSwarmFormHud, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         bar.addView(btnSwarmFormHud, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(4f) })
         return bar
     }
@@ -4911,10 +4907,11 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.4f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     applyMatrixModeCombo(mIdx)
                 }
             }
+            AnimHelper.attachSpringTouch(mb, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             modeMatrixQuickBtns.add(mb)
             matrixTrack.addView(mb, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -4945,7 +4942,7 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     if (cnt == 1) {
                         setSwarmModeEnabledLive(false)
                     } else {
@@ -4955,6 +4952,7 @@ class MainActivity : Activity() {
                     }
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             swarmScaleSegBtns.add(b)
             scaleTrack.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -4989,7 +4987,7 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.4f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.swarmRigPolicy = pIdx
                     if (pIdx != TiltConfigSpec.FLEET_RIG_MIXED) {
                         hub.tiltAirframeEnabled = (pIdx == TiltConfigSpec.FLEET_RIG_ALL_VECTORED)
@@ -4997,6 +4995,7 @@ class MainActivity : Activity() {
                     applyOperatingModeChangeLive("多机构型策略：${TiltConfigSpec.FLEET_RIG_FULL_NAMES[pIdx]}")
                 }
             }
+            AnimHelper.attachSpringTouch(pb, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             swarmRigPolicyBtns.add(pb)
             policyTrack.addView(pb, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -5018,7 +5017,7 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.2f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     val nowVec = hub.toggleSingleDroneRigInSwarm(dId)
                     simEngine.selectSwarmDrone(dId)
                     applyOperatingModeChangeLive(
@@ -5026,6 +5025,7 @@ class MainActivity : Activity() {
                     )
                 }
             }
+            AnimHelper.attachSpringTouch(db, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             swarmPerDroneRigBtns.add(db)
             mixedRow.addView(
                 db,
@@ -5063,7 +5063,7 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.swarmFormationType = fIdx
                     if (!hub.swarmModeEnabled) hub.swarmModeEnabled = true
                     GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
@@ -5074,6 +5074,7 @@ class MainActivity : Activity() {
                     AnimHelper.showDjiToast(toastBanner, "已按「${SwarmPalette.FORMATION_FULL_NAMES[fIdx]}」整队集结", d)
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             swarmFormSegBtns.add(b)
             formTrack.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -5104,7 +5105,7 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.4f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.swarmSpacingMeters = spVal
                     GcsSettingsModal.persistAllSettings(this@MainActivity, hub)
                     syncSwarmAllControlsUi()
@@ -5115,6 +5116,7 @@ class MainActivity : Activity() {
                     refreshCommandDockUi()
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             swarmSpaceSegBtns.add(b)
             spaceTrack.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -5155,12 +5157,13 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
             typeface = Typeface.DEFAULT_BOLD
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 rosManager.topics.swarmTopology = 0
                 syncSwarmAllControlsUi()
                 saveCurrentTopics(quiet = true)
             }
         }
+        AnimHelper.attachSpringTouch(btnNs, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         val btnIp = TextView(this).apply {
             text = "多机独立IP直连"
             maxLines = 1
@@ -5170,12 +5173,13 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
             typeface = Typeface.DEFAULT_BOLD
             setOnClickListener {
-                AnimHelper.triggerHaptic(it)
+                AnimHelper.animateStateFlip(it)
                 rosManager.topics.swarmTopology = 1
                 syncSwarmAllControlsUi()
                 saveCurrentTopics(quiet = true)
             }
         }
+        AnimHelper.attachSpringTouch(btnIp, GcsMotionSpec.PressRole.SEGMENT_CHIP)
         segSwarmTopoNsBtn = btnNs
         segSwarmTopoIpBtn = btnIp
         topoTrack.addView(btnNs, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -5353,7 +5357,7 @@ class MainActivity : Activity() {
         syncTopQuickSlotsVisual()
 
         if (::swarmHudBar.isInitialized) {
-            swarmHudBar.visibility = if (hub.swarmModeEnabled) View.VISIBLE else View.GONE
+            AnimHelper.animateFloatingBadge(swarmHudBar, show = hub.swarmModeEnabled, density = d, slideDp = -4f)
             val allScope = (hub.swarmCommandScope == 1)
             btnSwarmScopeHud.setTextColor(if (allScope) Color.WHITE else pal.textPrimary)
             btnSwarmScopeHud.background = roundedColor(
@@ -5405,9 +5409,14 @@ class MainActivity : Activity() {
             modeMatrixQuickBtns[i].background = roundedColor(if (sel) hiCol else Color.TRANSPARENT, dp(5f))
         }
 
-        wrapSwarmFleetRigSection?.visibility = if (hub.swarmModeEnabled) View.VISIBLE else View.GONE
-        wrapSwarmMixedMaskRow?.visibility =
-            if (hub.swarmModeEnabled && hub.swarmRigPolicy == TiltConfigSpec.FLEET_RIG_MIXED) View.VISIBLE else View.GONE
+        wrapSwarmFleetRigSection?.let { AnimHelper.animateCollapsibleSection(it, hub.swarmModeEnabled, d) }
+        wrapSwarmMixedMaskRow?.let {
+            AnimHelper.animateCollapsibleSection(
+                it,
+                hub.swarmModeEnabled && hub.swarmRigPolicy == TiltConfigSpec.FLEET_RIG_MIXED,
+                d
+            )
+        }
         for (i in swarmRigPolicyBtns.indices) {
             val sel = (hub.swarmRigPolicy == i)
             val hiCol = when (i) {
@@ -5537,12 +5546,13 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.setActiveFocusTiltRig(true)
                     hub.tiltCoordMode = i
                     applyOperatingModeChangeLive("倾转分配：${TiltConfigSpec.FULL_MODE_NAMES[i]}")
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             tiltModeDrawerBtns.add(b)
             modeTrack.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
@@ -5573,13 +5583,14 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.4f)
                 typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener {
-                    AnimHelper.triggerHaptic(it)
+                    AnimHelper.animateStateFlip(it)
                     hub.setActiveFocusTiltRig(true)
                     hub.tiltCoordMode = TiltConfigSpec.MODE_ACTIVE_PITCH
                     hub.tiltPitchBiasDeg = deg
                     applyOperatingModeChangeLive(String.format(Locale.US, "已设定主动机身俯仰偏置 %+.0f°", deg))
                 }
             }
+            AnimHelper.attachSpringTouch(b, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             tiltBiasDrawerBtns.add(b)
             biasTrack.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
