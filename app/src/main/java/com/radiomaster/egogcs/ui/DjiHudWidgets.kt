@@ -7,7 +7,9 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.view.View
 import com.radiomaster.egogcs.model.GcsSharedHub
@@ -67,6 +69,11 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
 
     private val d = resources.displayMetrics.density
 
+    private var cachedDiscShader: RadialGradient? = null
+    private var shaderKeyR = -1f
+    private var shaderKeyTheme = -1
+
+    private val discShaderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -76,15 +83,17 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
         style = Paint.Style.STROKE
         pathEffect = DashPathEffect(floatArrayOf(3.5f * d, 3.5f * d), 0f)
     }
-    private val cardinalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val cardinalPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 9.0f * d
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
+        fontFeatureSettings = "tnum, zero"
     }
-    private val pillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val pillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 8.2f * d
         textAlign = Paint.Align.CENTER
-        isFakeBoldText = true
+        typeface = GcsTheme.TYPEFACE_TABULAR_MONO
+        fontFeatureSettings = "tnum, zero"
     }
 
     private val clipPath = Path()
@@ -189,15 +198,45 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
 
         fillPaint.color = pal.hsiOuterBg
         canvas.drawCircle(cx, cy, rFull, fillPaint)
-        fillPaint.color = pal.hsiInnerBg
-        canvas.drawCircle(cx, cy, rBezelIn, fillPaint)
+        if (rBezelIn > 4f && (abs(rBezelIn - shaderKeyR) > 0.5f || hub.themeId != shaderKeyTheme)) {
+            shaderKeyR = rBezelIn
+            shaderKeyTheme = hub.themeId
+            val edgeTint = if (pal.isLight) {
+                Color.argb(252, 206, 218, 236)
+            } else {
+                Color.argb(252, 4, 7, 12)
+            }
+            cachedDiscShader = RadialGradient(
+                cx,
+                cy,
+                rBezelIn,
+                intArrayOf(pal.hsiInnerBg, edgeTint),
+                floatArrayOf(0.45f, 1.0f),
+                Shader.TileMode.CLAMP
+            )
+            discShaderPaint.shader = cachedDiscShader
+        }
+        if (discShaderPaint.shader != null) {
+            canvas.drawCircle(cx, cy, rBezelIn, discShaderPaint)
+        } else {
+            fillPaint.color = pal.hsiInnerBg
+            canvas.drawCircle(cx, cy, rBezelIn, fillPaint)
+        }
 
-        strokePaint.color = pal.hsiRingStroke
-        strokePaint.strokeWidth = 1.1f * d
+        strokePaint.color = pal.glassHighlightStroke
+        strokePaint.strokeWidth = 1.15f * d
         canvas.drawCircle(cx, cy, rFull, strokePaint)
-        strokePaint.color = pal.hsiTickMinor
-        strokePaint.strokeWidth = 0.85f * d
+        strokePaint.color = pal.hsiRingStroke
+        strokePaint.strokeWidth = 0.9f * d
         canvas.drawCircle(cx, cy, rBezelIn, strokePaint)
+
+        // 十字准星细刻度线，增强全向障碍扇区象限辨识度
+        strokePaint.color = Color.argb(if (pal.isLight) 42 else 34, Color.red(pal.hsiTickMinor), Color.green(pal.hsiTickMinor), Color.blue(pal.hsiTickMinor))
+        strokePaint.strokeWidth = 0.65f * d
+        canvas.drawLine(cx - rRadarMax, cy, cx - rAttCore, cy, strokePaint)
+        canvas.drawLine(cx + rAttCore, cy, cx + rRadarMax, cy, strokePaint)
+        canvas.drawLine(cx, cy - rRadarMax, cx, cy - rAttCore, strokePaint)
+        canvas.drawLine(cx, cy + rAttCore, cx, cy + rRadarMax, strokePaint)
 
         val rMidRing = rAttCore + (rRadarMax - rAttCore) * 0.5f
         dashPaint.color = pal.hsiTickMinor
@@ -433,16 +472,29 @@ class DjiHsiRadarView(context: Context, private val hub: GcsSharedHub) : View(co
             }
         }
 
+        val pillBorderCol: Int
         pillTextPaint.color = when {
-            nearestHit < 1.25f -> COL_RED
-            nearestHit < 2.35f -> COL_AMBER
-            else -> pal.textPrimary
+            nearestHit < 1.25f -> {
+                pillBorderCol = COL_RED
+                COL_RED
+            }
+            nearestHit < 2.35f -> {
+                pillBorderCol = COL_AMBER
+                COL_AMBER
+            }
+            else -> {
+                pillBorderCol = pal.glassHighlightStroke
+                pal.textPrimary
+            }
         }
-        val pw = max(46f * d, pillTextPaint.measureText(cachedPillTxt) + 10.0f * d)
-        val ph = 13.5f * d
+        val pw = max(48f * d, pillTextPaint.measureText(cachedPillTxt) + 11.0f * d)
+        val ph = 14.0f * d
         pillRect.set(cx - pw * 0.5f, cy + rBezelIn - ph - 1.5f * d, cx + pw * 0.5f, cy + rBezelIn - 1.5f * d)
         fillPaint.color = pal.hsiPillBg
-        canvas.drawRoundRect(pillRect, 4.0f * d, 4.0f * d, fillPaint)
+        canvas.drawRoundRect(pillRect, 4.5f * d, 4.5f * d, fillPaint)
+        strokePaint.color = pillBorderCol
+        strokePaint.strokeWidth = 0.85f * d
+        canvas.drawRoundRect(pillRect, 4.5f * d, 4.5f * d, strokePaint)
         val pFm = pillTextPaint.fontMetrics
         val pTextY = pillRect.centerY() - (pFm.ascent + pFm.descent) * 0.5f
         canvas.drawText(cachedPillTxt, cx, pTextY, pillTextPaint)
@@ -477,23 +529,24 @@ class DjiCompassTapeView(context: Context, private val hub: GcsSharedHub) : View
 
     private val density = resources.displayMetrics.density
     private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-    private val txtPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val txtPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 9.2f * density
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
+        fontFeatureSettings = "tnum, zero"
     }
     private val readoutBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
     private val readoutStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 1.0f * density
+        strokeWidth = 1.1f * density
     }
-    private val readoutTxtPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val readoutTxtPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 10.2f * density
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.MONOSPACE
-        isFakeBoldText = true
+        typeface = GcsTheme.TYPEFACE_TABULAR_MONO
+        fontFeatureSettings = "tnum, zero"
     }
     private val lubberPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -613,23 +666,23 @@ class DjiCompassTapeView(context: Context, private val hub: GcsSharedHub) : View
 
         canvas.restore()
 
-        val boxH = 18.0f * density
+        val boxH = 18.2f * density
         readoutBgPaint.color = pal.compassReadoutBg
         readoutStrokePaint.color = pal.accentStroke
         readoutTxtPaint.color = if (pal.isLight) pal.accent else pal.secondaryAccent
         lubberPaint.color = if (pal.isLight) pal.accent else pal.secondaryAccent
 
         badgeRect.set(center - boxW * 0.5f, 2.0f * density, center + boxW * 0.5f, 2.0f * density + boxH)
-        canvas.drawRoundRect(badgeRect, 4.5f * density, 4.5f * density, readoutBgPaint)
-        canvas.drawRoundRect(badgeRect, 4.5f * density, 4.5f * density, readoutStrokePaint)
+        canvas.drawRoundRect(badgeRect, 5.0f * density, 5.0f * density, readoutBgPaint)
+        canvas.drawRoundRect(badgeRect, 5.0f * density, 5.0f * density, readoutStrokePaint)
         val rFm = readoutTxtPaint.fontMetrics
         val rTextY = badgeRect.centerY() - (rFm.ascent + rFm.descent) * 0.5f
         canvas.drawText(cachedHdgBadgeTxt, center, rTextY, readoutTxtPaint)
 
         lubberPath.reset()
-        lubberPath.moveTo(center, badgeRect.bottom + 4.2f * density)
-        lubberPath.lineTo(center - 3.2f * density, badgeRect.bottom + 0.4f * density)
-        lubberPath.lineTo(center + 3.2f * density, badgeRect.bottom + 0.4f * density)
+        lubberPath.moveTo(center, badgeRect.bottom + 4.4f * density)
+        lubberPath.lineTo(center - 3.3f * density, badgeRect.bottom + 0.5f * density)
+        lubberPath.lineTo(center + 3.3f * density, badgeRect.bottom + 0.5f * density)
         lubberPath.close()
         canvas.drawPath(lubberPath, lubberPaint)
     }

@@ -105,6 +105,8 @@ class GcsSettingsModal(
     private val catPages = mutableListOf<View>()
     private val allToggleHandles = mutableListOf<ToggleSyncHandle>()
     private val allActionBtns = mutableListOf<TextView>()
+    private val allSeekBars = mutableListOf<SeekBar>()
+    private val allSliderValBadges = mutableListOf<TextView>()
 
     // 0. 飞行安全
     private lateinit var slInflation: SliderHandle
@@ -296,6 +298,8 @@ class GcsSettingsModal(
 
         allToggleHandles.clear()
         allActionBtns.clear()
+        allSeekBars.clear()
+        allSliderValBadges.clear()
 
         scrimRoot = FrameLayout(context).apply {
             setBackgroundColor(GcsTheme.of(hub.themeId).modalScrim)
@@ -434,7 +438,7 @@ class GcsSettingsModal(
             )
         }
 
-        bodyRow.addView(leftNav, LinearLayout.LayoutParams(dp(142f), MATCH_PARENT))
+        bodyRow.addView(leftNav, LinearLayout.LayoutParams(dp(136f), MATCH_PARENT))
         bodyRow.addView(
             View(context).apply {
                 GcsTheme.markRole(this, Role.DIVIDER)
@@ -480,6 +484,13 @@ class GcsSettingsModal(
             ab.setTextColor(pal.textPrimary)
             ab.background = pillBg(pal.cardFill, pal.cardStroke, radiusDp = 6f)
             ab.invalidate()
+        }
+        for (sb in allSeekBars) {
+            GcsTheme.styleAvionicsSeekBar(sb, pal, d)
+        }
+        for (vb in allSliderValBadges) {
+            vb.setTextColor(pal.accentBright)
+            vb.invalidate()
         }
         for (th in allToggleHandles) {
             th.refreshThemeColors()
@@ -1554,23 +1565,32 @@ class GcsSettingsModal(
 
     private fun groupCard(title: String): LinearLayout = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(10f), dp(8f), dp(10f), dp(9f))
-        GcsTheme.markRole(this, Role.SECTION_CARD, cornerDp = 8f)
-        addView(
-            TextView(context).apply {
-                text = title
-                setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.6f)
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(0, 0, 0, dp(5.5f))
-                GcsTheme.markRole(this, Role.TEXT_ACCENT)
-            }
-        )
+        setPadding(dp(10f), dp(8.5f), dp(10f), dp(9f))
+        GcsTheme.markRole(this, Role.SECTION_CARD, cornerDp = 8.5f)
+        val hdr = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(6f))
+        }
+        val bar = View(context).apply {
+            GcsTheme.markRole(this, Role.ACCENT_BAR, cornerDp = 2f)
+        }
+        val tv = TextView(context).apply {
+            text = title
+            maxLines = 2
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.6f)
+            typeface = Typeface.DEFAULT_BOLD
+            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+        }
+        hdr.addView(bar, LinearLayout.LayoutParams(dp(3f), dp(11.5f)).apply { rightMargin = dp(6f) })
+        hdr.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        addView(hdr)
     }
 
     private fun subFieldLabel(txt: String): TextView = TextView(context).apply {
         text = txt
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.8f)
-        setPadding(0, dp(4f), 0, dp(3.5f))
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
+        setPadding(0, dp(4.5f), 0, dp(3.5f))
         GcsTheme.markRole(this, Role.TEXT_MUTED)
     }
 
@@ -1578,7 +1598,7 @@ class GcsSettingsModal(
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         setPadding(dp(2.5f), dp(2.5f), dp(2.5f), dp(2.5f))
-        GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 6f)
+        GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 6.5f)
     }
 
     private fun segmentBtn(icon: Type?, title: String, onClick: () -> Unit): TextView = TextView(context).apply {
@@ -1598,7 +1618,15 @@ class GcsSettingsModal(
 
     private fun styleSegmentSelection(btn: TextView, selected: Boolean, activeColor: Int, pal: GcsTheme.Palette) {
         btn.setTextColor(if (selected) Color.WHITE else pal.textMuted)
-        btn.background = roundedColor(if (selected) activeColor else Color.TRANSPARENT, dp(5f))
+        btn.background = if (selected) {
+            GradientDrawable().apply {
+                setColor(activeColor)
+                cornerRadius = dp(5f).toFloat()
+                setStroke(1, Color.argb(105, 255, 255, 255))
+            }
+        } else {
+            roundedColor(Color.TRANSPARENT, dp(5f))
+        }
         btn.invalidate()
     }
 
@@ -1717,7 +1745,7 @@ class GcsSettingsModal(
     ): SliderHandle {
         val wrap = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(3.5f), 0, dp(3.5f))
+            setPadding(0, dp(4f), 0, dp(3.5f))
         }
         val top = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1726,26 +1754,33 @@ class GcsSettingsModal(
         val tvLbl = TextView(context).apply {
             text = label
             maxLines = 2
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
-            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.1f)
+            GcsTheme.markRole(this, Role.TEXT_SECONDARY)
         }
         val safeInit = initI.coerceIn(minI, maxI)
         val tvVal = TextView(context).apply {
             text = String.format(Locale.US, fmt, safeInit * scale)
             maxLines = 1
+            gravity = Gravity.CENTER
+            minWidth = dp(52f)
             setHorizontallyScrolling(false)
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f)
-            typeface = Typeface.MONOSPACE
-            setPadding(dp(6f), 0, 0, 0)
-            GcsTheme.markRole(this, Role.TEXT_ACCENT)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
+            GcsTheme.applyTabularReadout(this)
+            setPadding(dp(6f), dp(1.5f), dp(6f), dp(1.5f))
+            GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 4.5f)
+            setTextColor(GcsTheme.of(hub.themeId).accentBright)
         }
-        top.addView(tvLbl, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        allSliderValBadges.add(tvVal)
+        top.addView(tvLbl, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { rightMargin = dp(6f) })
         top.addView(tvVal)
         wrap.addView(top)
 
         val sb = SeekBar(context).apply {
             max = maxI - minI
             progress = safeInit - minI
+            minimumHeight = dp(24f)
+            setPadding(dp(7f), dp(3f), dp(7f), dp(3f))
+            GcsTheme.styleAvionicsSeekBar(this, GcsTheme.of(hub.themeId), d)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (!fromUser) return
@@ -1757,7 +1792,8 @@ class GcsSettingsModal(
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {}
             })
         }
-        wrap.addView(sb)
+        allSeekBars.add(sb)
+        wrap.addView(sb, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(1.5f) })
         parent.addView(wrap)
         return SliderHandle(sb, tvVal, minI, scale, fmt)
     }

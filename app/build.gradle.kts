@@ -37,6 +37,12 @@ android {
     }
 
     signingConfigs {
+        create("debugConfig") {
+            storeFile = file("${rootDir}/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
         if (hasOtaSigning) {
             create("otaShared") {
                 storeFile = file(requireNotNull(otaStoreFile))
@@ -61,10 +67,7 @@ android {
             )
         }
         debug {
-            // CI injects the existing OTA certificate; local builds can use Android's debug key.
-            if (hasOtaSigning) {
-                signingConfig = signingConfigs.getByName("otaShared")
-            }
+            signingConfig = signingConfigs.getByName("debugConfig")
             isMinifyEnabled = false
         }
     }

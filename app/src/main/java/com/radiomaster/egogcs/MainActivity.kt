@@ -8,6 +8,8 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.InsetDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -24,7 +26,6 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -173,10 +174,15 @@ class MainActivity : Activity() {
     private lateinit var inpTiltTelemetry: EditText
     private lateinit var inpTiltCmd: EditText
     private lateinit var tvClearanceTop: TextView
+    private lateinit var topClusterDivHz: View
     private lateinit var tvHzTop: TextView
+    private lateinit var topClusterDivBat: View
     private lateinit var tvBatTop: TextView
     private lateinit var btnMenuToggle: TextView
     private lateinit var btnSettingsToggle: ImageView
+    private var lastArmedBadgeStyled = -1
+    private var safeCutoutLeftPx = 0
+    private var safeCutoutRightPx = 0
 
     // 左侧飞行安全操控栏
     private lateinit var btnBrake: TextView
@@ -266,7 +272,9 @@ class MainActivity : Activity() {
     private lateinit var wrapWsUrl: LinearLayout
     private lateinit var inpMasterUri: EditText
     private lateinit var inpWsUrl: EditText
-    private lateinit var chkUdpTelemetry: CheckBox
+    private var udpTelemetryEnabledUi = false
+    private lateinit var udpSwitchPill: FrameLayout
+    private lateinit var udpSwitchThumb: View
     private lateinit var inpUdpPort: EditText
     private lateinit var tvUdpStatus: TextView
     private lateinit var btnExpandTopicMap: TextView
@@ -359,6 +367,11 @@ class MainActivity : Activity() {
         screenWidthDp = dm.widthPixels / d
         screenHeightDp = dm.heightPixels / d
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         applyImmersiveFullscreen()
 
@@ -642,23 +655,36 @@ class MainActivity : Activity() {
 
         tabGliderBar.background = roundedColor(pal.accent, dp(2f))
         toastBanner.setTextColor(pal.textPrimary)
-        toastBanner.background = GradientDrawable().apply {
-            setColor(pal.modalCardFill)
-            cornerRadius = dp(6f).toFloat()
-            setStroke(dp(1f), pal.secondaryAccent)
+        toastBanner.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(pal.glassDrawerFillTop, pal.modalCardFill)
+        ).apply {
+            cornerRadius = dp(6.5f).toFloat()
+            setStroke(maxOf(1, dp(1f)), pal.secondaryAccent)
         }
+        toastBanner.elevation = 8f * d
 
-        commandDock.background = GradientDrawable().apply {
-            setColor(pal.glassPopoverFill)
-            cornerRadius = dp(9f).toFloat()
-            setStroke(dp(1f), pal.accentStroke)
+        commandDock.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(pal.glassDrawerFillTop, pal.glassPopoverFill)
+        ).apply {
+            cornerRadius = dp(9.5f).toFloat()
+            setStroke(maxOf(1, dp(1f)), pal.accentStroke)
         }
+        commandDock.elevation = 8f * d
 
-        btnBrake.background = pillBg(
-            Color.argb(if (pal.isLight) 42 else 78, 255, 59, 48),
-            Color.parseColor("#FF3B30")
-        )
-        btnBrake.setTextColor(Color.parseColor(if (pal.isLight) "#D32F2F" else "#FF6961"))
+        btnBrake.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            if (pal.isLight) {
+                intArrayOf(Color.argb(56, 255, 59, 48), Color.argb(38, 229, 57, 53))
+            } else {
+                intArrayOf(Color.argb(148, 229, 57, 53), Color.argb(118, 168, 24, 24))
+            }
+        ).apply {
+            cornerRadius = dp(18f).toFloat()
+            setStroke(maxOf(1, dp(1.2f)), Color.parseColor("#FF5252"))
+        }
+        btnBrake.setTextColor(if (pal.isLight) Color.parseColor("#C62828") else Color.WHITE)
         btnBrake.invalidate()
 
         if (!rthConfirmPending) styleRthDefault()
@@ -672,6 +698,7 @@ class MainActivity : Activity() {
         syncTabHeaderColors()
         syncConnModeSectionsUi(showRosEditor = hub.isRosMode || rosSectionInConn.visibility == View.VISIBLE)
         syncProtoInputsVisibility()
+        syncUdpSwitchVisual(animate = false)
         syncDemoSceneSegButtons()
         syncMissionStrategyButtons()
         syncSwarmAllControlsUi()
@@ -681,6 +708,7 @@ class MainActivity : Activity() {
 
         lastBatDangerLevel = -1
         lastClearanceWarnLevel = -1
+        lastArmedBadgeStyled = -1
         lastHudThemeId = -1
         hsiView.invalidate()
         compassView.invalidate()
@@ -712,7 +740,13 @@ class MainActivity : Activity() {
     private fun syncTabHeaderColors() {
         val pal = GcsTheme.of(hub.themeId)
         for (i in tabBtns.indices) {
-            tabBtns[i].setTextColor(if (i == activeTabIndex) pal.textPrimary else pal.textMuted)
+            val active = (i == activeTabIndex)
+            tabBtns[i].setTextColor(if (active) pal.textPrimary else pal.textMuted)
+            tabBtns[i].background = if (active) {
+                InsetDrawable(roundedColor(pal.accentSoftFill, dp(6f)), dp(3f), dp(5f), dp(3f), dp(6f))
+            } else {
+                null
+            }
             tabBtns[i].invalidate()
         }
     }
@@ -739,8 +773,8 @@ class MainActivity : Activity() {
      */
     private fun computeOpenMapCenterOffsetPx(drawerWidthPx: Int): Float {
         val totalW = cockpitRoot.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
-        val leftSafeEdge = (leftSafetyRail.right.takeIf { it > 0 } ?: dp(96f)) + dp(8f)
-        val rightDrawerEdge = totalW - drawerWidthPx - dp(14f)
+        val leftSafeEdge = (leftSafetyRail.right.takeIf { it > 0 } ?: (safeCutoutLeftPx + dp(98f))) + dp(8f)
+        val rightDrawerEdge = totalW - safeCutoutRightPx - drawerWidthPx - dp(14f)
         val targetCenter = ((leftSafeEdge + rightDrawerEdge) * 0.5f)
             .coerceIn(leftSafeEdge + dp(94f).toFloat(), (totalW * 0.5f))
         return targetCenter - totalW * 0.5f
@@ -749,15 +783,15 @@ class MainActivity : Activity() {
     /**
      * 底部与侧翼组件防重叠协调器：
      * - 展开抽屉时自动收起底部中央指令坞 (避免与抽屉或左仪表碰撞)，并在宽屏终端或超窄屏下自动避让左下数字框；
-     * - 抽屉关闭且底部指令坞弹出时，在宽度 < 780dp 的屏幕上平滑避让左下数字框，保留左侧 HSI 球 + 中央指令坞 + 右侧姿态视窗三段式无碰撞对称排布。
+     * - 抽屉关闭且底部指令坞弹出时，在宽度 < 795dp 的屏幕上平滑避让左下数字框，保留左侧 HSI 球 + 中央指令坞 + 右侧姿态视窗三段式无碰撞对称排布。
      */
     private fun syncBottomHudAvoidance() {
         if (!::hdTelemetryBox.isInitialized || !::attitudeHudView.isInitialized || !::commandDock.isInitialized) return
         val totalW = cockpitRoot.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
-        val drawerLeftEdge = totalW - currentDrawerWidthPx() - dp(12f)
-        val bottomClusterRightApprox = dp(264f)
+        val drawerLeftEdge = totalW - safeCutoutRightPx - currentDrawerWidthPx() - dp(12f)
+        val bottomClusterRightApprox = safeCutoutLeftPx + dp(278f)
 
-        val hideTelemetryForDock = (!drawerOpen && dockLogicalActive && screenWidthDp < 780f)
+        val hideTelemetryForDock = (!drawerOpen && dockLogicalActive && screenWidthDp < 795f)
         val hideTelemetryForDrawer = (drawerOpen && drawerLeftEdge < bottomClusterRightApprox + dp(10f))
         val shouldHideTelemetry = hideTelemetryForDock || hideTelemetryForDrawer
 
@@ -1516,18 +1550,18 @@ class MainActivity : Activity() {
         )
         cockpitRoot.addView(mapView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 
-        // 顶部细长电量进度条 (0..2dp)
-        val batTrack = FrameLayout(this).apply { setBackgroundColor(Color.argb(38, 128, 140, 160)) }
+        // 顶部细长电量进度条 (0..2.5dp)
+        val batTrack = FrameLayout(this).apply { setBackgroundColor(Color.argb(46, 128, 145, 168)) }
         topBatFill = View(this).apply { setBackgroundColor(Color.parseColor("#00E676")) }
         batTrack.addView(topBatFill, FrameLayout.LayoutParams((resources.displayMetrics.widthPixels * 0.86f).roundToInt(), MATCH_PARENT))
-        cockpitRoot.addView(batTrack, FrameLayout.LayoutParams(MATCH_PARENT, dp(2f), Gravity.TOP))
+        cockpitRoot.addView(batTrack, FrameLayout.LayoutParams(MATCH_PARENT, dp(2.5f), Gravity.TOP))
 
-        // 1. 紧凑顶栏 (y = 2..38dp, 保证 640dp 横屏零溢出挤压)
+        // 1. 紧凑顶栏 (y = 2.5..38.5dp, 保证 640dp 横屏零溢出挤压)
         topBarView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             minimumHeight = dp(38f)
-            setPadding(dp(7f), dp(3f), dp(7f), dp(3f))
+            setPadding(dp(8f), dp(3.5f), dp(8f), dp(3f))
             GcsTheme.markRole(this, Role.TOP_GRADIENT_BAR)
         }
 
@@ -1536,9 +1570,9 @@ class MainActivity : Activity() {
             maxLines = 1
             setHorizontallyScrolling(false)
             gravity = Gravity.CENTER_VERTICAL
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(6.5f), dp(4f), dp(6.5f), dp(4f))
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
+            GcsTheme.applyTabularReadout(this, bold = true, letterSpacingEm = 0.01f)
+            setPadding(dp(7f), dp(4f), dp(7f), dp(4f))
             GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 5.5f)
         }
         topBarView.addView(tvModeBadge)
@@ -1664,18 +1698,40 @@ class MainActivity : Activity() {
         val rightCluster = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6.5f), dp(4f), dp(6.5f), dp(4f))
+            setPadding(dp(7.5f), dp(4f), dp(7.5f), dp(4f))
             GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 5.5f)
             setOnClickListener { toggleOrJumpDrawerTab(TAB_STATUS) }
         }
         AnimHelper.attachSpringTouch(rightCluster)
-        tvClearanceTop = monoLabel("避障1.4m", "#00E676", 9.8f)
-        tvHzTop = monoLabel(" | 60fps | ", "#FFFFFF", 9.8f, Role.TEXT_SECONDARY).apply {
-            visibility = if (screenWidthDp >= 650f) View.VISIBLE else View.GONE
+        val showHzInTopBar = screenWidthDp >= 650f
+        tvClearanceTop = monoLabel("避障1.4m", "#00E676", 9.6f)
+        topClusterDivHz = View(this).apply {
+            GcsTheme.markRole(this, Role.DIVIDER)
+            visibility = if (showHzInTopBar) View.VISIBLE else View.GONE
         }
-        tvBatTop = monoLabel("16.2V·12.6A | 控92%", "#00E676", 9.8f)
+        tvHzTop = monoLabel("60fps", "#FFFFFF", 9.6f, Role.TEXT_SECONDARY).apply {
+            visibility = if (showHzInTopBar) View.VISIBLE else View.GONE
+        }
+        topClusterDivBat = View(this).apply {
+            GcsTheme.markRole(this, Role.DIVIDER)
+        }
+        tvBatTop = monoLabel(if (showHzInTopBar) "16.2V·12.6A · 控92%" else "16.2V·控92%", "#00E676", 9.6f)
         rightCluster.addView(tvClearanceTop)
+        rightCluster.addView(
+            topClusterDivHz,
+            LinearLayout.LayoutParams(1, dp(11f)).apply {
+                leftMargin = dp(5.5f)
+                rightMargin = dp(5.5f)
+            }
+        )
         rightCluster.addView(tvHzTop)
+        rightCluster.addView(
+            topClusterDivBat,
+            LinearLayout.LayoutParams(1, dp(11f)).apply {
+                leftMargin = dp(5.5f)
+                rightMargin = dp(5.5f)
+            }
+        )
         rightCluster.addView(tvBatTop)
         topBarView.addView(rightCluster)
 
@@ -1851,8 +1907,8 @@ class MainActivity : Activity() {
 
         hdTelemetryBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(8.5f), dp(5.5f), dp(8.5f), dp(5.5f))
-            GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 7.5f)
+            setPadding(dp(7f), dp(5f), dp(7f), dp(5f))
+            GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 8.5f)
             setOnClickListener {
                 mapView.recenterLockDrone()
                 syncCameraControlLabels()
@@ -1860,23 +1916,51 @@ class MainActivity : Activity() {
             }
         }
         AnimHelper.attachSpringTouch(hdTelemetryBox)
+
+        fun buildHudMetricCell(microLabel: String, valueView: TextView): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            minimumWidth = dp(74f)
+            setPadding(dp(6f), dp(2.5f), dp(6f), dp(2.5f))
+            GcsTheme.markRole(this, Role.METRIC_CELL, cornerDp = 4.5f)
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = microLabel
+                    maxLines = 1
+                    setHorizontallyScrolling(false)
+                    setTextSize(TypedValue.COMPLEX_UNIT_DIP, 7.4f)
+                    typeface = GcsTheme.TYPEFACE_LABEL_MEDIUM
+                    letterSpacing = 0.03f
+                    GcsTheme.markRole(this, Role.TEXT_MUTED)
+                }
+            )
+            addView(valueView)
+        }
+
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        tvOsdH = monoLabel("H 1.2m", "#FFFFFF", 13f, Role.TEXT_PRIMARY)
-        tvOsdHs = monoLabel("  HS 0.0m/s", "#FFFFFF", 13f, Role.TEXT_PRIMARY)
-        row1.addView(tvOsdH)
-        row1.addView(tvOsdHs)
+        tvOsdH = monoLabel("1.2 m", "#FFFFFF", 11.8f, Role.TEXT_PRIMARY)
+        tvOsdHs = monoLabel("0.0 m/s", "#FFFFFF", 11.8f, Role.TEXT_PRIMARY)
+        row1.addView(buildHudMetricCell("高度 ALT", tvOsdH), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        row1.addView(
+            buildHudMetricCell("地速 SPD", tvOsdHs),
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(4f) }
+        )
 
         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        tvOsdD = monoLabel("D 3.8m", "#FFFFFF", 13f, Role.TEXT_PRIMARY)
-        tvOsdMapPts = monoLabel("  MAP 0", "#69B7FF", 11.2f, Role.TEXT_ACCENT)
-        row2.addView(tvOsdD)
-        row2.addView(tvOsdMapPts)
+        tvOsdD = monoLabel("3.8 m", "#FFFFFF", 11.8f, Role.TEXT_PRIMARY)
+        tvOsdMapPts = monoLabel("0", "#69B7FF", 11.5f, Role.TEXT_ACCENT)
+        row2.addView(buildHudMetricCell("距目标 DST", tvOsdD), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        row2.addView(
+            buildHudMetricCell("点云 MAP", tvOsdMapPts),
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(4f) }
+        )
 
-        tvOsdSubXyz = monoLabel("X -5.50  Y -4.20  YAW 37°", "#B8C0CC", 8.8f, Role.TEXT_MUTED).apply {
-            setPadding(0, dp(2f), 0, 0)
+        tvOsdSubXyz = monoLabel("X -5.50  Y -4.20  YAW 37°", "#B8C0CC", 8.4f, Role.TEXT_MUTED).apply {
+            GcsTheme.applyTabularReadout(this, bold = false, letterSpacingEm = -0.01f)
+            setPadding(dp(1.5f), dp(3f), dp(1.5f), 0)
         }
-        tvOsdTilt = monoLabel("TILT·协同 S1 +0.0° S2 +0.0°", "#FFB300", 8.8f).apply {
-            setPadding(0, dp(1.5f), 0, 0)
+        tvOsdTilt = monoLabel("TILT·协同 S1 +0.0° S2 +0.0°", "#FFB300", 8.4f).apply {
+            setPadding(dp(5.5f), dp(2f), dp(5.5f), dp(2f))
+            GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 4.5f)
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
                 val curVec = hub.activeFocusIsTiltRig()
@@ -1895,10 +1979,13 @@ class MainActivity : Activity() {
                 applyOperatingModeChangeLive(toastTxt)
             }
         }
-        hdTelemetryBox.addView(row1)
-        hdTelemetryBox.addView(row2, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(2f) })
+        hdTelemetryBox.addView(row1, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        hdTelemetryBox.addView(row2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(3f) })
         hdTelemetryBox.addView(tvOsdSubXyz)
-        hdTelemetryBox.addView(tvOsdTilt)
+        hdTelemetryBox.addView(
+            tvOsdTilt,
+            LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(2.5f) }
+        )
         bottomLeftCluster.addView(hdTelemetryBox, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(6f) })
 
         cockpitRoot.addView(
@@ -1982,12 +2069,12 @@ class MainActivity : Activity() {
         zoomPair.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, MATCH_PARENT))
         zoomPair.addView(btnZIn, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
 
-        val pillW = dp(80f)
+        val pillW = dp(82f)
         rightCamStack.addView(btn3DRef, LinearLayout.LayoutParams(pillW, WRAP_CONTENT))
         rightCamStack.addView(btnFollowRef, LinearLayout.LayoutParams(pillW, WRAP_CONTENT).apply { topMargin = dp(4.5f) })
         rightCamStack.addView(btnXrayRef, LinearLayout.LayoutParams(pillW, WRAP_CONTENT).apply { topMargin = dp(4.5f) })
         rightCamStack.addView(btnLayerPopupToggle, LinearLayout.LayoutParams(pillW, WRAP_CONTENT).apply { topMargin = dp(4.5f) })
-        rightCamStack.addView(zoomPair, LinearLayout.LayoutParams(pillW, dp(28f)).apply { topMargin = dp(4.5f) })
+        rightCamStack.addView(zoomPair, LinearLayout.LayoutParams(pillW, dp(29f)).apply { topMargin = dp(4.5f) })
 
         cockpitRoot.addView(
             rightCamStack,
@@ -1997,7 +2084,7 @@ class MainActivity : Activity() {
             }
         )
 
-        // 7. 右下角无人机三维实时姿态视窗 (124x94dp, 与左下 HSI 94x94dp 底边严丝合缝对称对齐)
+        // 7. 右下角无人机三维实时姿态视窗 (142x96dp, 与左下 HSI 96x96dp 底边严丝合缝对称对齐)
         attitudeHudView = UavAttitudeHudView(this, hub).apply {
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
@@ -2008,7 +2095,7 @@ class MainActivity : Activity() {
         AnimHelper.attachSpringTouch(attitudeHudView)
         cockpitRoot.addView(
             attitudeHudView,
-            FrameLayout.LayoutParams(dp(142f), dp(96f), Gravity.BOTTOM or Gravity.END).apply {
+            FrameLayout.LayoutParams(dp(144f), dp(96f), Gravity.BOTTOM or Gravity.END).apply {
                 rightMargin = dp(10f)
                 bottomMargin = dp(8f)
             }
@@ -2019,8 +2106,8 @@ class MainActivity : Activity() {
         layerQuickPopover.visibility = View.GONE
         cockpitRoot.addView(
             layerQuickPopover,
-            FrameLayout.LayoutParams(dp(262f), WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
-                rightMargin = dp(96f)
+            FrameLayout.LayoutParams(dp(264f), WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
+                rightMargin = dp(98f)
                 topMargin = dp(44f)
             }
         )
@@ -2042,6 +2129,46 @@ class MainActivity : Activity() {
         // 10. 居中模态设置中心 (置于最顶层，遮罩覆盖全屏)
         val modalRoot = settingsModal.buildModalView()
         cockpitRoot.addView(modalRoot, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+
+        // 11. 异形屏/挖孔屏安全区自适应（RadioMaster AX12 无挖孔屏保持紧凑 8~10dp 边距零浪费）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            cockpitRoot.setOnApplyWindowInsetsListener { _, insets ->
+                val cutout = insets.displayCutout
+                val sl = cutout?.safeInsetLeft ?: 0
+                val sr = cutout?.safeInsetRight ?: 0
+                if (sl != safeCutoutLeftPx || sr != safeCutoutRightPx) {
+                    safeCutoutLeftPx = sl
+                    safeCutoutRightPx = sr
+                    topBarView.setPadding(dp(8f) + sl, dp(3.5f), dp(8f) + sr, dp(3f))
+                    (leftSafetyRail.layoutParams as? FrameLayout.LayoutParams)?.let {
+                        it.leftMargin = dp(10f) + sl
+                        leftSafetyRail.layoutParams = it
+                    }
+                    (bottomLeftCluster.layoutParams as? FrameLayout.LayoutParams)?.let {
+                        it.leftMargin = dp(10f) + sl
+                        bottomLeftCluster.layoutParams = it
+                    }
+                    (rightCamStack.layoutParams as? FrameLayout.LayoutParams)?.let {
+                        it.rightMargin = dp(10f) + sr
+                        rightCamStack.layoutParams = it
+                    }
+                    (attitudeHudView.layoutParams as? FrameLayout.LayoutParams)?.let {
+                        it.rightMargin = dp(10f) + sr
+                        attitudeHudView.layoutParams = it
+                    }
+                    (layerQuickPopover.layoutParams as? FrameLayout.LayoutParams)?.let {
+                        it.rightMargin = dp(98f) + sr
+                        layerQuickPopover.layoutParams = it
+                    }
+                    (drawerRoot.layoutParams as? FrameLayout.LayoutParams)?.let {
+                        it.rightMargin = dp(8f) + sr
+                        drawerRoot.layoutParams = it
+                    }
+                    syncBottomHudAvoidance()
+                }
+                insets
+            }
+        }
 
         return cockpitRoot
     }
@@ -2282,28 +2409,30 @@ class MainActivity : Activity() {
         val altInline = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(27f)
+            minimumHeight = dp(28f)
             GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 5.5f)
         }
         val btnMinus = TextView(this).apply {
-            text = "-"
+            text = "−"
             gravity = Gravity.CENTER
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(7.5f), dp(3.5f), dp(7.5f), dp(3.5f))
+            setPadding(dp(8f), dp(3.5f), dp(8f), dp(3.5f))
             GcsTheme.markRole(this, Role.TEXT_PRIMARY)
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
                 adjustTargetAltitudeByStep(-1f)
             }
         }
-        tvDockAltVal = monoLabel(String.format(Locale.US, "高 %.1fm", hub.goalZ), "#69B7FF", 9.8f, Role.TEXT_ACCENT)
+        tvDockAltVal = monoLabel(String.format(Locale.US, "高 %.1fm", hub.goalZ), "#69B7FF", 9.8f, Role.TEXT_ACCENT).apply {
+            setPadding(dp(6f), 0, dp(6f), 0)
+        }
         val btnPlus = TextView(this).apply {
             text = "+"
             gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(7.5f), dp(3.5f), dp(7.5f), dp(3.5f))
+            setPadding(dp(8f), dp(3.5f), dp(8f), dp(3.5f))
             GcsTheme.markRole(this, Role.TEXT_PRIMARY)
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
@@ -2311,7 +2440,9 @@ class MainActivity : Activity() {
             }
         }
         altInline.addView(btnMinus)
+        altInline.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, dp(14f)))
         altInline.addView(tvDockAltVal)
+        altInline.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, dp(14f)))
         altInline.addView(btnPlus)
 
         val btnCancelPin = ImageView(this).apply {
@@ -2702,17 +2833,60 @@ class MainActivity : Activity() {
         wrapWsUrl = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         inpWsUrl = labeledInput(wrapWsUrl, "机载 rosbridge WebSocket 地址", cfg.wsUrl)
         directCard.addView(wrapWsUrl)
-        chkUdpTelemetry = CheckBox(this).apply {
-            text = "UDP 点云/位姿（命令保持可靠链路）"
-            isChecked = cfg.udpTelemetryEnabled
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
-            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+        udpTelemetryEnabledUi = cfg.udpTelemetryEnabled
+        val udpToggleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(7.5f), dp(6f), dp(7.5f), dp(6f))
+            GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 6f)
         }
-        directCard.addView(chkUdpTelemetry)
+        val udpTxtCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        udpTxtCol.addView(
+            TextView(this).apply {
+                text = "UDP 点云/位姿高速直通"
+                maxLines = 1
+                setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
+                typeface = Typeface.DEFAULT_BOLD
+                GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+            }
+        )
+        udpTxtCol.addView(
+            TextView(this).apply {
+                text = "高频遥测走低延迟 UDP，控制指令保持可靠链路"
+                maxLines = 2
+                setTextSize(TypedValue.COMPLEX_UNIT_DIP, 8.8f)
+                setPadding(0, dp(1.5f), dp(6f), 0)
+                GcsTheme.markRole(this, Role.TEXT_MUTED)
+            }
+        )
+        udpSwitchPill = FrameLayout(this)
+        udpSwitchThumb = View(this).apply {
+            background = roundedColor(Color.WHITE, dp(8.5f))
+        }
+        udpSwitchPill.addView(
+            udpSwitchThumb,
+            FrameLayout.LayoutParams(dp(15f), dp(15f), Gravity.CENTER_VERTICAL).apply {
+                leftMargin = dp(2.5f)
+            }
+        )
+        val toggleUdp = {
+            udpTelemetryEnabledUi = !udpTelemetryEnabledUi
+            AnimHelper.triggerHaptic(udpToggleRow)
+            syncUdpSwitchVisual(animate = true)
+        }
+        udpToggleRow.setOnClickListener { toggleUdp() }
+        udpSwitchPill.setOnClickListener { toggleUdp() }
+        udpToggleRow.addView(udpTxtCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        udpToggleRow.addView(udpSwitchPill, LinearLayout.LayoutParams(dp(36f), dp(20f)))
+        directCard.addView(udpToggleRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(7f) })
+        syncUdpSwitchVisual(animate = false)
+
         inpUdpPort = labeledInput(directCard, "本机 UDP 接收端口（需机载 ROS→UDP 桥）", cfg.udpPort.toString()).apply {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
-        tvUdpStatus = monoLabel(hub.udpTelemetryStatus, "#AAB6C7", 9.4f, Role.TEXT_MUTED)
+        tvUdpStatus = monoLabel(hub.udpTelemetryStatus, "#AAB6C7", 9.2f, Role.TEXT_MUTED).apply {
+            setPadding(0, dp(3f), 0, 0)
+        }
         directCard.addView(tvUdpStatus)
 
         val actRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -2980,6 +3154,26 @@ class MainActivity : Activity() {
         segProtoTcpBtn.background = roundedColor(if (isTcp) pal.accent else Color.TRANSPARENT, dp(5f))
         segProtoWsBtn.setTextColor(if (!isTcp) Color.WHITE else pal.textMuted)
         segProtoWsBtn.background = roundedColor(if (!isTcp) pal.accent else Color.TRANSPARENT, dp(5f))
+    }
+
+    private fun syncUdpSwitchVisual(animate: Boolean) {
+        if (!::udpSwitchPill.isInitialized) return
+        val pal = GcsTheme.of(hub.themeId)
+        udpSwitchPill.background = pillBg(
+            if (udpTelemetryEnabledUi) pal.accent else pal.wellFill,
+            if (udpTelemetryEnabledUi) pal.accentStroke else pal.cardStroke,
+            radiusDp = 11f
+        )
+        val targetTx = if (udpTelemetryEnabledUi) dp(16f).toFloat() else 0f
+        if (animate) {
+            udpSwitchThumb.animate()
+                .translationX(targetTx)
+                .setDuration(165L)
+                .setInterpolator(AnimHelper.EASE_OUT_EXPO)
+                .start()
+        } else {
+            udpSwitchThumb.translationX = targetTx
+        }
     }
 
     // ==================== Tab 1: 纯粹专注的航线任务编排面板 ====================
@@ -4243,7 +4437,7 @@ class MainActivity : Activity() {
         val pal = GcsTheme.of(curTheme)
         if (curTheme != lastHudThemeId) {
             lastHudThemeId = curTheme
-            tvModeBadge.setTextColor(pal.textPrimary)
+            lastArmedBadgeStyled = -1
             lastClearanceWarnLevel = -1
             lastBatDangerLevel = -1
         }
@@ -4259,6 +4453,29 @@ class MainActivity : Activity() {
             lastPx4ModeStr = s.px4Mode
             lastArmedFlag = s.armed
             tvModeBadge.text = "${s.px4Mode} · ${if (s.armed) "ARMED" else "DISARM"}"
+        }
+        val armedStyleCode = if (s.armed) 1 else 0
+        if (armedStyleCode != lastArmedBadgeStyled) {
+            lastArmedBadgeStyled = armedStyleCode
+            if (s.armed) {
+                tvModeBadge.setTextColor(pal.textPrimary)
+                tvModeBadge.background = GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(pal.glassFillTop, pal.glassFill)
+                ).apply {
+                    cornerRadius = 5.5f * d
+                    setStroke(dp(1f).coerceAtLeast(1), pal.glassHighlightStroke)
+                }
+            } else {
+                tvModeBadge.setTextColor(Color.rgb(255, 198, 72))
+                tvModeBadge.background = GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(pal.glassFillTop, pal.glassFill)
+                ).apply {
+                    cornerRadius = 5.5f * d
+                    setStroke(dp(1f).coerceAtLeast(1), Color.argb(150, 255, 178, 42))
+                }
+            }
         }
         val curConnLbl = hub.connectionLabel
         if (curConnLbl != lastConnLabelStr || s.fsmState != lastFsmStateStr) {
@@ -4325,10 +4542,10 @@ class MainActivity : Activity() {
         }
 
         if (hdTelemetryBox.visibility == View.VISIBLE) {
-            FastHudFormatter.setFixed1(tvOsdH, "H ", s.uavZ, "m")
-            FastHudFormatter.setFixed1(tvOsdHs, "  HS ", spd, "m/s")
-            FastHudFormatter.setFixed1(tvOsdD, "D ", distGoal, "m")
-            FastHudFormatter.setCompactPoints(tvOsdMapPts, "  MAP ", s.mapPointCount, "")
+            FastHudFormatter.setFixed1(tvOsdH, "", s.uavZ, " m")
+            FastHudFormatter.setFixed1(tvOsdHs, "", spd, " m/s")
+            FastHudFormatter.setFixed1(tvOsdD, "", distGoal, " m")
+            FastHudFormatter.setCompactPoints(tvOsdMapPts, "", s.mapPointCount, "")
             FastHudFormatter.setSubXyzYaw(tvOsdSubXyz, s.uavX, s.uavY, yawDeg)
             tvOsdTilt.setTextColor(
                 when {
@@ -4487,11 +4704,13 @@ class MainActivity : Activity() {
                 ?: "/drone_{id}_active_pitch_planner/pitch_tilt_cmd"
         )
         rosManager.topics = cfg
+        udpTelemetryEnabledUi = cfg.udpTelemetryEnabled
+        syncUdpSwitchVisual(animate = false)
     }
 
     private fun saveCurrentTopics(quiet: Boolean, refreshLink: Boolean = true): Boolean {
         val cur = rosManager.topics
-        val udpEnabled = if (::chkUdpTelemetry.isInitialized) chkUdpTelemetry.isChecked else cur.udpTelemetryEnabled
+        val udpEnabled = if (::udpSwitchPill.isInitialized) udpTelemetryEnabledUi else cur.udpTelemetryEnabled
         val udpPort = if (::inpUdpPort.isInitialized) inpUdpPort.text.toString().toIntOrNull() else cur.udpPort
         if (udpPort == null || udpPort !in 1024..65535 || udpPort == 14550) {
             AnimHelper.showDjiToast(toastBanner, "UDP 端口需为1024–65535，且不能占用14550", d)
@@ -5416,10 +5635,12 @@ class MainActivity : Activity() {
 
     private fun glassBg(radiusPx: Int): GradientDrawable {
         val pal = GcsTheme.of(hub.themeId)
-        return GradientDrawable().apply {
-            setColor(pal.glassFill)
+        return GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(pal.glassFillTop, pal.glassFill)
+        ).apply {
             cornerRadius = radiusPx.toFloat()
-            setStroke(maxOf(1, dp(0.85f)), pal.glassStroke)
+            setStroke(maxOf(1, dp(0.9f)), pal.glassStroke)
         }
     }
 
@@ -5436,10 +5657,20 @@ class MainActivity : Activity() {
 
     private fun camPillBg(active: Boolean): GradientDrawable {
         val pal = GcsTheme.of(hub.themeId)
-        return GradientDrawable().apply {
-            cornerRadius = dp(14f).toFloat()
-            setColor(if (active) pal.accentSoftFill else pal.glassFill)
-            setStroke(maxOf(1, dp(0.9f)), if (active) pal.accent else pal.glassStroke)
+        return if (active) {
+            GradientDrawable().apply {
+                cornerRadius = dp(14f).toFloat()
+                setColor(pal.accentSoftFill)
+                setStroke(maxOf(1, dp(0.95f)), pal.accent)
+            }
+        } else {
+            GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(pal.glassFillTop, pal.glassFill)
+            ).apply {
+                cornerRadius = dp(14f).toFloat()
+                setStroke(maxOf(1, dp(0.9f)), pal.glassStroke)
+            }
         }
     }
 
@@ -5449,7 +5680,7 @@ class MainActivity : Activity() {
         setHorizontallyScrolling(false)
         setTextColor(Color.parseColor(hexCol))
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, sizeDp)
-        typeface = Typeface.MONOSPACE
+        GcsTheme.applyTabularReadout(this, bold = true)
         if (themeRole != null) {
             GcsTheme.markRole(this, themeRole)
         }
@@ -5460,13 +5691,14 @@ class MainActivity : Activity() {
         maxLines = 1
         setHorizontallyScrolling(false)
         gravity = Gravity.CENTER
-        minimumHeight = dp(29f)
+        minWidth = dp(88f)
+        minimumHeight = dp(30f)
         setTextColor(pal.textPrimary)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
         typeface = Typeface.DEFAULT_BOLD
         setPadding(dp(10.5f), dp(5f), dp(11f), dp(5f))
         val ac = Color.parseColor(accentHex)
-        background = pillBg(if (active) Color.argb(52, Color.red(ac), Color.green(ac), Color.blue(ac)) else pal.glassFill, ac)
+        background = pillBg(if (active) Color.argb(56, Color.red(ac), Color.green(ac), Color.blue(ac)) else pal.glassFill, ac)
         GcsIcons.bind(this, icon, label, d, iconDp = 11.5f, gapDp = 4f)
         AnimHelper.attachSpringTouch(this)
     }
@@ -5507,17 +5739,25 @@ class MainActivity : Activity() {
     private fun sectionCard(title: String): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(9.5f), dp(8f), dp(9.5f), dp(8.5f))
-        GcsTheme.markRole(this, Role.SECTION_CARD, cornerDp = 8f)
-        addView(
-            TextView(this@MainActivity).apply {
-                text = title
-                maxLines = 2
-                setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(0, 0, 0, dp(5.5f))
-                GcsTheme.markRole(this, Role.TEXT_SECONDARY)
-            }
-        )
+        GcsTheme.markRole(this, Role.SECTION_CARD, cornerDp = 8.5f)
+        val hdr = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(5.5f))
+        }
+        val bar = View(this@MainActivity).apply {
+            GcsTheme.markRole(this, Role.ACCENT_BAR, cornerDp = 2f)
+        }
+        val tv = TextView(this@MainActivity).apply {
+            text = title
+            maxLines = 2
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
+            typeface = Typeface.DEFAULT_BOLD
+            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+        }
+        hdr.addView(bar, LinearLayout.LayoutParams(dp(3f), dp(11f)).apply { rightMargin = dp(5.5f) })
+        hdr.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        addView(hdr)
     }
 
     private fun fullMetricRow(label: String, valueTv: TextView): View {

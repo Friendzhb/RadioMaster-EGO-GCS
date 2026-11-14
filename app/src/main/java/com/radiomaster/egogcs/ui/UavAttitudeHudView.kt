@@ -78,6 +78,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
     private val badgeRect = RectF()
     private val clipStageRect = RectF()
     private val arcRect = RectF()
+    private val cardClipPath = Path()
     private val polyPath = Path()
     private val reticlePath = Path()
 
@@ -100,26 +101,27 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
         strokeJoin = Paint.Join.ROUND
     }
     private val rotorFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textSize = 8.4f * d
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+        textSize = 8.5f * d
+        typeface = GcsTheme.TYPEFACE_LABEL_MEDIUM
         isFakeBoldText = true
     }
-    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 7.4f * d
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.MONOSPACE
-        isFakeBoldText = true
+        typeface = GcsTheme.TYPEFACE_TABULAR_MONO
+        fontFeatureSettings = "tnum, zero"
     }
-    private val cardinalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val cardinalPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 7.6f * d
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
     }
-    private val valPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val valPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = 8.2f * d
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.MONOSPACE
-        isFakeBoldText = true
+        typeface = GcsTheme.TYPEFACE_TABULAR_MONO
+        fontFeatureSettings = "tnum, zero"
     }
 
     fun cycleInspectCamera(): String {
@@ -224,25 +226,42 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
 
         val pad = 1.0f * d
         cardRect.set(pad, pad, w - pad, h - pad)
-        val rCorner = 8.0f * d
+        val rCorner = 8.5f * d
+        val headerBottom = 18.5f * d
+        val footerTop = h - 19.5f * d
+
         bgPaint.color = pal.glassFill
         canvas.drawRoundRect(cardRect, rCorner, rCorner, bgPaint)
 
-        borderPaint.color = pal.glassStroke
-        borderPaint.strokeWidth = max(1f, 0.9f * d)
+        // 头尾航空仪表条带底色分区（圆角裁剪内渲染，零溢出）
+        canvas.save()
+        cardClipPath.reset()
+        cardClipPath.addRoundRect(cardRect, rCorner, rCorner, Path.Direction.CW)
+        canvas.clipPath(cardClipPath)
+        bgPaint.color = pal.modalHeaderFill
+        canvas.drawRect(cardRect.left, cardRect.top, cardRect.right, headerBottom, bgPaint)
+        bgPaint.color = pal.metricCellFill
+        canvas.drawRect(cardRect.left, footerTop, cardRect.right, cardRect.bottom, bgPaint)
+        canvas.restore()
+
+        borderPaint.color = pal.glassHighlightStroke
+        borderPaint.strokeWidth = max(1f, 0.95f * d)
         canvas.drawRoundRect(cardRect, rCorner, rCorner, borderPaint)
+
+        borderPaint.color = pal.divider
+        borderPaint.strokeWidth = 1f
+        canvas.drawLine(cardRect.left + 2f * d, headerBottom, cardRect.right - 2f * d, headerBottom, borderPaint)
 
         drawCornerReticles(canvas, cardRect, pal.accent, 5.5f * d)
 
-        val headerBottom = 18.0f * d
         val prefixTitle = if (tiltOn) "倾转" else "姿态"
         val modeShort = when (inspectMode) {
             1 -> "$prefixTitle·等轴"
             2 -> "$prefixTitle·正视"
             else -> "$prefixTitle·追尾"
         }
-        titlePaint.color = pal.textSecondary
-        canvas.drawText(modeShort, 7.0f * d, baselineCenteredY(headerBottom * 0.52f, titlePaint), titlePaint)
+        titlePaint.color = pal.textPrimary
+        canvas.drawText(modeShort, 7.2f * d, baselineCenteredY(headerBottom * 0.53f, titlePaint), titlePaint)
 
         val srcTag = when {
             tiltOn && snap.hasLiveTiltTelemetry -> "INDI"
@@ -251,15 +270,17 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
             hub.isRosMode -> "ODOM"
             else -> "SIM"
         }
-        val bw = max(28f * d, badgePaint.measureText(srcTag) + 8.5f * d)
-        val bh = 12.0f * d
-        badgeRect.set(w - bw - 6.0f * d, (headerBottom - bh) * 0.5f + 0.5f * d, w - 6.0f * d, (headerBottom + bh) * 0.5f + 0.5f * d)
+        val bw = max(29f * d, badgePaint.measureText(srcTag) + 9.0f * d)
+        val bh = 12.2f * d
+        badgeRect.set(w - bw - 6.0f * d, (headerBottom - bh) * 0.5f + 0.4f * d, w - 6.0f * d, (headerBottom + bh) * 0.5f + 0.4f * d)
         bgPaint.color = pal.accentSoftFill
-        canvas.drawRoundRect(badgeRect, 3.5f * d, 3.5f * d, bgPaint)
+        canvas.drawRoundRect(badgeRect, 3.8f * d, 3.8f * d, bgPaint)
+        borderPaint.color = if (snap.hasLiveAttitudeQuat) pal.secondaryAccent else pal.accentStroke
+        borderPaint.strokeWidth = 0.8f * d
+        canvas.drawRoundRect(badgeRect, 3.8f * d, 3.8f * d, borderPaint)
         badgePaint.color = if (snap.hasLiveAttitudeQuat) pal.secondaryAccent else pal.accentBright
         canvas.drawText(srcTag, badgeRect.centerX(), baselineCenteredY(badgeRect.centerY(), badgePaint), badgePaint)
 
-        val footerTop = h - 19.0f * d
         clipStageRect.set(3f * d, headerBottom, w - 3f * d, footerTop)
         projCx = clipStageRect.centerX()
         projCy = clipStageRect.centerY() + 1.5f * d
@@ -487,7 +508,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
 
         borderPaint.color = pal.divider
         borderPaint.strokeWidth = 1f
-        canvas.drawLine(5.5f * d, footerTop, w - 5.5f * d, footerTop, borderPaint)
+        canvas.drawLine(cardRect.left + 2f * d, footerTop, cardRect.right - 2f * d, footerTop, borderPaint)
 
         val rollDeg = roll * 57.29578f
         val pitchDeg = pitch * 57.29578f
@@ -497,12 +518,12 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
         val rTenths = (rollDeg * 10f).roundToInt()
         if (rTenths != cachedRollTenths) {
             cachedRollTenths = rTenths
-            cachedRollStr = FastHudFormatter.formatSignedTenthsDeg("R", rTenths)
+            cachedRollStr = FastHudFormatter.formatSignedTenthsDeg("R ", rTenths)
         }
         val pTenths = (pitchDeg * 10f).roundToInt()
         if (pTenths != cachedPitchTenths) {
             cachedPitchTenths = pTenths
-            cachedPitchStr = FastHudFormatter.formatSignedTenthsDeg("P", pTenths)
+            cachedPitchStr = FastHudFormatter.formatSignedTenthsDeg("P ", pTenths)
         }
         val hInt = hdgDeg.roundToInt() % 360
         if (hInt != cachedHdgInt) {
@@ -512,6 +533,10 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
 
         val innerFooterW = w - 8.0f * d
         val colW = innerFooterW / 3f
+        val startX = 4.0f * d
+        canvas.drawLine(startX + colW, footerTop + 3.5f * d, startX + colW, h - 3.5f * d, borderPaint)
+        canvas.drawLine(startX + colW * 2f, footerTop + 3.5f * d, startX + colW * 2f, h - 3.5f * d, borderPaint)
+
         val baseValSize = 8.2f * d
         valPaint.textSize = baseValSize
         val widest = max(
@@ -524,7 +549,6 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
 
         val textY = baselineCenteredY((footerTop + h - pad) * 0.5f, valPaint)
         val warnCol = Color.rgb(255, 145, 0)
-        val startX = 4.0f * d
 
         valPaint.color = if (abs(rollDeg) >= 22f) warnCol else pal.textPrimary
         canvas.drawText(cachedRollStr, startX + colW * 0.5f, textY, valPaint)

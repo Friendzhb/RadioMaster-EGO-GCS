@@ -84,11 +84,10 @@ object FastHudFormatter {
         s.b = renderFps
 
         sb.setLength(0)
-        sb.append(" | ")
         if (isRosMode) {
             sb.append(odomHz).append("Hz·")
         }
-        sb.append(renderFps).append("fps | ")
+        sb.append(renderFps).append("fps")
         tv.text = sb.toString()
     }
 
@@ -120,14 +119,13 @@ object FastHudFormatter {
         s.b = txPct
 
         sb.setLength(0)
-        if (compact) sb.append(" | ")
         appendScaledInt(sb, qv, 1, forcePlus = false)
         if (compact) {
             sb.append("V·控").append(txPct).append('%')
         } else {
             sb.append("V·")
             appendScaledInt(sb, qa, 1, forcePlus = false)
-            sb.append("A | 控").append(txPct).append('%')
+            sb.append("A · 控").append(txPct).append('%')
         }
         tv.text = sb.toString()
     }
