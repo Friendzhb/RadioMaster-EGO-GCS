@@ -201,9 +201,32 @@ object DroneVectorModel {
             val y0 = hullXY[i][1]
             val x1 = hullXY[nxt][0]
             val y1 = hullXY[nxt][1]
+            val bx0 = x0 * 0.90f
+            val by0 = y0 * 0.90f
+            val bx1 = x1 * 0.90f
+            val by1 = y1 * 0.90f
+            val sideShade = if (i == 0 || i == 7) {
+                0.94f
+            } else if (i == 3 || i == 4) {
+                0.72f
+            } else {
+                0.84f
+            }
+            faces.add(
+                VecFace3D(
+                    floatArrayOf(
+                        x0, y0, topZ,
+                        x1, y1, topZ,
+                        bx1, by1, botZ,
+                        bx0, by0, botZ
+                    ),
+                    PartRole.FUSELAGE_SHELL,
+                    sideShade
+                )
+            )
             segs.add(VecSeg3D(x0, y0, topZ, x1, y1, topZ, PartRole.FUSELAGE_EDGE, 1.25f))
-            segs.add(VecSeg3D(x0 * 0.90f, y0 * 0.90f, botZ, x1 * 0.90f, y1 * 0.90f, botZ, PartRole.FUSELAGE_EDGE, 0.85f))
-            segs.add(VecSeg3D(x0, y0, topZ, x0 * 0.90f, y0 * 0.90f, botZ, PartRole.FUSELAGE_EDGE, 0.9f))
+            segs.add(VecSeg3D(bx0, by0, botZ, bx1, by1, botZ, PartRole.FUSELAGE_EDGE, 0.85f))
+            segs.add(VecSeg3D(x0, y0, topZ, bx0, by0, botZ, PartRole.FUSELAGE_EDGE, 0.9f))
         }
 
         // 机头双目相机视窗与航向指向针

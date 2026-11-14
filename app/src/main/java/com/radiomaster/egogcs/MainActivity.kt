@@ -522,6 +522,9 @@ class MainActivity : Activity() {
         super.onResume()
         applyImmersiveFullscreen()
         mapView.startLoop()
+        if (::attitudeHudView.isInitialized) {
+            attitudeHudView.setLoopActive(true)
+        }
         if (::otaManager.isInitialized) {
             otaManager.onHostResume()
         }
@@ -531,6 +534,9 @@ class MainActivity : Activity() {
         topicInspector.stopActiveSession()
         isDetailCurrentlyStreaming = false
         syncDetailStreamButtonUi()
+        if (::attitudeHudView.isInitialized) {
+            attitudeHudView.setLoopActive(false)
+        }
         mapView.stopLoop()
         super.onPause()
     }
@@ -543,6 +549,9 @@ class MainActivity : Activity() {
         topicInspector.shutdown()
         lanScanner.cancelScan()
         hwBridge.stop()
+        if (::attitudeHudView.isInitialized) {
+            attitudeHudView.setLoopActive(false)
+        }
         mapView.stopLoop()
         rosManager.shutdown()
         simEngine.stop()

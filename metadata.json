@@ -1,0 +1,6 @@
+{
+  "name": "智航",
+  "description": "面向 RadioMaster AX12 的激光倾转集群无人机三维地面站",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

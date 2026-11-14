@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
+import android.opengl.EGLDisplay
 import android.opengl.GLES20
 import android.opengl.Matrix
 import android.util.Log
@@ -14,39 +15,89 @@ import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
 
-/** Transparent GLB layer over the attitude card, using the same telemetry as the map. */
-internal class VectorHudTextureView(context: Context, private val onReadyChanged: () -> Unit) : TextureView(context), TextureView.SurfaceTextureListener {
-    data class Pose(
-        val roll: Float,
-        val pitch: Float,
-        val yaw: Float,
-        val frontTilt: Float,
-        val rearTilt: Float,
-        val cameraAzimuth: Float,
-        val cameraElevation: Float
-    )
+/**
+ * Transparent 60 FPS OpenGL ES 2.0 layer over the attitude HUD card:
+ * - Requests 4x MSAA with automatic fallback for software/older GPUs.
+ * - Uses zero-allocation primitive pose transfer between UI Choreographer and the EGL worker thread.
+ */
+internal class VectorHudTextureView(
+    context: Context,
+    private val onReadyChanged: () -> Unit
+) : TextureView(context), TextureView.SurfaceTextureListener {
 
     @Volatile var modelReady = false
         private set
 
     @Volatile private var worker: HudThread? = null
-    private var latestPose: Pose? = null
+    private var hasCachedPose = false
+    private var cachedRoll = 0f
+    private var cachedPitch = 0f
+    private var cachedYaw = 0f
+    private var cachedFrontTilt = 0f
+    private var cachedRearTilt = 0f
+    private var cachedAzimuth = 0f
+    private var cachedElevation = 0.33f
+    private var cachedSpinPhase = 0f
+    private var cachedArmed = false
+    private var cachedM0 = 0.35f
+    private var cachedM1 = 0.35f
+    private var cachedM2 = 0.35f
+    private var cachedM3 = 0.35f
+    private var cachedLightTheme = false
 
     init {
         isOpaque = false
         surfaceTextureListener = this
     }
 
-    fun updatePose(pose: Pose) {
-        latestPose = pose
-        worker?.request(pose)
+    fun updatePose(
+        roll: Float,
+        pitch: Float,
+        yaw: Float,
+        frontTilt: Float,
+        rearTilt: Float,
+        cameraAzimuth: Float,
+        cameraElevation: Float,
+        spinPhase: Float,
+        armed: Boolean,
+        m0: Float,
+        m1: Float,
+        m2: Float,
+        m3: Float,
+        isLightTheme: Boolean
+    ) {
+        hasCachedPose = true
+        cachedRoll = roll
+        cachedPitch = pitch
+        cachedYaw = yaw
+        cachedFrontTilt = frontTilt
+        cachedRearTilt = rearTilt
+        cachedAzimuth = cameraAzimuth
+        cachedElevation = cameraElevation
+        cachedSpinPhase = spinPhase
+        cachedArmed = armed
+        cachedM0 = m0
+        cachedM1 = m1
+        cachedM2 = m2
+        cachedM3 = m3
+        cachedLightTheme = isLightTheme
+        worker?.request(
+            roll, pitch, yaw, frontTilt, rearTilt, cameraAzimuth, cameraElevation,
+            spinPhase, armed, m0, m1, m2, m3, isLightTheme
+        )
     }
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
         val thread = HudThread(surface, width, height)
         worker = thread
         thread.start()
-        latestPose?.let { thread.request(it) }
+        if (hasCachedPose) {
+            thread.request(
+                cachedRoll, cachedPitch, cachedYaw, cachedFrontTilt, cachedRearTilt,
+                cachedAzimuth, cachedElevation, cachedSpinPhase, cachedArmed,
+                cachedM0, cachedM1, cachedM2, cachedM3, cachedLightTheme
+            )
+        }
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
@@ -57,24 +108,71 @@ internal class VectorHudTextureView(context: Context, private val onReadyChanged
         modelReady = false
         val old = worker
         worker = null
-        // If EGL is still using the texture, release it on that thread after EGL teardown.
         return old?.shutdownAndTakeSurface() != true
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
-    private inner class HudThread(private val texture: SurfaceTexture, width: Int, height: Int) : Thread("vector-uav-hud") {
+    private inner class HudThread(
+        private val texture: SurfaceTexture,
+        width: Int,
+        height: Int
+    ) : Thread("vector-uav-hud") {
         private val lock = Object()
         private var running = true
         private var finished = false
         private var releaseSurface = false
         private var dirty = false
-        private var pose: Pose? = null
+        private var hasPose = false
         private var widthPx = width
         private var heightPx = height
 
-        fun request(value: Pose) = synchronized(lock) {
-            pose = value
+        private var pRoll = 0f
+        private var pPitch = 0f
+        private var pYaw = 0f
+        private var pFrontTilt = 0f
+        private var pRearTilt = 0f
+        private var pAzimuth = 0f
+        private var pElevation = 0.33f
+        private var pSpinPhase = 0f
+        private var pArmed = false
+        private var pM0 = 0.35f
+        private var pM1 = 0.35f
+        private var pM2 = 0.35f
+        private var pM3 = 0.35f
+        private var pLightTheme = false
+
+        fun request(
+            roll: Float,
+            pitch: Float,
+            yaw: Float,
+            frontTilt: Float,
+            rearTilt: Float,
+            az: Float,
+            el: Float,
+            spinPhase: Float,
+            armed: Boolean,
+            m0: Float,
+            m1: Float,
+            m2: Float,
+            m3: Float,
+            isLightTheme: Boolean
+        ) = synchronized(lock) {
+            pRoll = roll
+            pPitch = pitch
+            pYaw = yaw
+            pFrontTilt = frontTilt
+            pRearTilt = rearTilt
+            pAzimuth = az
+            pElevation = el
+            pSpinPhase = spinPhase
+            pArmed = armed
+            pM0 = m0
+            pM1 = m1
+            pM2 = m2
+            pM3 = m3
+            pLightTheme = isLightTheme
+            hasPose = true
             dirty = true
             lock.notifyAll()
         }
@@ -97,6 +195,34 @@ internal class VectorHudTextureView(context: Context, private val onReadyChanged
             }
         }
 
+        private fun chooseHudConfig(display: EGLDisplay): EGLConfig {
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val count = IntArray(1)
+            val msaaAttrs = intArrayOf(
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_DEPTH_SIZE, 16,
+                EGL14.EGL_SAMPLE_BUFFERS, 1,
+                EGL14.EGL_SAMPLES, 4,
+                EGL14.EGL_NONE
+            )
+            if (EGL14.eglChooseConfig(display, msaaAttrs, 0, configs, 0, 1, count, 0) && count[0] > 0 && configs[0] != null) {
+                return requireNotNull(configs[0])
+            }
+            val stdAttrs = intArrayOf(
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_DEPTH_SIZE, 16,
+                EGL14.EGL_NONE
+            )
+            check(EGL14.eglChooseConfig(display, stdAttrs, 0, configs, 0, 1, count, 0) && count[0] > 0 && configs[0] != null)
+            return requireNotNull(configs[0])
+        }
+
         override fun run() {
             var display = EGL14.EGL_NO_DISPLAY
             var eglContext = EGL14.EGL_NO_CONTEXT
@@ -105,23 +231,20 @@ internal class VectorHudTextureView(context: Context, private val onReadyChanged
                 display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
                 check(display != EGL14.EGL_NO_DISPLAY)
                 check(EGL14.eglInitialize(display, IntArray(2), 0, IntArray(2), 0))
-                val attributes = intArrayOf(
-                    EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-                    EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
-                    EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
-                    EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
-                    EGL14.EGL_DEPTH_SIZE, 16, EGL14.EGL_NONE
+                val config = chooseHudConfig(display)
+                eglContext = EGL14.eglCreateContext(
+                    display,
+                    config,
+                    EGL14.EGL_NO_CONTEXT,
+                    intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+                    0
                 )
-                val configs = arrayOfNulls<EGLConfig>(1)
-                val count = IntArray(1)
-                check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, 1, count, 0) && count[0] > 0)
-                eglContext = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
                 check(eglContext != EGL14.EGL_NO_CONTEXT)
-                surface = EGL14.eglCreateWindowSurface(display, configs[0], texture, intArrayOf(EGL14.EGL_NONE), 0)
+                surface = EGL14.eglCreateWindowSurface(display, config, texture, intArrayOf(EGL14.EGL_NONE), 0)
                 check(surface != EGL14.EGL_NO_SURFACE && EGL14.eglMakeCurrent(display, surface, surface, eglContext))
                 val renderer = VectorGlbRenderer(context)
                 renderer.create()
-                check(renderer.ready) { "The HUD GLB did not load" }
+                check(renderer.ready) { "The HUD 3D UAV model did not load" }
                 synchronized(lock) {
                     if (!running) return
                     if (worker === this) modelReady = true
@@ -132,22 +255,48 @@ internal class VectorHudTextureView(context: Context, private val onReadyChanged
                 val projection = FloatArray(16)
                 val viewProjection = FloatArray(16)
                 while (true) {
-                    var current: Pose? = null
                     var w = 1
                     var h = 1
+                    var fRoll = 0f
+                    var fPitch = 0f
+                    var fYaw = 0f
+                    var fFront = 0f
+                    var fRear = 0f
+                    var fAz = 0f
+                    var fEl = 0.33f
+                    var fSpin = 0f
+                    var fArmed = false
+                    var fM0 = 0.35f
+                    var fM1 = 0.35f
+                    var fM2 = 0.35f
+                    var fM3 = 0.35f
+                    var fLight = false
                     val stopped: Boolean
                     synchronized(lock) {
-                        while (running && (!dirty || pose == null)) lock.wait()
+                        while (running && (!dirty || !hasPose)) lock.wait()
                         stopped = !running
                         if (!stopped) {
-                            current = pose
                             w = widthPx.coerceAtLeast(1)
                             h = heightPx.coerceAtLeast(1)
+                            fRoll = pRoll
+                            fPitch = pPitch
+                            fYaw = pYaw
+                            fFront = pFrontTilt
+                            fRear = pRearTilt
+                            fAz = pAzimuth
+                            fEl = pElevation
+                            fSpin = pSpinPhase
+                            fArmed = pArmed
+                            fM0 = pM0
+                            fM1 = pM1
+                            fM2 = pM2
+                            fM3 = pM3
+                            fLight = pLightTheme
                             dirty = false
                         }
                     }
                     if (stopped) break
-                    val frame = current ?: continue
+
                     GLES20.glViewport(0, 0, w, h)
                     GLES20.glClearColor(0f, 0f, 0f, 0f)
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
@@ -155,32 +304,52 @@ internal class VectorHudTextureView(context: Context, private val onReadyChanged
                     GLES20.glDepthFunc(GLES20.GL_LEQUAL)
                     GLES20.glDepthMask(true)
                     GLES20.glDisable(GLES20.GL_BLEND)
-                    val az = frame.cameraAzimuth
-                    val el = frame.cameraElevation
-                    val distance = 3.35f
-                    Matrix.setLookAtM(
-                        view, 0, distance * cos(el) * cos(az), distance * cos(el) * sin(az), distance * sin(el),
-                        0f, 0f, 0f, 0f, 0f, 1f
-                    )
+
+                    val distance = 3.06f
+                    val eyeX = distance * cos(fEl) * cos(fAz)
+                    val eyeY = distance * cos(fEl) * sin(fAz)
+                    val eyeZ = distance * sin(fEl)
+                    Matrix.setLookAtM(view, 0, eyeX, eyeY, eyeZ, 0f, 0f, 0.02f, 0f, 0f, 1f)
                     val focal = min(w * 0.42f, h * 0.47f) * 2.55f
                     val fov = (2.0 * atan(h / (2.0 * focal.coerceAtLeast(1f))) * 180.0 / PI).toFloat()
                     Matrix.perspectiveM(projection, 0, fov, w.toFloat() / h, 0.1f, 50f)
                     Matrix.multiplyMM(viewProjection, 0, projection, 0, view, 0)
+
                     renderer.draw(
-                        viewProjection, 0f, 0f, 0f, frame.roll, frame.pitch, frame.yaw,
-                        frame.frontTilt, frame.rearTilt, 0.88f, false
+                        viewProjection = viewProjection,
+                        x = 0f,
+                        y = 0f,
+                        z = 0f,
+                        roll = fRoll,
+                        pitch = fPitch,
+                        yaw = fYaw,
+                        frontTilt = fFront,
+                        rearTilt = fRear,
+                        displayScale = 0.94f,
+                        occluded = false,
+                        spinPhase = fSpin,
+                        armed = fArmed,
+                        m0 = fM0,
+                        m1 = fM1,
+                        m2 = fM2,
+                        m3 = fM3,
+                        showThrustVectors = true,
+                        showHeadingCue = false,
+                        eyeX = eyeX,
+                        eyeY = eyeY,
+                        eyeZ = eyeZ,
+                        isLightTheme = fLight
                     )
                     check(EGL14.eglSwapBuffers(display, surface)) { "HUD EGL swap failed" }
                 }
             } catch (e: Exception) {
-                Log.e("VectorHudTextureView", "Could not render the original UAV model in the HUD", e)
+                Log.e("VectorHudTextureView", "Could not render the 3D UAV model in the HUD", e)
             } finally {
                 if (worker === this) modelReady = false
                 if (display != EGL14.EGL_NO_DISPLAY) {
                     EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
                     if (surface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, surface)
                     if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(display, eglContext)
-                    // The map also uses EGL_DEFAULT_DISPLAY. Terminating it here would invalidate its context.
                     EGL14.eglReleaseThread()
                 }
                 val release = synchronized(lock) {

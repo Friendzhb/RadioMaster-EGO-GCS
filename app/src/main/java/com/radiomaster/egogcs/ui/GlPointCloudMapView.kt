@@ -2259,23 +2259,88 @@ class GlPointCloudMapView(
     private fun drawVectorGlbModels(snap: RenderSnapshot, zScale: Float, occluded: Boolean) {
         if (!vectorGlb.ready) return
         val blend = projBlend
+        val isLight = GcsTheme.of(hub.themeId).isLight
+        val showVectors = blend > 0.08f
+        val zoomScale = if (worldHalfSpan > 8.5f) {
+            (1.0f + (worldHalfSpan - 8.5f) * 0.028f).coerceAtMost(1.38f)
+        } else {
+            1.0f
+        }
         if (snap.swarmCount > 1) {
             val count = snap.swarmCount.coerceIn(2, SwarmPalette.MAX_SWARM_DRONES)
+            val focusMotors = snap.motorNorm4
             for (id in 0 until count) {
                 val drone = snap.swarmAgents[id]
                 if (!drone.isTiltRig) continue
+                val isFocus = id == snap.activeDroneId
+                val col = SwarmPalette.RGB_FLOAT[id]
+                val spin = if (drone.armed) shaderClockSec * 24.0f + id * 0.85f else 0f
+                val wingThr = if (drone.armed) {
+                    (0.36f + (abs(drone.tiltServo1Rad) + abs(drone.tiltServo2Rad)) * 0.28f).coerceIn(0.25f, 0.92f)
+                } else {
+                    0f
+                }
+                val m0 = if (isFocus) focusMotors[0] else wingThr
+                val m1 = if (isFocus) focusMotors[1] else wingThr
+                val m2 = if (isFocus) focusMotors[2] else wingThr
+                val m3 = if (isFocus) focusMotors[3] else wingThr
                 vectorGlb.draw(
-                    vpMatrix, drone.uavX, drone.uavY, drone.uavZ * zScale,
-                    drone.smoothRoll * blend, drone.smoothPitch * blend, drone.yaw,
-                    drone.tiltServo1Rad * blend, drone.tiltServo2Rad * blend,
-                    if (id == snap.activeDroneId) 0.48f else 0.45f, occluded
+                    viewProjection = vpMatrix,
+                    x = drone.uavX,
+                    y = drone.uavY,
+                    z = drone.uavZ * zScale,
+                    roll = drone.smoothRoll * blend,
+                    pitch = drone.smoothPitch * blend,
+                    yaw = drone.yaw,
+                    frontTilt = drone.tiltServo1Rad * blend,
+                    rearTilt = drone.tiltServo2Rad * blend,
+                    displayScale = (if (isFocus) 0.48f else 0.45f) * zoomScale,
+                    occluded = occluded,
+                    spinPhase = spin,
+                    armed = drone.armed,
+                    m0 = m0,
+                    m1 = m1,
+                    m2 = m2,
+                    m3 = m3,
+                    showThrustVectors = showVectors,
+                    showHeadingCue = true,
+                    eyeX = curEyeX,
+                    eyeY = curEyeY,
+                    eyeZ = curEyeZ,
+                    isLightTheme = isLight,
+                    tintR = col[0],
+                    tintG = col[1],
+                    tintB = col[2],
+                    tintStrength = if (isFocus) 0.30f else 0.22f
                 )
             }
         } else if (snap.activeIsTiltRig) {
+            val mn = snap.motorNorm4
+            val spin = if (snap.armed) shaderClockSec * 24.0f else 0f
             vectorGlb.draw(
-                vpMatrix, snap.uavX, snap.uavY, snap.uavZ * zScale,
-                snap.smoothRoll * blend, snap.smoothPitch * blend, snap.yaw,
-                snap.tiltServo1Rad * blend, snap.tiltServo2Rad * blend, 0.45f, occluded
+                viewProjection = vpMatrix,
+                x = snap.uavX,
+                y = snap.uavY,
+                z = snap.uavZ * zScale,
+                roll = snap.smoothRoll * blend,
+                pitch = snap.smoothPitch * blend,
+                yaw = snap.yaw,
+                frontTilt = snap.tiltServo1Rad * blend,
+                rearTilt = snap.tiltServo2Rad * blend,
+                displayScale = 0.46f * zoomScale,
+                occluded = occluded,
+                spinPhase = spin,
+                armed = snap.armed,
+                m0 = mn[0],
+                m1 = mn[1],
+                m2 = mn[2],
+                m3 = mn[3],
+                showThrustVectors = showVectors,
+                showHeadingCue = true,
+                eyeX = curEyeX,
+                eyeY = curEyeY,
+                eyeZ = curEyeZ,
+                isLightTheme = isLight
             )
         }
     }
@@ -2299,25 +2364,30 @@ class GlPointCloudMapView(
         servo2Rad: Float = 0f
     ) {
         val rig = DroneVectorModel.rigFor(isTiltRig)
-        val worldScale = if (isSelectedFocus) 0.48f else 0.45f
+        val zoomScale = if (worldHalfSpan > 8.5f) {
+            (1.0f + (worldHalfSpan - 8.5f) * 0.028f).coerceAtMost(1.38f)
+        } else {
+            1.0f
+        }
+        val worldScale = (if (isSelectedFocus) 0.48f else 0.45f) * zoomScale
 
         if (blend > 0.05f) {
-            pushFxDiscXY(ux, uy, 0.008f, 0.32f, 18, 0f, 0f, 0f, 0.48f * blend)
+            pushFxDiscXY(ux, uy, 0.008f, 0.32f * zoomScale, 18, 0f, 0f, 0f, 0.48f * blend)
             pushActorLine(ux, uy, 0.015f, ux, uy, uz, armR, armG, armB, 0.52f, 0f, uz)
         }
 
         if (isSelectedFocus) {
-            pushActorRingXY(ux, uy, uz, 0.36f, 0.024f, 22, armR, armG, armB, 0.85f, -1f)
+            pushActorRingXY(ux, uy, uz, 0.36f * zoomScale, 0.024f * zoomScale, 22, armR, armG, armB, 0.85f, -1f)
         }
 
         if (droneOccludedBlend > 0.03f && isSelectedFocus) {
             val sonarPhase = ((animationTimeNanos() / 1_000_000L) % 1200L) / 1200f
-            val sonarR = 0.38f + sonarPhase * 0.48f
+            val sonarR = (0.38f + sonarPhase * 0.48f) * zoomScale
             val sonarA = (1f - sonarPhase) * 0.68f * droneOccludedBlend
-            pushActorRingXY(ux, uy, uz, sonarR, 0.030f, 24, 0.15f, 0.94f, 1.0f, sonarA, -1f)
+            pushActorRingXY(ux, uy, uz, sonarR, 0.030f * zoomScale, 24, 0.15f, 0.94f, 1.0f, sonarA, -1f)
         }
 
-        // The GLB is drawn in the same depth passes after these auxiliary rings/lines.
+        // The 3D tilt-UAV renderer draws in the same depth passes after these auxiliary rings/lines.
         if (isTiltRig && vectorGlb.ready) return
 
         for (face in rig.faces) {
