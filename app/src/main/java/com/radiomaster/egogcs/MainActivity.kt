@@ -2859,7 +2859,9 @@ class MainActivity : Activity() {
                 GcsTheme.markRole(this, Role.TEXT_MUTED)
             }
         )
-        udpSwitchPill = FrameLayout(this)
+        udpSwitchPill = FrameLayout(this).apply {
+            contentDescription = "UDP 点云/位姿高速直通"
+        }
         udpSwitchThumb = View(this).apply {
             background = roundedColor(Color.WHITE, dp(8.5f))
         }
@@ -3158,6 +3160,7 @@ class MainActivity : Activity() {
 
     private fun syncUdpSwitchVisual(animate: Boolean) {
         if (!::udpSwitchPill.isInitialized) return
+        udpSwitchPill.isSelected = udpTelemetryEnabledUi
         val pal = GcsTheme.of(hub.themeId)
         udpSwitchPill.background = pillBg(
             if (udpTelemetryEnabledUi) pal.accent else pal.wellFill,

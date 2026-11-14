@@ -415,6 +415,8 @@ class GlPointCloudMapView(
     private val tmpVoxelRgb = FloatArray(3)
     private val uavTmpA = FloatArray(3)
     private val uavTmpB = FloatArray(3)
+    private val vectorGlb = VectorGlbRenderer(context)
+    internal val vectorGlbReady: Boolean get() = vectorGlb.ready
     private var droneOccludedBlend = 0f
     private var shaderClockSec = 0f
 
@@ -1001,6 +1003,7 @@ class GlPointCloudMapView(
         GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ACTOR_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        vectorGlb.create()
         voxelMap.notifyGlContextRecreated()
         gridKey.invalidate()
         voxelKey.invalidate()
@@ -1108,6 +1111,7 @@ class GlPointCloudMapView(
             GLES20.glDepthFunc(GLES20.GL_LEQUAL)
             GLES20.glDepthMask(true)
             drawActorBatchesVisible(max(1.2f, 1.5f * density))
+            drawVectorGlbModels(snap, zFlat, occluded = false)
 
             // Pass 4: 视线走廊遮挡体素「单层外表皮深度预通透镜」(Single-Skin Depth-Prepass Cutaway Lens)
             // 4a: 静默深度预通 (仅写最近外表面 Z 值，零颜色输出) -> 4b: GL_EQUAL 单层外皮逐像素平滑消隐 (100% 消除内部共享乱面与多层叠加混浊！)
@@ -1125,6 +1129,7 @@ class GlPointCloudMapView(
                 GLES20.glDepthFunc(GLES20.GL_GREATER)
                 GLES20.glDepthMask(false)
                 drawActorBatchesOccluded(max(1.25f, 1.55f * density))
+                drawVectorGlbModels(snap, zFlat, occluded = true)
             }
 
             // Pass 6: 半透明高程垂幕、接地阴影与触控波纹
@@ -2251,6 +2256,30 @@ class GlPointCloudMapView(
         }
     }
 
+    private fun drawVectorGlbModels(snap: RenderSnapshot, zScale: Float, occluded: Boolean) {
+        if (!vectorGlb.ready) return
+        val blend = projBlend
+        if (snap.swarmCount > 1) {
+            val count = snap.swarmCount.coerceIn(2, SwarmPalette.MAX_SWARM_DRONES)
+            for (id in 0 until count) {
+                val drone = snap.swarmAgents[id]
+                if (!drone.isTiltRig) continue
+                vectorGlb.draw(
+                    vpMatrix, drone.uavX, drone.uavY, drone.uavZ * zScale,
+                    drone.smoothRoll * blend, drone.smoothPitch * blend, drone.yaw,
+                    drone.tiltServo1Rad * blend, drone.tiltServo2Rad * blend,
+                    if (id == snap.activeDroneId) 0.48f else 0.45f, occluded
+                )
+            }
+        } else if (snap.activeIsTiltRig) {
+            vectorGlb.draw(
+                vpMatrix, snap.uavX, snap.uavY, snap.uavZ * zScale,
+                snap.smoothRoll * blend, snap.smoothPitch * blend, snap.yaw,
+                snap.tiltServo1Rad * blend, snap.tiltServo2Rad * blend, 0.45f, occluded
+            )
+        }
+    }
+
     private fun drawQuadrotor3D(
         ux: Float,
         uy: Float,
@@ -2287,6 +2316,9 @@ class GlPointCloudMapView(
             val sonarA = (1f - sonarPhase) * 0.68f * droneOccludedBlend
             pushActorRingXY(ux, uy, uz, sonarR, 0.030f, 24, 0.15f, 0.94f, 1.0f, sonarA, -1f)
         }
+
+        // The GLB is drawn in the same depth passes after these auxiliary rings/lines.
+        if (isTiltRig && vectorGlb.ready) return
 
         for (face in rig.faces) {
             val pts = face.pts

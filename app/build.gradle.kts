@@ -37,12 +37,6 @@ android {
     }
 
     signingConfigs {
-        create("debugConfig") {
-            storeFile = file("${rootDir}/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
-        }
         if (hasOtaSigning) {
             create("otaShared") {
                 storeFile = file(requireNotNull(otaStoreFile))
@@ -67,7 +61,10 @@ android {
             )
         }
         debug {
-            signingConfig = signingConfigs.getByName("debugConfig")
+            // CI uses the existing OTA certificate; local builds use the standard debug key.
+            if (hasOtaSigning) {
+                signingConfig = signingConfigs.getByName("otaShared")
+            }
             isMinifyEnabled = false
         }
     }
@@ -80,10 +77,16 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    androidResources {
+        // openFd maps the original model directly from the APK without a second heap-sized copy.
+        noCompress += "glb"
+    }
 }
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     implementation("androidx.core:core-ktx:1.13.1")

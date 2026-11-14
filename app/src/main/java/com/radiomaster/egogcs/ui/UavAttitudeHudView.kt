@@ -8,9 +8,9 @@ import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
-import android.graphics.Typeface
 import android.os.SystemClock
 import android.view.View
+import android.widget.FrameLayout
 import com.radiomaster.egogcs.model.GcsSharedHub
 import com.radiomaster.egogcs.model.RenderSnapshot
 import com.radiomaster.egogcs.ui.DroneVectorModel.PartRole
@@ -26,7 +26,7 @@ import kotlin.math.sin
  * 紧凑防重叠、自适应字号零截断版右下角「无人机三维实时姿态视窗」(`UavAttitudeHudView`)：
  * 与左下角 96dp HSI 避障姿态球严格等高底边对齐，头尾文字区采用实测宽度自适应与 FontMetrics 居中杜绝任何裁剪。
  */
-class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View(context) {
+class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : FrameLayout(context) {
 
     private val readSnapshot = RenderSnapshot()
 
@@ -73,6 +73,21 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
     private var cachedYawStr = "Y 000°"
 
     private val d = resources.displayMetrics.density
+    private val modelTexture = VectorHudTextureView(context) { invalidate() }
+    internal val vectorGlbReady: Boolean get() = modelTexture.modelReady
+
+    init {
+        setWillNotDraw(false)
+        addView(
+            modelTexture,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply {
+                leftMargin = (3f * d).roundToInt()
+                rightMargin = (3f * d).roundToInt()
+                topMargin = (18.5f * d).roundToInt()
+                bottomMargin = (19.5f * d).roundToInt()
+            }
+        )
+    }
 
     private val cardRect = RectF()
     private val badgeRect = RectF()
@@ -223,6 +238,8 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
         val pal = GcsTheme.of(hub.themeId)
         val tiltOn = snap.activeIsTiltRig
         val rig = DroneVectorModel.rigFor(tiltOn)
+        val textureVisibility = if (tiltOn) View.VISIBLE else View.INVISIBLE
+        if (modelTexture.visibility != textureVisibility) modelTexture.visibility = textureVisibility
 
         val pad = 1.0f * d
         cardRect.set(pad, pad, w - pad, h - pad)
@@ -298,6 +315,12 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
         while (azDiff < -PI.toFloat()) azDiff += (PI * 2.0).toFloat()
         val camAz = isoWorldAz + azDiff * chaseFollowBlend
 
+        if (tiltOn) {
+            modelTexture.updatePose(
+                VectorHudTextureView.Pose(roll, pitch, yaw, snap.tiltServo1Rad, snap.tiltServo2Rad, camAz, camElevRad)
+            )
+        }
+
         projCosAz = cos(camAz)
         projSinAz = sin(camAz)
         projCosEl = cos(camElevRad)
@@ -327,170 +350,172 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : View
         )
 
         val modelScale = 0.88f
-        val faces = rig.faces
-        for (fIdx in 0 until faces.size) {
-            val face = faces[fIdx]
-            val nPts = face.pts.size / 3
-            if (nPts < 3) continue
-            polyPath.reset()
-            for (i in 0 until nPts) {
-                val bi = i * 3
-                DroneVectorModel.transformBodyToWorld(
-                    face.pts[bi],
-                    face.pts[bi + 1],
-                    face.pts[bi + 2],
-                    modelScale,
-                    roll,
-                    pitch,
-                    yaw,
-                    tmpWorld0
-                )
-                projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
-                if (i == 0) {
-                    polyPath.moveTo(tmpProj0[0], tmpProj0[1])
-                } else {
-                    polyPath.lineTo(tmpProj0[0], tmpProj0[1])
-                }
-            }
-            polyPath.close()
-            val shade = face.shadeBoost
-            rigFacePaint.color = if (pal.isLight) {
-                Color.argb((185 * shade).roundToInt().coerceIn(60, 230), 42, 62, 92)
-            } else {
-                Color.argb((178 * shade).roundToInt().coerceIn(60, 235), 28, 38, 54)
-            }
-            canvas.drawPath(polyPath, rigFacePaint)
-        }
-
-        val propSpinRad = if (snap.armed) {
-            ((SystemClock.uptimeMillis() % 720L) / 720f) * (PI.toFloat() * 2f) * 3f
-        } else {
-            0.4f
-        }
-
-        val rotors = rig.rotors
-        for (rIdx in 0 until rotors.size) {
-            val rot = rotors[rIdx]
-            val tiltAlpha = when (rot.servoGroup) {
-                1 -> snap.tiltServo1Rad
-                2 -> snap.tiltServo2Rad
-                else -> 0f
-            }
-            val shroudR = rot.radius * 1.12f
-            polyPath.reset()
-            var s = 0
-            while (s <= RING_SEGS) {
-                val lx = UNIT_COS[s] * rot.radius
-                val ly = UNIT_SIN[s] * rot.radius
-                DroneVectorModel.transformNacellePointToWorld(
-                    rot.cx, rot.cy, rot.cz, lx, ly, 0.024f,
-                    tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld1
-                )
-                projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
-                if (s == 0) {
-                    polyPath.moveTo(tmpProj1[0], tmpProj1[1])
-                } else {
-                    polyPath.lineTo(tmpProj1[0], tmpProj1[1])
-                }
-                s += 2
-            }
-            polyPath.close()
-            rotorFillPaint.color = if (rot.isFront) {
-                Color.argb(if (pal.isLight) 42 else 36, 255, 68, 58)
-            } else {
-                Color.argb(if (pal.isLight) 42 else 36, 0, 220, 118)
-            }
-            canvas.drawPath(polyPath, rotorFillPaint)
-
-            // 若为倾转旋翼短舱，绘制随舵机实时偏转的涵道外护圈与三维推力矢量箭
-            if (rot.servoGroup > 0) {
+        if (!tiltOn || !modelTexture.modelReady) {
+            val faces = rig.faces
+            for (fIdx in 0 until faces.size) {
+                val face = faces[fIdx]
+                val nPts = face.pts.size / 3
+                if (nPts < 3) continue
                 polyPath.reset()
-                var k = 0
-                while (k <= RING_SEGS) {
+                for (i in 0 until nPts) {
+                    val bi = i * 3
+                    DroneVectorModel.transformBodyToWorld(
+                        face.pts[bi],
+                        face.pts[bi + 1],
+                        face.pts[bi + 2],
+                        modelScale,
+                        roll,
+                        pitch,
+                        yaw,
+                        tmpWorld0
+                    )
+                    projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
+                    if (i == 0) {
+                        polyPath.moveTo(tmpProj0[0], tmpProj0[1])
+                    } else {
+                        polyPath.lineTo(tmpProj0[0], tmpProj0[1])
+                    }
+                }
+                polyPath.close()
+                val shade = face.shadeBoost
+                rigFacePaint.color = if (pal.isLight) {
+                    Color.argb((185 * shade).roundToInt().coerceIn(60, 230), 42, 62, 92)
+                } else {
+                    Color.argb((178 * shade).roundToInt().coerceIn(60, 235), 28, 38, 54)
+                }
+                canvas.drawPath(polyPath, rigFacePaint)
+            }
+
+            val propSpinRad = if (snap.armed) {
+                ((SystemClock.uptimeMillis() % 720L) / 720f) * (PI.toFloat() * 2f) * 3f
+            } else {
+                0.4f
+            }
+
+            val rotors = rig.rotors
+            for (rIdx in 0 until rotors.size) {
+                val rot = rotors[rIdx]
+                val tiltAlpha = when (rot.servoGroup) {
+                    1 -> snap.tiltServo1Rad
+                    2 -> snap.tiltServo2Rad
+                    else -> 0f
+                }
+                val shroudR = rot.radius * 1.12f
+                polyPath.reset()
+                var s = 0
+                while (s <= RING_SEGS) {
+                    val lx = UNIT_COS[s] * rot.radius
+                    val ly = UNIT_SIN[s] * rot.radius
                     DroneVectorModel.transformNacellePointToWorld(
-                        rot.cx, rot.cy, rot.cz,
-                        UNIT_COS[k] * shroudR, UNIT_SIN[k] * shroudR, 0.02f,
+                        rot.cx, rot.cy, rot.cz, lx, ly, 0.024f,
                         tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld1
                     )
                     projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
-                    if (k == 0) {
+                    if (s == 0) {
                         polyPath.moveTo(tmpProj1[0], tmpProj1[1])
                     } else {
                         polyPath.lineTo(tmpProj1[0], tmpProj1[1])
                     }
-                    k += 2
+                    s += 2
                 }
                 polyPath.close()
-                rigLinePaint.style = Paint.Style.STROKE
-                rigLinePaint.color = if (rot.isFront) Color.rgb(255, 76, 66) else Color.rgb(0, 224, 122)
-                rigLinePaint.strokeWidth = 1.05f * d
-                canvas.drawPath(polyPath, rigLinePaint)
+                rotorFillPaint.color = if (rot.isFront) {
+                    Color.argb(if (pal.isLight) 42 else 36, 255, 68, 58)
+                } else {
+                    Color.argb(if (pal.isLight) 42 else 36, 0, 220, 118)
+                }
+                canvas.drawPath(polyPath, rotorFillPaint)
 
-                val mIdx = (rot.motorId - 1).coerceIn(0, 3)
-                val vecLen = 0.24f + snap.motorNorm4[mIdx].coerceIn(0.15f, 1.0f) * 0.24f
+                // 若为倾转旋翼短舱，绘制随舵机实时偏转的涵道外护圈与三维推力矢量箭
+                if (rot.servoGroup > 0) {
+                    polyPath.reset()
+                    var k = 0
+                    while (k <= RING_SEGS) {
+                        DroneVectorModel.transformNacellePointToWorld(
+                            rot.cx, rot.cy, rot.cz,
+                            UNIT_COS[k] * shroudR, UNIT_SIN[k] * shroudR, 0.02f,
+                            tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld1
+                        )
+                        projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
+                        if (k == 0) {
+                            polyPath.moveTo(tmpProj1[0], tmpProj1[1])
+                        } else {
+                            polyPath.lineTo(tmpProj1[0], tmpProj1[1])
+                        }
+                        k += 2
+                    }
+                    polyPath.close()
+                    rigLinePaint.style = Paint.Style.STROKE
+                    rigLinePaint.color = if (rot.isFront) Color.rgb(255, 76, 66) else Color.rgb(0, 224, 122)
+                    rigLinePaint.strokeWidth = 1.05f * d
+                    canvas.drawPath(polyPath, rigLinePaint)
+
+                    val mIdx = (rot.motorId - 1).coerceIn(0, 3)
+                    val vecLen = 0.24f + snap.motorNorm4[mIdx].coerceIn(0.15f, 1.0f) * 0.24f
+                    DroneVectorModel.transformNacellePointToWorld(
+                        rot.cx, rot.cy, rot.cz, 0f, 0f, 0.02f,
+                        tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld0
+                    )
+                    DroneVectorModel.transformNacellePointToWorld(
+                        rot.cx, rot.cy, rot.cz, 0f, 0f, vecLen,
+                        tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld1
+                    )
+                    projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
+                    projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
+                    rigLinePaint.color = if (rot.servoGroup == 1) Color.rgb(255, 196, 0) else Color.rgb(41, 182, 246)
+                    rigLinePaint.strokeWidth = 1.35f * d
+                    canvas.drawLine(tmpProj0[0], tmpProj0[1], tmpProj1[0], tmpProj1[1], rigLinePaint)
+                }
+
+                val bladeAng = propSpinRad * rot.spinSign
+                val ca = cos(bladeAng) * rot.radius * 0.92f
+                val sa = sin(bladeAng) * rot.radius * 0.92f
+
                 DroneVectorModel.transformNacellePointToWorld(
-                    rot.cx, rot.cy, rot.cz, 0f, 0f, 0.02f,
+                    rot.cx, rot.cy, rot.cz, ca, sa, 0.03f,
                     tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld0
                 )
                 DroneVectorModel.transformNacellePointToWorld(
-                    rot.cx, rot.cy, rot.cz, 0f, 0f, vecLen,
+                    rot.cx, rot.cy, rot.cz, -ca, -sa, 0.03f,
                     tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld1
                 )
                 projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
                 projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
-                rigLinePaint.color = if (rot.servoGroup == 1) Color.rgb(255, 196, 0) else Color.rgb(41, 182, 246)
-                rigLinePaint.strokeWidth = 1.35f * d
+
+                rigLinePaint.color = if (pal.isLight) Color.argb(175, 25, 42, 68) else Color.argb(180, 225, 238, 255)
+                rigLinePaint.strokeWidth = 1.0f * d
                 canvas.drawLine(tmpProj0[0], tmpProj0[1], tmpProj1[0], tmpProj1[1], rigLinePaint)
             }
 
-            val bladeAng = propSpinRad * rot.spinSign
-            val ca = cos(bladeAng) * rot.radius * 0.92f
-            val sa = sin(bladeAng) * rot.radius * 0.92f
+            val segments = rig.segments
+            for (sIdx in 0 until segments.size) {
+                val seg = segments[sIdx]
+                DroneVectorModel.transformBodyToWorld(seg.x0, seg.y0, seg.z0, modelScale, roll, pitch, yaw, tmpWorld0)
+                DroneVectorModel.transformBodyToWorld(seg.x1, seg.y1, seg.z1, modelScale, roll, pitch, yaw, tmpWorld1)
+                projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
+                projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
 
-            DroneVectorModel.transformNacellePointToWorld(
-                rot.cx, rot.cy, rot.cz, ca, sa, 0.03f,
-                tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld0
-            )
-            DroneVectorModel.transformNacellePointToWorld(
-                rot.cx, rot.cy, rot.cz, -ca, -sa, 0.03f,
-                tiltAlpha, modelScale, roll, pitch, yaw, tmpWorld1
-            )
-            projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
-            projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
+                val meanDepth = (tmpProj0[2] + tmpProj1[2]) * 0.5f
+                val depthCue = ((4.1f - meanDepth) / 1.5f).coerceIn(0.52f, 1.18f)
 
-            rigLinePaint.color = if (pal.isLight) Color.argb(175, 25, 42, 68) else Color.argb(180, 225, 238, 255)
-            rigLinePaint.strokeWidth = 1.0f * d
-            canvas.drawLine(tmpProj0[0], tmpProj0[1], tmpProj1[0], tmpProj1[1], rigLinePaint)
-        }
+                val baseCol = when (seg.role) {
+                    PartRole.NAV_FRONT_RED -> -0x00bbdd
+                    PartRole.NAV_REAR_GREEN -> if (pal.isLight) -0xff57a8 else -0xff198a
+                    PartRole.GIMBAL_NOSE -> pal.accent
+                    PartRole.LIDAR_DOME -> if (pal.isLight) -0xff7d2e else -0x9b0026
+                    PartRole.ARM_BEAM -> pal.textPrimary
+                    PartRole.FUSELAGE_EDGE -> pal.accentBright
+                    PartRole.LANDING_SKID -> pal.textMuted
+                    PartRole.FUSELAGE_SHELL -> pal.textSecondary
+                    PartRole.TILT_SERVO_SHAFT -> Color.rgb(255, 179, 0)
+                    PartRole.THRUST_VECTOR -> pal.secondaryAccent
+                }
 
-        val segments = rig.segments
-        for (sIdx in 0 until segments.size) {
-            val seg = segments[sIdx]
-            DroneVectorModel.transformBodyToWorld(seg.x0, seg.y0, seg.z0, modelScale, roll, pitch, yaw, tmpWorld0)
-            DroneVectorModel.transformBodyToWorld(seg.x1, seg.y1, seg.z1, modelScale, roll, pitch, yaw, tmpWorld1)
-            projectWorldPoint(tmpWorld0[0], tmpWorld0[1], tmpWorld0[2], tmpProj0)
-            projectWorldPoint(tmpWorld1[0], tmpWorld1[1], tmpWorld1[2], tmpProj1)
-
-            val meanDepth = (tmpProj0[2] + tmpProj1[2]) * 0.5f
-            val depthCue = ((4.1f - meanDepth) / 1.5f).coerceIn(0.52f, 1.18f)
-
-            val baseCol = when (seg.role) {
-                PartRole.NAV_FRONT_RED -> -0x00bbdd
-                PartRole.NAV_REAR_GREEN -> if (pal.isLight) -0xff57a8 else -0xff198a
-                PartRole.GIMBAL_NOSE -> pal.accent
-                PartRole.LIDAR_DOME -> if (pal.isLight) -0xff7d2e else -0x9b0026
-                PartRole.ARM_BEAM -> pal.textPrimary
-                PartRole.FUSELAGE_EDGE -> pal.accentBright
-                PartRole.LANDING_SKID -> pal.textMuted
-                PartRole.FUSELAGE_SHELL -> pal.textSecondary
-                PartRole.TILT_SERVO_SHAFT -> Color.rgb(255, 179, 0)
-                PartRole.THRUST_VECTOR -> pal.secondaryAccent
+                val alpha = (Color.alpha(baseCol) * (0.58f + 0.42f * depthCue)).roundToInt().coerceIn(75, 255)
+                rigLinePaint.color = (alpha shl 24) or (baseCol and 0x00FFFFFF)
+                rigLinePaint.strokeWidth = (1.10f * seg.widthFactor * depthCue.coerceAtLeast(0.72f)) * d
+                canvas.drawLine(tmpProj0[0], tmpProj0[1], tmpProj1[0], tmpProj1[1], rigLinePaint)
             }
-
-            val alpha = (Color.alpha(baseCol) * (0.58f + 0.42f * depthCue)).roundToInt().coerceIn(75, 255)
-            rigLinePaint.color = (alpha shl 24) or (baseCol and 0x00FFFFFF)
-            rigLinePaint.strokeWidth = (1.10f * seg.widthFactor * depthCue.coerceAtLeast(0.72f)) * d
-            canvas.drawLine(tmpProj0[0], tmpProj0[1], tmpProj1[0], tmpProj1[1], rigLinePaint)
         }
 
         drawBodyTriadAxes(canvas, roll, pitch, yaw)

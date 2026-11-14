@@ -4,7 +4,6 @@ import android.opengl.EGL14
 import android.opengl.GLES20
 import android.view.View
 import android.view.ViewGroup
-import android.widget.CheckBox
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -32,16 +31,20 @@ class RenderPipelineTest {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             Thread.sleep(900)
             scenario.onActivity { activity ->
-                fun find(view: View): CheckBox? {
-                    if (view is CheckBox && view.text.startsWith("UDP 点云")) return view
+                fun find(view: View): View? {
+                    if (view.contentDescription == "UDP 点云/位姿高速直通") return view
                     if (view is ViewGroup) {
                         for (i in 0 until view.childCount) find(view.getChildAt(i))?.let { return it }
                     }
                     return null
                 }
-                val checkbox = find(activity.window.decorView)
-                assertNotNull("UDP option should be available in the connection panel", checkbox)
-                assertFalse(checkbox!!.isChecked)
+                val toggle = find(activity.window.decorView)
+                assertNotNull("UDP option should be available in the connection panel", toggle)
+                assertFalse(toggle!!.isSelected)
+                toggle.performClick()
+                assertTrue(toggle.isSelected)
+                toggle.performClick()
+                assertFalse(toggle.isSelected)
                 assertFalse(activity.isFinishing)
             }
             instrument.uiAutomation.takeScreenshot()?.let { bitmap ->

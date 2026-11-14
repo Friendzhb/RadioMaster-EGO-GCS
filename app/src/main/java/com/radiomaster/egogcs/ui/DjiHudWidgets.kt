@@ -10,7 +10,6 @@ import android.graphics.Path
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
-import android.graphics.Typeface
 import android.view.View
 import com.radiomaster.egogcs.model.GcsSharedHub
 import com.radiomaster.egogcs.model.RenderSnapshot
