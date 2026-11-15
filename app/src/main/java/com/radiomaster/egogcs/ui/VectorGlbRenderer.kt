@@ -1,13 +1,21 @@
 package com.radiomaster.egogcs.ui
 
 import android.content.Context
+import android.opengl.EGL14
+import android.opengl.EGLContext
 import android.opengl.GLES20
 import android.opengl.Matrix
 import android.util.Log
 import java.io.FileInputStream
 import java.io.FileNotFoundException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /**
  * Renders both research UAV configurations in GLES 2.0:
@@ -18,9 +26,9 @@ import kotlin.math.max
  *   twisted carbon propellers with high-visibility painted tips.
  * - **X4 Standard Research Quadrotor** (`isTiltRig = false`): shares the same research avionics core
  *   paired with rigid 45-degree tubular carbon booms (`buildProceduralStandardQuad`).
- * - Supports 3-point hemisphere + sharp Blinn-Phong metallic/emissive shading, X-Ray Fresnel hologram
- *   pass, per-motor inertia-driven propeller rotation, directional 3-lobe motion-blur wake fans, and
- *   throttle-scaled 3D thrust vector arrows.
+ * - Uploads a mipmapped 64x64 RGBA8 GPU surface detail texture (`GL_TEXTURE_2D`) encoding 2x2 twill
+ *   carbon-fiber weave and brushed CNC metallic grain, and tracks the owning `EGLContext` so
+ *   `preserveEGLContextOnPause` transitions never reload textures, shaders, or VBOs.
  */
 internal class VectorGlbRenderer(context: Context) {
     private val assets = context.applicationContext.assets
@@ -28,9 +36,11 @@ internal class VectorGlbRenderer(context: Context) {
     @Volatile private var tiltModel: VectorUavMeshBuilder.PreparedModel? = null
 
     @Volatile private var quadModel: VectorUavMeshBuilder.PreparedModel? = null
+    private var boundEglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var program = 0
     private var tiltVertexBuffer = 0
     private var quadVertexBuffer = 0
+    private var materialTextureId = 0
     private var aPosition = -1
     private var aNormal = -1
     private var uMvp = -1
@@ -39,10 +49,17 @@ internal class VectorGlbRenderer(context: Context) {
     private var uEyePos = -1
     private var uTint = -1
     private var uParams = -1
+    private var uDetailTex = -1
+
+    @Volatile var textureUploadCount: Int = 0
+        private set
 
     private val body = FloatArray(16)
     private val front = FloatArray(16)
     private val rear = FloatArray(16)
+    private val mvpBody = FloatArray(16)
+    private val mvpFront = FloatArray(16)
+    private val mvpRear = FloatArray(16)
     private val spinTemp = FloatArray(16)
     private val auxLocal = FloatArray(16)
     private val partMatrix = FloatArray(16)
@@ -50,14 +67,41 @@ internal class VectorGlbRenderer(context: Context) {
 
     val ready: Boolean
         get() = tiltModel != null && quadModel != null &&
-            program != 0 && tiltVertexBuffer != 0 && quadVertexBuffer != 0
+            program != 0 && tiltVertexBuffer != 0 && quadVertexBuffer != 0 && materialTextureId != 0
+
+    /**
+     * Checks whether all compiled shaders, VBOs, and 3D UAV surface textures are already resident in [ctx].
+     * Validating both the `EGLContext` handle and `glIsTexture`/`glIsProgram`/`glIsBuffer` prevents
+     * redundant texture reloads on preserved contexts while safely detecting genuine `EGL_CONTEXT_LOST`
+     * or recycled native handle addresses.
+     */
+    fun isContextResident(ctx: EGLContext = EGL14.eglGetCurrentContext()): Boolean {
+        if (ctx == EGL14.EGL_NO_CONTEXT || ctx != boundEglContext) return false
+        if (tiltModel == null || quadModel == null) return false
+        if (program == 0 || tiltVertexBuffer == 0 || quadVertexBuffer == 0 || materialTextureId == 0) return false
+        return GLES20.glIsTexture(materialTextureId) &&
+            GLES20.glIsProgram(program) &&
+            GLES20.glIsBuffer(tiltVertexBuffer) &&
+            GLES20.glIsBuffer(quadVertexBuffer)
+    }
 
     fun create() {
+        val currentCtx = EGL14.eglGetCurrentContext()
+        if (isContextResident(currentCtx)) {
+            return
+        }
+        // Only delete old GL handles if they belong to the currently active context
+        if (currentCtx != EGL14.EGL_NO_CONTEXT && currentCtx == boundEglContext) {
+            deleteCurrentGlObjects()
+        } else {
+            program = 0
+            tiltVertexBuffer = 0
+            quadVertexBuffer = 0
+            materialTextureId = 0
+        }
         tiltModel = null
         quadModel = null
-        program = 0
-        tiltVertexBuffer = 0
-        quadVertexBuffer = 0
+        boundEglContext = EGL14.EGL_NO_CONTEXT
         try {
             val preparedTilt = loadTiltModel()
             val preparedQuad = loadQuadModel()
@@ -70,9 +114,10 @@ internal class VectorGlbRenderer(context: Context) {
             uEyePos = GLES20.glGetUniformLocation(program, "uEyePos")
             uTint = GLES20.glGetUniformLocation(program, "uTint")
             uParams = GLES20.glGetUniformLocation(program, "uParams")
+            uDetailTex = GLES20.glGetUniformLocation(program, "uDetailTex")
             check(
                 aPosition >= 0 && aNormal >= 0 && uMvp >= 0 && uModel >= 0 &&
-                    uColor >= 0 && uEyePos >= 0 && uTint >= 0 && uParams >= 0
+                    uColor >= 0 && uEyePos >= 0 && uTint >= 0 && uParams >= 0 && uDetailTex >= 0
             )
 
             val ids = IntArray(2)
@@ -85,19 +130,88 @@ internal class VectorGlbRenderer(context: Context) {
             uploadStaticModelVbo(quadVertexBuffer, preparedQuad)
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
 
+            materialTextureId = uploadMaterialDetailTexture()
+            check(materialTextureId != 0) { "Could not upload UAV material detail texture" }
+            textureUploadCount++
+
             tiltModel = preparedTilt
             quadModel = preparedQuad
+            boundEglContext = currentCtx
         } catch (e: Exception) {
             Log.e("VectorGlbRenderer", "Could not initialize 3D research UAV renderer", e)
-            if (tiltVertexBuffer != 0) GLES20.glDeleteBuffers(1, intArrayOf(tiltVertexBuffer), 0)
-            if (quadVertexBuffer != 0) GLES20.glDeleteBuffers(1, intArrayOf(quadVertexBuffer), 0)
-            if (program != 0) GLES20.glDeleteProgram(program)
-            tiltVertexBuffer = 0
-            quadVertexBuffer = 0
-            program = 0
+            deleteCurrentGlObjects()
             tiltModel = null
             quadModel = null
+            boundEglContext = EGL14.EGL_NO_CONTEXT
         }
+    }
+
+    fun release() {
+        val currentCtx = EGL14.eglGetCurrentContext()
+        if (currentCtx != EGL14.EGL_NO_CONTEXT && currentCtx == boundEglContext) {
+            deleteCurrentGlObjects()
+        } else {
+            program = 0
+            tiltVertexBuffer = 0
+            quadVertexBuffer = 0
+            materialTextureId = 0
+        }
+        tiltModel = null
+        quadModel = null
+        boundEglContext = EGL14.EGL_NO_CONTEXT
+    }
+
+    private fun deleteCurrentGlObjects() {
+        if (materialTextureId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(materialTextureId), 0)
+            materialTextureId = 0
+        }
+        if (tiltVertexBuffer != 0) {
+            GLES20.glDeleteBuffers(1, intArrayOf(tiltVertexBuffer), 0)
+            tiltVertexBuffer = 0
+        }
+        if (quadVertexBuffer != 0) {
+            GLES20.glDeleteBuffers(1, intArrayOf(quadVertexBuffer), 0)
+            quadVertexBuffer = 0
+        }
+        if (program != 0) {
+            GLES20.glDeleteProgram(program)
+            program = 0
+        }
+    }
+
+    private fun uploadMaterialDetailTexture(): Int {
+        val texIds = IntArray(1)
+        GLES20.glGenTextures(1, texIds, 0)
+        val texId = texIds[0]
+        if (texId == 0) return 0
+        val pixels = loadMaterialDetailPixels().duplicate().apply { position(0) }
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_REPEAT)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_REPEAT)
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D,
+            0,
+            GLES20.GL_RGBA,
+            DETAIL_TEX_SIZE,
+            DETAIL_TEX_SIZE,
+            0,
+            GLES20.GL_RGBA,
+            GLES20.GL_UNSIGNED_BYTE,
+            pixels
+        )
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        val error = GLES20.glGetError()
+        if (error != GLES20.GL_NO_ERROR) {
+            GLES20.glDeleteTextures(1, intArrayOf(texId), 0)
+            error("UAV detail texture upload failed: $error")
+        }
+        return texId
     }
 
     private fun uploadStaticModelVbo(vboId: Int, prepared: VectorUavMeshBuilder.PreparedModel) {
@@ -243,6 +357,9 @@ internal class VectorGlbRenderer(context: Context) {
         }
 
         GLES20.glUseProgram(program)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, materialTextureId)
+        GLES20.glUniform1i(uDetailTex, 0)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, activeVbo)
         GLES20.glEnableVertexAttribArray(aPosition)
         GLES20.glEnableVertexAttribArray(aNormal)
@@ -270,45 +387,80 @@ internal class VectorGlbRenderer(context: Context) {
             maxRotorBlur = 0.72f
         }
 
+        Matrix.multiplyMM(mvpBody, 0, viewProjection, 0, body, 0)
+        if (isTiltRig) {
+            Matrix.multiplyMM(mvpFront, 0, viewProjection, 0, front, 0)
+            Matrix.multiplyMM(mvpRear, 0, viewProjection, 0, rear, 0)
+        } else {
+            System.arraycopy(mvpBody, 0, mvpFront, 0, 16)
+            System.arraycopy(mvpBody, 0, mvpRear, 0, 16)
+        }
+
+        if (occluded) {
+            GLES20.glUniform4f(uParams, 0f, 1f, darkCarbonLift, 0f)
+            GLES20.glUniform4f(uColor, 0.16f, 0.88f, 1.0f, 0.38f)
+        }
+
         val parts = loaded.parts
+        var lastUploadedGroup = -1
         var pIdx = 0
         while (pIdx < parts.size) {
             val part = parts[pIdx]
             pIdx++
-            val group = when (part.group) {
+            val groupIdx = part.group
+            val group = when (groupIdx) {
                 1 -> front
                 2 -> rear
                 else -> body
             }
             val rIdx = part.rotorIndex
-            if (rIdx in 1..4) {
+            val phase = if (rIdx in 1..4) {
                 val mIdx = rIdx - 1
-                val phase = if (hasPhaseArr) requireNotNull(rotorPhases)[mIdx] else spinPhase
-                if (phase != 0f) {
-                    val hub = loaded.rotorHubs[mIdx]
-                    val deg = (phase * hub.spinSign * RAD_TO_DEG) % 360f
-                    System.arraycopy(group, 0, spinTemp, 0, 16)
-                    Matrix.translateM(spinTemp, 0, hub.x, hub.y, 0f)
-                    Matrix.rotateM(spinTemp, 0, deg, 0f, 0f, 1f)
-                    Matrix.translateM(spinTemp, 0, -hub.x, -hub.y, 0f)
-                    Matrix.multiplyMM(partMatrix, 0, spinTemp, 0, part.transform, 0)
+                if (hasPhaseArr) requireNotNull(rotorPhases)[mIdx] else spinPhase
+            } else {
+                0f
+            }
+            if (rIdx in 1..4 && phase != 0f) {
+                val hub = loaded.rotorHubs[rIdx - 1]
+                val deg = (phase * hub.spinSign * RAD_TO_DEG) % 360f
+                System.arraycopy(group, 0, spinTemp, 0, 16)
+                Matrix.translateM(spinTemp, 0, hub.x, hub.y, 0f)
+                Matrix.rotateM(spinTemp, 0, deg, 0f, 0f, 1f)
+                Matrix.translateM(spinTemp, 0, -hub.x, -hub.y, 0f)
+                if (part.isIdentityTransform) {
+                    Matrix.multiplyMM(mvp, 0, viewProjection, 0, spinTemp, 0)
+                    GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+                    GLES20.glUniformMatrix4fv(uModel, 1, false, spinTemp, 0)
                 } else {
-                    Matrix.multiplyMM(partMatrix, 0, group, 0, part.transform, 0)
+                    Matrix.multiplyMM(partMatrix, 0, spinTemp, 0, part.transform, 0)
+                    Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
+                    GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+                    GLES20.glUniformMatrix4fv(uModel, 1, false, partMatrix, 0)
+                }
+                lastUploadedGroup = -1
+            } else if (part.isIdentityTransform) {
+                if (lastUploadedGroup != groupIdx) {
+                    val gMvp = when (groupIdx) {
+                        1 -> mvpFront
+                        2 -> mvpRear
+                        else -> mvpBody
+                    }
+                    GLES20.glUniformMatrix4fv(uMvp, 1, false, gMvp, 0)
+                    GLES20.glUniformMatrix4fv(uModel, 1, false, group, 0)
+                    lastUploadedGroup = groupIdx
                 }
             } else {
                 Matrix.multiplyMM(partMatrix, 0, group, 0, part.transform, 0)
+                Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
+                GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+                GLES20.glUniformMatrix4fv(uModel, 1, false, partMatrix, 0)
+                lastUploadedGroup = -1
             }
-            Matrix.multiplyMM(mvp, 0, viewProjection, 0, partMatrix, 0)
-            GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
-            GLES20.glUniformMatrix4fv(uModel, 1, false, partMatrix, 0)
-            if (occluded) {
-                GLES20.glUniform4f(uParams, 0f, 1f, darkCarbonLift, 0f)
-                GLES20.glUniform4f(uColor, 0.16f, 0.88f, 1.0f, 0.38f)
-            } else {
+            if (!occluded) {
                 val partTintBoost = when {
-                    part.rotorIndex > 0 -> 0f
+                    rIdx > 0 -> 0f
                     part.emissive > 0.25f -> tintStrength * 0.15f
-                    part.group == 0 && tintStrength > 0.01f -> tintStrength
+                    groupIdx == 0 && tintStrength > 0.01f -> tintStrength
                     else -> tintStrength * 0.35f
                 }
                 GLES20.glUniform4f(uTint, tintR, tintG, tintB, partTintBoost)
@@ -373,6 +525,7 @@ internal class VectorGlbRenderer(context: Context) {
             drawOccludedThrustVectors(loaded, viewProjection, m0, m1, m2, m3)
         }
 
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         GLES20.glDisableVertexAttribArray(aPosition)
         GLES20.glDisableVertexAttribArray(aNormal)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
@@ -593,12 +746,66 @@ internal class VectorGlbRenderer(context: Context) {
     }
 
     companion object {
+        internal const val DETAIL_TEX_SIZE = 64
         private const val RAD_TO_DEG = 57.2957795f
         private val MODEL_CACHE_LOCK = Any()
+        private val DETAIL_TEX_LOCK = Any()
 
         @Volatile private var cachedTiltModel: VectorUavMeshBuilder.PreparedModel? = null
 
         @Volatile private var cachedQuadModel: VectorUavMeshBuilder.PreparedModel? = null
+
+        @Volatile private var cachedDetailPixels: ByteBuffer? = null
+
+        /**
+         * Synthesizes and caches a seamless 64x64 RGBA8 procedural material detail texture:
+         * - R: 2x2 twill woven carbon-fiber relief (warp/weft tow alternation + filament micro-grooves)
+         * - G: Brushed CNC aluminum / titanium linear micro-grain
+         * - B: Anodized metallic micro-specular sheen
+         * - A: Opaque (255)
+         */
+        internal fun loadMaterialDetailPixels(): ByteBuffer {
+            cachedDetailPixels?.let { return it.duplicate().order(ByteOrder.nativeOrder()).apply { position(0) } }
+            synchronized(DETAIL_TEX_LOCK) {
+                cachedDetailPixels?.let { return it.duplicate().order(ByteOrder.nativeOrder()).apply { position(0) } }
+                val buf = ByteBuffer.allocateDirect(DETAIL_TEX_SIZE * DETAIL_TEX_SIZE * 4).order(ByteOrder.nativeOrder())
+                val cellSize = 8
+                val twoPi = (PI * 2.0).toFloat()
+                for (y in 0 until DETAIL_TEX_SIZE) {
+                    val ty = y / cellSize
+                    val ly = (y % cellSize + 0.5f) / cellSize
+                    val vNorm = y.toFloat() / DETAIL_TEX_SIZE
+                    for (x in 0 until DETAIL_TEX_SIZE) {
+                        val tx = x / cellSize
+                        val lx = (x % cellSize + 0.5f) / cellSize
+                        val uNorm = x.toFloat() / DETAIL_TEX_SIZE
+
+                        val isWarpOver = ((tx + ty) and 3) < 2
+                        val across = if (isWarpOver) lx else ly
+                        val along = if (isWarpOver) ly else lx
+                        val towCrown = sin(across * PI.toFloat()).coerceIn(0f, 1f)
+                        val filament = 0.90f + 0.10f * sin(across * twoPi * 3f)
+                        val crimp = 0.88f + 0.12f * cos((along - 0.5f) * PI.toFloat())
+                        val orientBias = if (isWarpOver) 1.04f else 0.94f
+                        val carbonVal = (0.28f + 0.68f * towCrown * filament * crimp * orientBias).coerceIn(0f, 1f)
+
+                        val grain1 = sin(uNorm * twoPi * 16f + sin(vNorm * twoPi * 2f) * 0.35f)
+                        val grain2 = cos(vNorm * twoPi * 24f + uNorm * twoPi * 4f)
+                        val brushedVal = (0.54f + 0.24f * grain1 + 0.16f * grain2).coerceIn(0f, 1f)
+
+                        val glintVal = (0.42f + 0.38f * towCrown * towCrown + 0.20f * max(0f, grain1)).coerceIn(0f, 1f)
+
+                        buf.put((carbonVal * 255f).roundToInt().coerceIn(0, 255).toByte())
+                        buf.put((brushedVal * 255f).roundToInt().coerceIn(0, 255).toByte())
+                        buf.put((glintVal * 255f).roundToInt().coerceIn(0, 255).toByte())
+                        buf.put(0xFF.toByte())
+                    }
+                }
+                buf.position(0)
+                cachedDetailPixels = buf
+                return buf.duplicate().order(ByteOrder.nativeOrder()).apply { position(0) }
+            }
+        }
 
         private const val VERTEX_SHADER = """
             attribute vec3 aPosition;
@@ -607,11 +814,13 @@ internal class VectorGlbRenderer(context: Context) {
             uniform mat4 uModel;
             varying vec3 vWorldPos;
             varying vec3 vWorldNormal;
+            varying vec3 vLocalPos;
             varying float vFade;
             void main() {
                 vec4 wp = uModel * vec4(aPosition, 1.0);
                 vWorldPos = wp.xyz;
                 vWorldNormal = (uModel * vec4(aNormal, 0.0)).xyz;
+                vLocalPos = aPosition;
                 vFade = clamp(aNormal.z, 0.0, 1.0);
                 gl_Position = uMvp * vec4(aPosition, 1.0);
             }
@@ -622,8 +831,10 @@ internal class VectorGlbRenderer(context: Context) {
             uniform vec3 uEyePos;
             uniform vec4 uTint;
             uniform vec4 uParams;
+            uniform sampler2D uDetailTex;
             varying vec3 vWorldPos;
             varying vec3 vWorldNormal;
+            varying vec3 vLocalPos;
             varying float vFade;
             void main() {
                 if (uParams.y > 2.5) {
@@ -638,7 +849,8 @@ internal class VectorGlbRenderer(context: Context) {
                     return;
                 }
                 if (uParams.y > 0.5) {
-                    float fres = pow(clamp(1.0 - abs(dot(n, v)), 0.0001, 1.0), 1.75);
+                    float f0 = clamp(1.0 - abs(dot(n, v)), 0.0, 1.0);
+                    float fres = f0 * sqrt(max(f0, 0.0));
                     vec3 holo = mix(vec3(0.15, 0.88, 1.0), uTint.rgb, uTint.a * 0.65);
                     gl_FragColor = vec4(min(holo * (0.72 + 0.52 * fres), vec3(1.0)), clamp(0.24 + 0.46 * fres, 0.22, 0.72));
                     return;
@@ -646,21 +858,35 @@ internal class VectorGlbRenderer(context: Context) {
                 if (dot(n, v) < 0.0) {
                     n = -n;
                 }
+                vec2 detailUv = (vLocalPos.xy + vec2(vLocalPos.z * 0.65, -vLocalPos.z * 0.65)) * 28.0;
+                vec4 detail = texture2D(uDetailTex, detailUv);
+                float nonEmissive = 1.0 - clamp(uParams.w * 2.2, 0.0, 1.0);
+                float metalness = smoothstep(0.52, 0.82, uParams.x);
+                float microRelief = mix(detail.r, detail.g, metalness);
+                float texMod = mix(1.0, 0.86 + 0.28 * microRelief, nonEmissive * (1.0 - uTint.a * 0.65));
+                float specTex = mix(1.0, 0.78 + 0.44 * detail.b, nonEmissive);
                 vec3 base = mix(uColor.rgb, uTint.rgb, uTint.a);
                 float liftMask = uParams.z * (1.0 - clamp(uParams.w, 0.0, 1.0));
-                base = max(base, vec3(0.16, 0.20, 0.27) * liftMask);
+                base = max(base, vec3(0.16, 0.20, 0.27) * liftMask) * texMod;
                 float hemi = n.z * 0.5 + 0.5;
                 vec3 amb = mix(vec3(0.28, 0.33, 0.42), vec3(0.64, 0.72, 0.84), hemi);
                 vec3 lKey = normalize(vec3(0.42, -0.38, 0.82));
                 vec3 lFill = normalize(vec3(-0.56, 0.54, 0.34));
                 float diffKey = max(dot(n, lKey), 0.0);
                 float diffFill = max(dot(n, lFill), 0.0);
-                float camFill = max(dot(n, v), 0.0) * 0.16;
+                float nv = max(dot(n, v), 0.0);
+                float camFill = nv * 0.16;
                 vec3 hVec = normalize(lKey + v);
-                float specDot = clamp(dot(n, hVec), 0.0001, 1.0);
-                float specBroad = (dot(n, hVec) > 0.0 ? pow(specDot, 9.0) : 0.0) * (0.14 + 0.16 * uParams.x);
-                float specSharp = (dot(n, hVec) > 0.0 ? pow(specDot, 42.0) : 0.0) * uParams.x * 1.15;
-                float fres = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0001, 1.0), 2.45);
+                float sd = max(dot(n, hVec), 0.0);
+                float s2 = sd * sd;
+                float s4 = s2 * s2;
+                float s8 = s4 * s4;
+                float s16 = s8 * s8;
+                float s32 = s16 * s16;
+                float specBroad = (s8 * sd) * (0.14 + 0.16 * uParams.x) * specTex;
+                float specSharp = (s32 * s8 * s2) * uParams.x * 1.15 * specTex;
+                float fn = clamp(1.0 - nv, 0.0, 1.0);
+                float fres = fn * fn * sqrt(max(fn, 0.0));
                 vec3 rimCol = mix(vec3(0.62, 0.86, 1.0), uTint.rgb, uTint.a * 0.65);
                 vec3 rim = rimCol * (fres * (0.24 + 0.22 * uParams.z));
                 vec3 lit = base * (amb + vec3(0.76, 0.74, 0.70) * diffKey + vec3(0.28, 0.35, 0.44) * diffFill + camFill + uParams.w) +

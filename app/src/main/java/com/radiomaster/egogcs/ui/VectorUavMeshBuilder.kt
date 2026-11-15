@@ -40,6 +40,15 @@ internal object VectorUavMeshBuilder {
     private const val DECIMATE_THRESHOLD_VERTS = 4800
     private const val CLUSTER_GRID = 88
 
+    private fun isIdentityMat4(m: FloatArray): Boolean {
+        if (m.size < 16) return false
+        for (i in 0 until 16) {
+            val expected = if (i % 5 == 0) 1f else 0f
+            if (abs(m[i] - expected) > 1e-6f) return false
+        }
+        return true
+    }
+
     class GpuPart(
         val name: String,
         val group: Int,
@@ -50,7 +59,9 @@ internal object VectorUavMeshBuilder {
         val color: FloatArray,
         val specular: Float = 0.34f,
         val emissive: Float = 0.0f
-    )
+    ) {
+        val isIdentityTransform: Boolean = isIdentityMat4(transform)
+    }
 
     class RotorHub(
         val motorId: Int,

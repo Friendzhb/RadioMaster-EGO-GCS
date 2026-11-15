@@ -92,6 +92,44 @@ class VectorGlbAssetTest {
         }
     }
 
+    @Test fun materialDetailTexturePixelsAreCachedAndEncodeWovenCarbonAndBrushedGrain() {
+        val first = VectorGlbRenderer.loadMaterialDetailPixels()
+        val expectedBytes = VectorGlbRenderer.DETAIL_TEX_SIZE * VectorGlbRenderer.DETAIL_TEX_SIZE * 4
+        assertEquals(0, first.position())
+        assertEquals(expectedBytes, first.remaining())
+
+        var minR = 255
+        var maxR = 0
+        var minG = 255
+        var maxG = 0
+        val copyA = ByteArray(expectedBytes)
+        for (i in 0 until expectedBytes step 4) {
+            val r = first.get().toInt() and 0xFF
+            val g = first.get().toInt() and 0xFF
+            val b = first.get().toInt() and 0xFF
+            val a = first.get().toInt() and 0xFF
+            copyA[i] = r.toByte()
+            copyA[i + 1] = g.toByte()
+            copyA[i + 2] = b.toByte()
+            copyA[i + 3] = a.toByte()
+            if (r < minR) minR = r
+            if (r > maxR) maxR = r
+            if (g < minG) minG = g
+            if (g > maxG) maxG = g
+            assertEquals(255, a)
+        }
+        assertTrue("Carbon weave channel must have clear relief contrast", maxR - minR >= 80)
+        assertTrue("Brushed CNC grain channel must have micro-relief variation", maxG - minG >= 40)
+
+        // Mutating position on first duplicate must not corrupt subsequent callers
+        val second = VectorGlbRenderer.loadMaterialDetailPixels()
+        assertEquals(0, second.position())
+        assertEquals(expectedBytes, second.remaining())
+        val copyB = ByteArray(expectedBytes)
+        second.get(copyB)
+        assertTrue(copyA.contentEquals(copyB))
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun rejectsTruncatedFile() {
         VectorGlbAsset.parse(ByteBuffer.wrap(ByteArray(20)))

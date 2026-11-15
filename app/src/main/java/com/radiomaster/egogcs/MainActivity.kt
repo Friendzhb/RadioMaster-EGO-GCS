@@ -258,6 +258,8 @@ class MainActivity : Activity() {
     private val tabPanels = mutableListOf<View>()
     private var drawerOpen = false
     private var drawerWideMode = false
+    private var telemetryFullscreenMode = false
+    private var activityResumed = false
     private var activeTabIndex = 0
 
     // Tab 0 (连接)
@@ -316,6 +318,7 @@ class MainActivity : Activity() {
     private var isDetailCurrentlyStreaming = false
 
     // Tab 3 (状态)
+    private lateinit var btnTelemetryFullscreenToggle: TextView
     private lateinit var tvUavPowerCard: TextView
     private lateinit var tvTxPowerCard: TextView
     private lateinit var tvMapPtsCard: TextView
@@ -494,10 +497,19 @@ class MainActivity : Activity() {
                 syncTiltAllControlsUi()
                 publishTiltSettingsToRos()
                 attitudeHudView.invalidate()
+            },
+            onVisibilityChanged = { open ->
+                syncSettingsGearVisual()
+                if (::btnSettingsToggle.isInitialized) {
+                    AnimHelper.animateGearRotation(btnSettingsToggle, open)
+                }
+                syncOpenGlSurfaceLifecycle()
             }
         )
 
         setContentView(buildNativeDjiCockpit())
+        mapView.preserveEGLContextOnPause = true
+        attitudeHudView.preserveEGLContextOnPause = true
         applyActiveThemeLive(animate = false)
         syncCameraControlLabels()
         syncLayerPopoverControls()
@@ -523,28 +535,33 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         applyImmersiveFullscreen()
+        mapView.preserveEGLContextOnPause = true
         mapView.startLoop()
         if (::attitudeHudView.isInitialized) {
-            attitudeHudView.setLoopActive(true)
+            attitudeHudView.preserveEGLContextOnPause = true
         }
+        syncOpenGlSurfaceLifecycle()
         if (::otaManager.isInitialized) {
             otaManager.onHostResume()
         }
     }
 
     override fun onPause() {
+        activityResumed = false
         topicInspector.stopActiveSession()
         isDetailCurrentlyStreaming = false
         syncDetailStreamButtonUi()
         if (::attitudeHudView.isInitialized) {
-            attitudeHudView.setLoopActive(false)
+            attitudeHudView.onPause()
         }
         mapView.stopLoop()
         super.onPause()
     }
 
     override fun onDestroy() {
+        activityResumed = false
         uiHandler.removeCallbacksAndMessages(null)
         if (::otaManager.isInitialized) {
             otaManager.shutdown()
@@ -553,7 +570,7 @@ class MainActivity : Activity() {
         lanScanner.cancelScan()
         hwBridge.stop()
         if (::attitudeHudView.isInitialized) {
-            attitudeHudView.setLoopActive(false)
+            attitudeHudView.releaseGlResources()
         }
         mapView.stopLoop()
         rosManager.shutdown()
@@ -715,6 +732,7 @@ class MainActivity : Activity() {
         syncMissionStrategyButtons()
         syncSwarmAllControlsUi()
         syncTiltAllControlsUi()
+        syncTelemetryFullscreenToggleVisual()
         refreshWaypointOrchestratorList()
         if (cachedTopicEntries.isNotEmpty()) renderFilteredTopicRows()
 
@@ -773,12 +791,89 @@ class MainActivity : Activity() {
         return min(dp(484f), (w * 0.74f).roundToInt())
     }
 
-    private fun currentDrawerWidthPx(): Int =
-        if (drawerWideMode && activeTabIndex == TAB_TOPICS && topicDetailPage.visibility == View.VISIBLE) {
-            wideDrawerWidthPx()
+    private fun fullScreenDrawerWidthPx(): Int {
+        val w = cockpitRoot.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        return (w - safeCutoutLeftPx - safeCutoutRightPx - dp(16f)).coerceAtLeast(normalDrawerWidthPx())
+    }
+
+    private fun currentDrawerWidthPx(): Int = when {
+        telemetryFullscreenMode && activeTabIndex == TAB_STATUS -> fullScreenDrawerWidthPx()
+        drawerWideMode && activeTabIndex == TAB_TOPICS && topicDetailPage.visibility == View.VISIBLE -> wideDrawerWidthPx()
+        else -> normalDrawerWidthPx()
+    }
+
+    /**
+     * Synchronizes OpenGL surface pause/resume states across GCS view switches (Main 3D Map <->
+     * Telemetry Dashboard / Settings Modal) with `preserveEGLContextOnPause = true`, ensuring
+     * obscured GL surfaces stop burning GPU cycles while keeping their `EGLContext` and 3D UAV
+     * textures/VBOs/shaders resident in VRAM with zero texture reloads on return.
+     */
+    private fun syncOpenGlSurfaceLifecycle() {
+        if (!::mapView.isInitialized || !::attitudeHudView.isInitialized) return
+        mapView.preserveEGLContextOnPause = true
+        attitudeHudView.preserveEGLContextOnPause = true
+
+        val modalOpen = ::settingsModal.isInitialized && settingsModal.isOpen
+        val fullScreenTelemetryActive = drawerOpen && activeTabIndex == TAB_STATUS && telemetryFullscreenMode
+        mapView.setGlSurfacePaused(fullScreenTelemetryActive || modalOpen)
+
+        if (!activityResumed) return
+        val hideAttitudeForPopover = layerPopoverOpen && screenHeightDp < 395f
+        val hudObscured = drawerOpen || modalOpen || hideAttitudeForPopover
+        if (hudObscured) {
+            attitudeHudView.onPause()
         } else {
-            normalDrawerWidthPx()
+            attitudeHudView.onResume()
         }
+    }
+
+    private fun syncTelemetryFullscreenToggleVisual() {
+        if (!::btnTelemetryFullscreenToggle.isInitialized) return
+        val pal = GcsTheme.of(hub.themeId)
+        btnTelemetryFullscreenToggle.setTextColor(
+            if (telemetryFullscreenMode) pal.accentBright else pal.textPrimary
+        )
+        GcsIcons.bind(
+            btnTelemetryFullscreenToggle,
+            if (telemetryFullscreenMode) Type.COLLAPSE_WIDTH else Type.EXPAND_WIDTH,
+            if (telemetryFullscreenMode) "分屏地图预览" else "全屏遥测仪表",
+            d,
+            iconDp = 11.5f
+        )
+        btnTelemetryFullscreenToggle.background = if (telemetryFullscreenMode) {
+            pillBg(pal.accentSoftFill, pal.accent, radiusDp = 6f)
+        } else {
+            pillBg(pal.glassFill, pal.cardStroke, radiusDp = 6f)
+        }
+    }
+
+    private fun setTelemetryFullscreenMode(fullScreen: Boolean, animateWidth: Boolean = true) {
+        if (telemetryFullscreenMode == fullScreen) return
+        telemetryFullscreenMode = fullScreen
+        syncTelemetryFullscreenToggleVisual()
+        val newW = currentDrawerWidthPx()
+        if (animateWidth && drawerOpen) {
+            AnimHelper.animateDrawerWidthMorph(
+                drawer = drawerRoot,
+                targetWidthPx = newW,
+                centerShiftViews = listOf(topCenterStack),
+                targetCenterOffsetPx = computeOpenMapCenterOffsetPx(newW),
+                drawerOpen = drawerOpen
+            ) {
+                syncMeasuredTabGlider(animate = false)
+            }
+        } else {
+            val lp = drawerRoot.layoutParams as FrameLayout.LayoutParams
+            lp.width = newW
+            drawerRoot.layoutParams = lp
+            drawerRoot.post { syncMeasuredTabGlider(animate = false) }
+            if (drawerOpen) {
+                topCenterStack.translationX = computeOpenMapCenterOffsetPx(newW)
+            }
+        }
+        syncBottomHudAvoidance()
+        syncOpenGlSurfaceLifecycle()
+    }
 
     /**
      * 计算抽屉展开时左侧剩余地图可视区的精确中心偏移，保证顶部航向堆栈既不碰左安全栏也不碰右抽屉
@@ -821,6 +916,7 @@ class MainActivity : Activity() {
                 hideOffsetX = dp(6f).toFloat()
             )
         }
+        syncOpenGlSurfaceLifecycle()
     }
 
     // ==================== 四级互斥菜单状态机 ====================
@@ -833,7 +929,7 @@ class MainActivity : Activity() {
         }
         settingsModal.setVisible(open, jumpCategory)
         syncSettingsGearVisual()
-        AnimHelper.animateGearRotation(btnSettingsToggle, open)
+        syncOpenGlSurfaceLifecycle()
     }
 
     private fun syncSettingsGearVisual() {
@@ -894,6 +990,11 @@ class MainActivity : Activity() {
         syncMenuButtonVisual()
 
         val activeW = currentDrawerWidthPx()
+        if (open && drawerRoot.layoutParams.width != activeW) {
+            val lp = drawerRoot.layoutParams as FrameLayout.LayoutParams
+            lp.width = activeW
+            drawerRoot.layoutParams = lp
+        }
         val animW = maxOf(activeW, prevWidthPx).toFloat()
         val centerShiftPx = computeOpenMapCenterOffsetPx(activeW)
         val activePanel = tabPanels.getOrNull(activeTabIndex)
@@ -910,6 +1011,7 @@ class MainActivity : Activity() {
         )
         refreshCommandDockUi()
         syncBottomHudAvoidance()
+        syncOpenGlSurfaceLifecycle()
     }
 
     private fun syncMenuButtonVisual() {
@@ -1096,6 +1198,11 @@ class MainActivity : Activity() {
             tabRowRef.post { syncMeasuredTabGlider(animate = false) }
         }
         syncMenuButtonVisual()
+        if (drawerOpen) {
+            topCenterStack.translationX = computeOpenMapCenterOffsetPx(curW)
+        }
+        syncBottomHudAvoidance()
+        syncOpenGlSurfaceLifecycle()
 
         when (idx) {
             TAB_TOPICS -> refreshRosTopicList()
@@ -1688,6 +1795,7 @@ class MainActivity : Activity() {
         val rightCluster = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            contentDescription = "遥测仪表盘"
             setPadding(dp(7.5f), dp(4f), dp(7.5f), dp(4f))
             GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 5.5f)
             setOnClickListener { toggleOrJumpDrawerTab(TAB_STATUS) }
@@ -4084,6 +4192,31 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10f), dp(9f), dp(10f), dp(10f))
         }
+
+        val viewSwitchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val btnReturnMap = createSmallIconBtn(Type.CUBE_3D, "返回三维地图") {
+            setDrawerOpenState(false)
+        }.apply {
+            contentDescription = "返回三维地图"
+        }
+        btnTelemetryFullscreenToggle = createSmallIconBtn(Type.EXPAND_WIDTH, "全屏遥测仪表") {
+            setTelemetryFullscreenMode(!telemetryFullscreenMode, animateWidth = true)
+        }.apply {
+            contentDescription = "全屏遥测仪表盘"
+        }
+        syncTelemetryFullscreenToggleVisual()
+        viewSwitchRow.addView(btnReturnMap, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        viewSwitchRow.addView(
+            btnTelemetryFullscreenToggle,
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(5f) }
+        )
+        col.addView(
+            viewSwitchRow,
+            LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(8f) }
+        )
 
         tvUavPowerCard = monoLabel("16.24V · 12.6A (86%)", "#00B865", 11.2f)
         tvTxPowerCard = monoLabel("8.08V · 1.05A (92%)", "#69B7FF", 11.2f, Role.TEXT_ACCENT)

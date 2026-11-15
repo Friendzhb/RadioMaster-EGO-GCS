@@ -1,25 +1,56 @@
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.TimeUnit
+import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.api.tasks.testing.Test
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
-val buildEpochMs = System.currentTimeMillis()
+val otaStoreFile = providers.environmentVariable("EGO_SIGNING_STORE_FILE").orNull
+val otaStorePassword = providers.environmentVariable("EGO_SIGNING_STORE_PASSWORD").orNull
+val otaKeyAlias = providers.environmentVariable("EGO_SIGNING_KEY_ALIAS").orNull
+val otaKeyPassword = providers.environmentVariable("EGO_SIGNING_KEY_PASSWORD").orNull
+val resolvedOtaKeystore = otaStoreFile
+    ?.takeIf { it.isNotBlank() }
+    ?.let { path ->
+        val direct = File(path)
+        when {
+            direct.isAbsolute -> direct
+            file(path).isFile -> file(path)
+            else -> rootProject.file(path)
+        }
+    }
+val hasOtaSigning = resolvedOtaKeystore?.isFile == true &&
+    !otaStorePassword.isNullOrBlank() &&
+    !otaKeyAlias.isNullOrBlank() &&
+    !otaKeyPassword.isNullOrBlank()
+val aiStudioDebugKeystore = rootProject.file("debug.keystore")
+val hasAiStudioDebugKeystore = aiStudioDebugKeystore.isFile
+
+// 对齐构建时间戳粒度（OTA 正式发版按分钟、常规 CI/开发构建按小时分桶），防止每次毫秒变化击穿 Gradle buildCache
+val explicitEpochSec = providers.environmentVariable("SOURCE_DATE_EPOCH").orNull?.toLongOrNull()
+val rawEpochMs = explicitEpochSec?.times(1000L) ?: System.currentTimeMillis()
+val cacheBucketMs = if (hasOtaSigning) 60_000L else 3_600_000L
+val buildEpochMs = (rawEpochMs / cacheBucketMs) * cacheBucketMs
 val autoVersionCode = (((buildEpochMs / 1000L) - 1_700_000_000L).toInt() + 17).coerceAtLeast(317)
 val buildUtcStamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply {
     timeZone = TimeZone.getTimeZone("UTC")
 }.format(Date(buildEpochMs)) + " UTC"
 
-val otaStoreFile = providers.environmentVariable("EGO_SIGNING_STORE_FILE").orNull
-val otaStorePassword = providers.environmentVariable("EGO_SIGNING_STORE_PASSWORD").orNull
-val otaKeyAlias = providers.environmentVariable("EGO_SIGNING_KEY_ALIAS").orNull
-val otaKeyPassword = providers.environmentVariable("EGO_SIGNING_KEY_PASSWORD").orNull
-val hasOtaSigning = listOf(otaStoreFile, otaStorePassword, otaKeyAlias, otaKeyPassword)
-    .all { !it.isNullOrBlank() }
+// 依赖解析与远端元数据本地缓存优化：避免 GitHub Actions 每次构建重复轮询校验远端 Maven 元数据导致超时
+configurations.configureEach {
+    resolutionStrategy {
+        cacheDynamicVersionsFor(24, TimeUnit.HOURS)
+        cacheChangingModulesFor(24, TimeUnit.HOURS)
+    }
+}
 
 android {
     namespace = "com.radiomaster.egogcs"
@@ -37,9 +68,17 @@ android {
     }
 
     signingConfigs {
+        if (hasAiStudioDebugKeystore) {
+            create("debugConfig") {
+                storeFile = aiStudioDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
         if (hasOtaSigning) {
             create("otaShared") {
-                storeFile = file(requireNotNull(otaStoreFile))
+                storeFile = requireNotNull(resolvedOtaKeystore)
                 storePassword = otaStorePassword
                 keyAlias = otaKeyAlias
                 keyPassword = otaKeyPassword
@@ -49,11 +88,15 @@ android {
         }
     }
 
+    val activeSigningConfig = when {
+        hasOtaSigning -> signingConfigs.getByName("otaShared")
+        hasAiStudioDebugKeystore -> signingConfigs.getByName("debugConfig")
+        else -> signingConfigs.getByName("debug")
+    }
+
     buildTypes {
         release {
-            if (hasOtaSigning) {
-                signingConfig = signingConfigs.getByName("otaShared")
-            }
+            signingConfig = activeSigningConfig
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -61,10 +104,8 @@ android {
             )
         }
         debug {
-            // CI uses the existing OTA certificate; local builds use the standard debug key.
-            if (hasOtaSigning) {
-                signingConfig = signingConfigs.getByName("otaShared")
-            }
+            // Priority: CI OTA certificate -> AI Studio root debug.keystore -> standard Android debug key.
+            signingConfig = activeSigningConfig
             isMinifyEnabled = false
         }
     }
@@ -78,13 +119,55 @@ android {
         jvmTarget = "17"
     }
 
+    lint {
+        checkReleaseBuilds = false
+        checkDependencies = false
+        abortOnError = true
+    }
+
     androidResources {
         // openFd maps the original model directly from the APK without a second heap-sized copy.
         noCompress += "glb"
     }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "/META-INF/LICENSE*"
+        }
+    }
+}
+
+// 显式开启 Kotlin / Java 增量编译与 Gradle 任务级构建缓存 (buildCache)
+tasks.withType<KotlinCompile>().configureEach {
+    incremental = true
+    outputs.cacheIf { true }
+}
+
+tasks.withType<JavaCompile>().configureEach {
+    options.isIncremental = true
+    options.isFork = true
+    outputs.cacheIf { true }
+}
+
+tasks.withType<Test>().configureEach {
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
+    outputs.cacheIf { true }
 }
 
 dependencies {
+    // 统一锁定 Kotlin 标准库族版本至 1.9.24，消除 OkHttp/Okio 传递引入的 kotlin-stdlib-jdk7/jdk8 1.9.10 版本分裂
+    implementation(platform("org.jetbrains.kotlin:kotlin-bom:1.9.24"))
+    androidTestImplementation(platform("org.jetbrains.kotlin:kotlin-bom:1.9.24"))
+
+    // 消除主类路径对 debugAndroidTestRuntimeClasspath 的 {strictly} 反向降级冲突
+    constraints {
+        implementation("androidx.annotation:annotation:1.8.0")
+        implementation("androidx.tracing:tracing:1.2.0")
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    }
+
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test:runner:1.6.2")

@@ -98,6 +98,13 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
     private val d = resources.displayMetrics.density
     private val modelTexture = VectorHudTextureView(context) { invalidate() }
     internal val vectorGlbReady: Boolean get() = modelTexture.modelReady
+    internal val textureUploadCount: Int get() = modelTexture.textureUploadCount
+
+    var preserveEGLContextOnPause: Boolean
+        get() = modelTexture.preserveEGLContextOnPause
+        set(value) {
+            modelTexture.preserveEGLContextOnPause = value
+        }
 
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
@@ -185,22 +192,44 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
         fontFeatureSettings = "tnum, zero"
     }
 
+    fun onPause() {
+        setLoopActive(false)
+    }
+
+    fun onResume() {
+        setLoopActive(true)
+    }
+
+    fun releaseGlResources() {
+        setLoopActive(false)
+        modelTexture.releaseGlResources()
+    }
+
     fun setLoopActive(active: Boolean) {
         loopDesired = active
         if (active) {
             framePacer.reset()
             lastFrameNs = 0L
-            scheduleNextFrame()
-        } else if (loopPosted) {
-            Choreographer.getInstance().removeFrameCallback(frameCallback)
-            loopPosted = false
+            if (isAttachedToWindow && visibility == VISIBLE) {
+                modelTexture.onResume()
+                pushGlPoseFromSnapshot(hub.snapshots.readInto(readSnapshot))
+                scheduleNextFrame()
+            }
+        } else {
+            if (loopPosted) {
+                Choreographer.getInstance().removeFrameCallback(frameCallback)
+                loopPosted = false
+            }
             lastFrameNs = 0L
+            modelTexture.onPause()
         }
     }
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         if (loopDesired && visibility == VISIBLE) {
+            modelTexture.onResume()
+            pushGlPoseFromSnapshot(hub.snapshots.readInto(readSnapshot))
             framePacer.reset()
             scheduleNextFrame()
         }
@@ -212,12 +241,30 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             loopPosted = false
         }
         lastFrameNs = 0L
+        modelTexture.releaseGlResources()
         super.onDetachedFromWindow()
     }
 
     override fun onVisibilityChanged(changedView: View, visibility: Int) {
         super.onVisibilityChanged(changedView, visibility)
-        if (visibility == VISIBLE && loopDesired && isAttachedToWindow) {
+        if (changedView === this) {
+            if (visibility == VISIBLE) {
+                if (loopDesired && isAttachedToWindow) {
+                    modelTexture.onResume()
+                    pushGlPoseFromSnapshot(hub.snapshots.readInto(readSnapshot))
+                    framePacer.reset()
+                    scheduleNextFrame()
+                }
+            } else {
+                if (loopPosted) {
+                    Choreographer.getInstance().removeFrameCallback(frameCallback)
+                    loopPosted = false
+                }
+                lastFrameNs = 0L
+                modelTexture.onPause()
+            }
+        } else if (visibility == VISIBLE && loopDesired && isAttachedToWindow) {
+            modelTexture.onResume()
             framePacer.reset()
             scheduleNextFrame()
         }

@@ -28,6 +28,8 @@ jobs:
 
       - name: Set up Gradle and validate Wrapper
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Configure Android SDK 34
         shell: bash
@@ -65,7 +67,7 @@ jobs:
           EGO_SIGNING_KEY_ALIAS: ${{ secrets.EGO_GCS_OTA_KEY_ALIAS }}
           EGO_SIGNING_KEY_PASSWORD: ${{ secrets.EGO_GCS_OTA_KEY_PASSWORD }}
         shell: bash
-        run: ./gradlew --no-daemon --stacktrace spotlessCheck :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+        run: ./gradlew --no-daemon --build-cache --stacktrace spotlessCheck :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 
       - name: Verify APK and signing compatibility
         shell: bash
@@ -117,6 +119,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
       - name: Install Android test environment
         shell: bash
         run: |
@@ -142,7 +146,7 @@ jobs:
           tail -n 80 "$RUNNER_TEMP/emulator.log"
           exit 1
       - name: Run Android 9 render, lifecycle, and UDP integration scenarios
-        run: ./gradlew --no-daemon --stacktrace -Pandroid.injected.device.serial=emulator-5554 :app:connectedDebugAndroidTest
+        run: ./gradlew --no-daemon --build-cache --stacktrace -Pandroid.injected.device.serial=emulator-5554 :app:connectedDebugAndroidTest
       - name: Collect performance and emulator records
         if: always()
         shell: bash

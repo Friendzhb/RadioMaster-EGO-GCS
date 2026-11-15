@@ -3,6 +3,8 @@ package com.radiomaster.egogcs.ui
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
+import android.opengl.EGL14
+import android.opengl.EGLContext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
@@ -19,9 +21,7 @@ import com.radiomaster.egogcs.model.SwarmPalette
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGLConfig
-import javax.microedition.khronos.egl.EGLDisplay
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.PI
 import kotlin.math.abs
@@ -212,7 +212,9 @@ class GlPointCloudMapView(
                 float nz = sqrt(max(0.0, 1.0 - r2 * 4.0));
                 vec3 norm = vec3(uv.x * 2.0, -uv.y * 2.0, nz);
                 float diff = max(0.0, dot(norm, vec3(0.38, 0.48, 0.79)));
-                float spec = pow(diff, 12.0) * 0.14;
+                float d2 = diff * diff;
+                float d4 = d2 * d2;
+                float spec = (d4 * d4 * d4) * 0.14;
                 float edlRim = 1.0 - smoothstep(0.13, 0.25, r2) * 0.48;
                 vec3 litRgb = (vColor.rgb * (0.60 + 0.60 * diff) + vec3(spec)) * edlRim;
                 vec3 fogRgb = mix(litRgb, uFogColor, vFog);
@@ -419,6 +421,8 @@ class GlPointCloudMapView(
     private val uavTmpB = FloatArray(3)
     private val vectorGlb = VectorGlbRenderer(context)
     internal val vectorGlbReady: Boolean get() = vectorGlb.ready
+    internal val droneTextureUploadCount: Int get() = vectorGlb.textureUploadCount
+    private var boundMapEglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private val droneRotorSpins = Array(SwarmPalette.MAX_SWARM_DRONES) { RotorSpinState() }
     private var droneOccludedBlend = 0f
     private var shaderClockSec = 0f
@@ -592,11 +596,17 @@ class GlPointCloudMapView(
     private var loopRunning = false
     private var lastAnimationNs = 0L
 
+    @Volatile var isGlSurfacePaused: Boolean = false
+        private set
+
     @Volatile private var resetFrameClock = true
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!loopRunning) return
-            if (framePacer.due(frameTimeNanos, if (hub.perfMode == 2) 30 else 60) && renderPending.request()) {
+            if (!isGlSurfacePaused &&
+                framePacer.due(frameTimeNanos, if (hub.perfMode == 2) 30 else 60) &&
+                renderPending.request()
+            ) {
                 requestRender()
             }
             if (hudPacer.due(frameTimeNanos, if (hub.perfMode == 2) 7 else 10)) {
@@ -708,44 +718,10 @@ class GlPointCloudMapView(
 
     init {
         setEGLContextClientVersion(2)
-        setEGLConfigChooser(MsaaFallbackConfigChooser())
+        setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         preserveEGLContextOnPause = true
         setRenderer(this)
         renderMode = RENDERMODE_WHEN_DIRTY
-    }
-
-    private class MsaaFallbackConfigChooser : EGLConfigChooser {
-        override fun chooseConfig(egl: EGL10, display: EGLDisplay): EGLConfig {
-            val count = IntArray(1)
-            val configs = arrayOfNulls<EGLConfig>(1)
-            val msaaSpec = intArrayOf(
-                EGL10.EGL_RED_SIZE, 8,
-                EGL10.EGL_GREEN_SIZE, 8,
-                EGL10.EGL_BLUE_SIZE, 8,
-                EGL10.EGL_ALPHA_SIZE, 8,
-                EGL10.EGL_DEPTH_SIZE, 16,
-                EGL10.EGL_RENDERABLE_TYPE, 4,
-                EGL10.EGL_SAMPLE_BUFFERS, 1,
-                EGL10.EGL_SAMPLES, 4,
-                EGL10.EGL_NONE
-            )
-            if (egl.eglChooseConfig(display, msaaSpec, configs, 1, count) && count[0] > 0 && configs[0] != null) {
-                return requireNotNull(configs[0])
-            }
-            val stdSpec = intArrayOf(
-                EGL10.EGL_RED_SIZE, 8,
-                EGL10.EGL_GREEN_SIZE, 8,
-                EGL10.EGL_BLUE_SIZE, 8,
-                EGL10.EGL_ALPHA_SIZE, 8,
-                EGL10.EGL_DEPTH_SIZE, 16,
-                EGL10.EGL_RENDERABLE_TYPE, 4,
-                EGL10.EGL_NONE
-            )
-            check(egl.eglChooseConfig(display, stdSpec, configs, 1, count) && count[0] > 0 && configs[0] != null) {
-                "No compatible GLES 2.0 EGLConfig found"
-            }
-            return requireNotNull(configs[0])
-        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -759,13 +735,41 @@ class GlPointCloudMapView(
         return true
     }
 
+    /**
+     * Pauses or resumes the OpenGL surface rendering thread (`GLSurfaceView.onPause`/`onResume`)
+     * while honoring [preserveEGLContextOnPause] = `true` and keeping the 10Hz HUD/Telemetry
+     * `Choreographer` tick active when obscured by full-screen overlays (such as the Full-Screen
+     * Telemetry Dashboard or Settings Modal).
+     */
+    fun setGlSurfacePaused(paused: Boolean) {
+        if (isGlSurfacePaused == paused) return
+        isGlSurfacePaused = paused
+        if (paused) {
+            if (loopRunning) {
+                super.onPause()
+            }
+            renderPending.complete()
+        } else {
+            resetFrameClock = true
+            framePacer.reset()
+            if (loopRunning) {
+                super.onResume()
+                if (renderPending.request()) {
+                    requestRender()
+                }
+            }
+        }
+    }
+
     fun startLoop() {
         if (loopRunning) return
         loopRunning = true
         resetFrameClock = true
         framePacer.reset()
         hudPacer.reset()
-        onResume()
+        if (!isGlSurfacePaused) {
+            super.onResume()
+        }
         Choreographer.getInstance().postFrameCallback(frameCallback)
     }
 
@@ -773,7 +777,9 @@ class GlPointCloudMapView(
         if (!loopRunning) return
         loopRunning = false
         Choreographer.getInstance().removeFrameCallback(frameCallback)
-        onPause()
+        if (!isGlSurfacePaused) {
+            super.onPause()
+        }
         renderPending.complete()
     }
 
@@ -937,11 +943,71 @@ class GlPointCloudMapView(
         return uiGroundOut2
     }
 
+    private fun isMapContextResident(ctx: EGLContext): Boolean {
+        if (ctx == EGL14.EGL_NO_CONTEXT || ctx != boundMapEglContext) return false
+        if (progSky == 0 || progCloud == 0 || progPrim == 0 || progCutaway == 0 || progOccluded == 0) return false
+        if (vboCloudId == 0 || vboSolidTriId == 0 || vboStaticGridId == 0) return false
+        return GLES20.glIsProgram(progSky) &&
+            GLES20.glIsProgram(progCloud) &&
+            GLES20.glIsProgram(progPrim) &&
+            GLES20.glIsProgram(progCutaway) &&
+            GLES20.glIsProgram(progOccluded) &&
+            GLES20.glIsBuffer(vboCloudId) &&
+            GLES20.glIsBuffer(vboSolidTriId) &&
+            GLES20.glIsBuffer(vboStaticGridId) &&
+            vectorGlb.isContextResident(ctx)
+    }
+
+    private fun deleteCurrentMapGlObjects() {
+        val programs = intArrayOf(progSky, progCloud, progPrim, progCutaway, progOccluded)
+        for (p in programs) {
+            if (p != 0 && GLES20.glIsProgram(p)) {
+                GLES20.glDeleteProgram(p)
+            }
+        }
+        progSky = 0
+        progCloud = 0
+        progPrim = 0
+        progCutaway = 0
+        progOccluded = 0
+
+        val vbos = intArrayOf(
+            vboCloudId, vboGroundLineId, vboSolidTriId, vboSolidEdgeId,
+            vboGlassTriId, vboGlassEdgeId, vboFxTriId, vboActorLineId,
+            vboActorTriId, vboStaticGridId
+        )
+        for (b in vbos) {
+            if (b != 0 && GLES20.glIsBuffer(b)) {
+                GLES20.glDeleteBuffers(1, intArrayOf(b), 0)
+            }
+        }
+        vboCloudId = 0
+        vboGroundLineId = 0
+        vboSolidTriId = 0
+        vboSolidEdgeId = 0
+        vboGlassTriId = 0
+        vboGlassEdgeId = 0
+        vboFxTriId = 0
+        vboActorLineId = 0
+        vboActorTriId = 0
+        vboStaticGridId = 0
+    }
+
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.038f, 0.048f, 0.065f, 1.0f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthFunc(GLES20.GL_LEQUAL)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+        val currentCtx = EGL14.eglGetCurrentContext()
+        if (isMapContextResident(currentCtx)) {
+            resetFrameClock = true
+            return
+        }
+        if (currentCtx != EGL14.EGL_NO_CONTEXT && currentCtx == boundMapEglContext) {
+            deleteCurrentMapGlObjects()
+        }
+        boundMapEglContext = EGL14.EGL_NO_CONTEXT
 
         progSky = buildProgram(SKY_VS, SKY_FS)
         aSkyPos = GLES20.glGetAttribLocation(progSky, "aNdcPos")
@@ -1048,6 +1114,7 @@ class GlPointCloudMapView(
         voxelMap.notifyGlContextRecreated()
         gridKey.invalidate()
         voxelKey.invalidate()
+        boundMapEglContext = currentCtx
         resetFrameClock = true
     }
 
@@ -1952,7 +2019,7 @@ class GlPointCloudMapView(
             drawQuadrotor3D(
                 snap.uavX, snap.uavY, snap.uavZ * zScale,
                 snap.yaw, snap.smoothRoll * b, snap.smoothPitch * b,
-                snap.armed, zScale, b,
+                snap.armed, b,
                 armR = 0.88f, armG = 0.92f, armB = 0.98f,
                 isSelectedFocus = false,
                 isTiltRig = snap.activeIsTiltRig,
@@ -2286,7 +2353,7 @@ class GlPointCloudMapView(
             drawQuadrotor3D(
                 ag.uavX, ag.uavY, ag.uavZ * zScale,
                 ag.yaw, ag.smoothRoll * blend, ag.smoothPitch * blend,
-                ag.armed, zScale, blend,
+                ag.armed, blend,
                 armR = 0.35f + col[0] * 0.65f,
                 armG = 0.35f + col[1] * 0.65f,
                 armB = 0.35f + col[2] * 0.65f,
@@ -2426,7 +2493,6 @@ class GlPointCloudMapView(
         roll: Float,
         pitch: Float,
         armed: Boolean,
-        zScale: Float,
         blend: Float,
         armR: Float,
         armG: Float,

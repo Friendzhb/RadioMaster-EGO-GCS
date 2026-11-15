@@ -58,7 +58,8 @@ class GcsSettingsModal(
     private val onClearMapAndTrail: () -> Unit,
     private val onFactoryResetApplied: () -> Unit,
     private val onShowToast: (String) -> Unit,
-    private val onTiltConfigChanged: () -> Unit = {}
+    private val onTiltConfigChanged: () -> Unit = {},
+    private val onVisibilityChanged: (Boolean) -> Unit = {}
 ) {
 
     private val readSnapshot = RenderSnapshot()
@@ -524,6 +525,7 @@ class GcsSettingsModal(
         if (show && activeCategory in catPages.indices) {
             AnimHelper.animateStaggeredChildren(catPages[activeCategory], d)
         }
+        onVisibilityChanged(show)
     }
 
     fun syncAllControlsFromHub() {

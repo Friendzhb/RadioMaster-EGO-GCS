@@ -12,5 +12,11 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
+buildCache {
+    local {
+        isEnabled = true
+    }
+}
+
 rootProject.name = "RadioMasterEgoNativeGCS"
 include(":app")

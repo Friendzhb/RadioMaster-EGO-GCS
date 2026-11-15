@@ -135,12 +135,73 @@ class VectorGlbRenderTest {
                 screenshot.recycle()
             }
             val beforeResume = requireNotNull(map).renderMetrics.frames
+            assertEquals(1, requireNotNull(map).droneTextureUploadCount)
+            assertEquals(1, requireNotNull(hud).textureUploadCount)
+            assertTrue("Main map must enable preserveEGLContextOnPause", requireNotNull(map).preserveEGLContextOnPause)
+            assertTrue("Attitude HUD must enable preserveEGLContextOnPause", requireNotNull(hud).preserveEGLContextOnPause)
+
+            // Switch between Main Map and Telemetry Dashboard (both split-view and full-screen)
+            repeat(2) {
+                scenario.onActivity { activity ->
+                    fun findByDesc(view: View, desc: String): View? {
+                        if (view.contentDescription == desc) return view
+                        if (view is ViewGroup) {
+                            for (i in 0 until view.childCount) findByDesc(view.getChildAt(i), desc)?.let { return it }
+                        }
+                        return null
+                    }
+                    val telemetryBtn = findByDesc(activity.window.decorView, "遥测仪表盘")
+                    assertNotNull(telemetryBtn)
+                    telemetryBtn!!.performClick()
+                }
+                Thread.sleep(150)
+                scenario.onActivity { activity ->
+                    fun findByDesc(view: View, desc: String): View? {
+                        if (view.contentDescription == desc) return view
+                        if (view is ViewGroup) {
+                            for (i in 0 until view.childCount) findByDesc(view.getChildAt(i), desc)?.let { return it }
+                        }
+                        return null
+                    }
+                    val fullBtn = findByDesc(activity.window.decorView, "全屏遥测仪表盘")
+                    assertNotNull(fullBtn)
+                    if (!requireNotNull(map).isGlSurfacePaused) {
+                        fullBtn!!.performClick()
+                    }
+                }
+                assertTrue("Full-screen telemetry dashboard should pause map GL surface", requireNotNull(map).isGlSurfacePaused)
+                Thread.sleep(150)
+                scenario.onActivity { activity ->
+                    fun findByDesc(view: View, desc: String): View? {
+                        if (view.contentDescription == desc) return view
+                        if (view is ViewGroup) {
+                            for (i in 0 until view.childCount) findByDesc(view.getChildAt(i), desc)?.let { return it }
+                        }
+                        return null
+                    }
+                    val returnBtn = findByDesc(activity.window.decorView, "返回三维地图")
+                    assertNotNull(returnBtn)
+                    returnBtn!!.performClick()
+                }
+                val switchDeadline = System.currentTimeMillis() + 10_000
+                while ((hud?.vectorGlbReady != true || requireNotNull(map).isGlSurfacePaused) &&
+                    System.currentTimeMillis() < switchDeadline
+                ) {
+                    Thread.sleep(50)
+                }
+                assertFalse("Returning to main map must resume map GL surface", requireNotNull(map).isGlSurfacePaused)
+                assertTrue("Returning to main map must keep Attitude HUD 3D model ready", hud?.vectorGlbReady == true)
+                assertEquals("3D map drone textures must not reload on telemetry switch", 1, requireNotNull(map).droneTextureUploadCount)
+                assertEquals("3D HUD drone textures must not reload on telemetry switch", 1, requireNotNull(hud).textureUploadCount)
+            }
+
             scenario.moveToState(Lifecycle.State.CREATED)
             scenario.moveToState(Lifecycle.State.RESUMED)
             val resumeDeadline = System.currentTimeMillis() + 30_000
             while ((hud?.vectorGlbReady != true || requireNotNull(map).renderMetrics.frames <= beforeResume) && System.currentTimeMillis() < resumeDeadline) Thread.sleep(100)
             assertTrue("Attitude HUD should recover after background and resume", hud?.vectorGlbReady == true)
-            assertTrue("Main map should continue drawing after the HUD context is recreated", requireNotNull(map).renderMetrics.frames > beforeResume)
+            assertTrue("Main map should continue drawing after resume", requireNotNull(map).renderMetrics.frames > beforeResume)
+            assertEquals("Preserved EGLContext must avoid reloading HUD drone texture", 1, requireNotNull(hud).textureUploadCount)
             val glError = AtomicInteger(-1)
             val checked = CountDownLatch(1)
             scenario.onActivity {
@@ -153,6 +214,29 @@ class VectorGlbRenderTest {
             assertTrue("Main map GL thread should respond", checked.await(15, TimeUnit.SECONDS))
             assertEquals(GLES20.GL_NO_ERROR, glError.get())
         }
+    }
+
+    @Test fun preservedEglContextSkipsDroneTextureReloadOnSurfaceRecreate() {
+        val instrument = InstrumentationRegistry.getInstrumentation()
+        lateinit var map: GlPointCloudMapView
+        instrument.runOnMainSync {
+            map = GlPointCloudMapView(instrument.targetContext, GcsSharedHub(), FastLioVoxelMap(), {}, { false }, { _, _ -> }, { _, _ -> }, { _, _ -> })
+        }
+        assertTrue(map.preserveEGLContextOnPause)
+        EglBuffer().use {
+            map.onSurfaceCreated(null, null)
+            map.onSurfaceChanged(null, 320, 240)
+            map.onDrawFrame(null)
+            assertEquals(1, map.droneTextureUploadCount)
+
+            // Simulate preserved-EGLContext surface recreation: zero shader/VBO/texture reload
+            map.onSurfaceCreated(null, null)
+            map.onSurfaceChanged(null, 320, 240)
+            map.onDrawFrame(null)
+            assertEquals(1, map.droneTextureUploadCount)
+            assertEquals(GLES20.GL_NO_ERROR, GLES20.glGetError())
+        }
+        instrument.runOnMainSync { map.onPause() }
     }
 
     private class EglBuffer : AutoCloseable {
