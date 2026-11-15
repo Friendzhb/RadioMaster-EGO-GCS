@@ -37,8 +37,10 @@ internal object VectorUavMeshBuilder {
     private const val QUAD_MOTOR_XY = 0.13306f
     private const val QUAD_MOTOR_Z = 0.054f
 
-    private const val DECIMATE_THRESHOLD_VERTS = 4800
-    private const val CLUSTER_GRID = 88
+    private const val TARGET_GLB_MESH_VERTS = 84_000
+    private const val HARD_MAX_GLB_MESH_VERTS = 138_000
+    private const val MIN_CLUSTER_GRID = 4
+    private const val MAX_CLUSTER_GRID = 120
 
     private fun isIdentityMat4(m: FloatArray): Boolean {
         if (m.size < 16) return false
@@ -367,17 +369,22 @@ internal object VectorUavMeshBuilder {
             )
         }
 
+        val (partTargets, partMaxCaps) = allocatePartBudgets(parsed.parts)
         val clusterMap = IntHashTable(32_768)
-        for (part in parsed.parts) {
+        val triSet = LongHashSet(32_768)
+        for (idx in parsed.parts.indices) {
+            val part = parsed.parts[idx]
+            val targetVerts = partTargets[idx]
+            val maxVerts = partMaxCaps[idx]
             val startVert = collector.vertexCount
             val rIdx = detectRotorIndex(part.name)
-            if (part.vertexCount > DECIMATE_THRESHOLD_VERTS) {
-                decimatePart(bin, part, collector, clusterMap)
+            if (part.vertexCount > maxVerts) {
+                decimatePart(bin, part, collector, clusterMap, triSet, targetVerts, maxVerts)
                 if (collector.vertexCount == startVert) {
-                    copyPartRaw(bin, part, collector)
+                    copyPartCapped(bin, part, collector, maxVerts)
                 }
             } else {
-                copyPartRaw(bin, part, collector)
+                copyPartCapped(bin, part, collector, maxVerts)
             }
             val count = collector.vertexCount - startVert
             if (count > 0) {
@@ -473,32 +480,139 @@ internal object VectorUavMeshBuilder {
         return out
     }
 
-    private fun copyPartRaw(bin: ByteBuffer, part: VectorGlbAsset.Part, out: FloatCollector) {
+    /**
+     * Allocates per-part `(targetVertices, maxVertices)` budgets across all GLB parts using water-filling
+     * proportional to `sqrt(part.vertexCount)`. Guarantees `sum(maxVertices) <= HARD_MAX_GLB_MESH_VERTS`
+     * while preserving small hardware parts losslessly and giving complex CAD parts crisp resolution.
+     */
+    private fun allocatePartBudgets(parts: List<VectorGlbAsset.Part>): Pair<IntArray, IntArray> {
+        val n = parts.size
+        if (n == 0) return IntArray(0) to IntArray(0)
+        val targets = IntArray(n)
+        val maxCaps = IntArray(n)
+        val totalRaw = parts.sumOf { it.vertexCount.toLong() }
+        if (totalRaw <= TARGET_GLB_MESH_VERTS.toLong()) {
+            for (i in 0 until n) {
+                targets[i] = parts[i].vertexCount
+                maxCaps[i] = parts[i].vertexCount
+            }
+            return targets to maxCaps
+        }
+
+        val weights = DoubleArray(n) { i -> sqrt(max(1, parts[i].vertexCount).toDouble()) }
+        val locked = BooleanArray(n)
+        var remTarget = TARGET_GLB_MESH_VERTS
+        var remMax = HARD_MAX_GLB_MESH_VERTS
+
+        for (pass in 0 until 3) {
+            var weightSum = 0.0
+            var unlockedCount = 0
+            for (i in 0 until n) {
+                if (!locked[i]) {
+                    weightSum += weights[i]
+                    unlockedCount++
+                }
+            }
+            if (unlockedCount == 0 || weightSum <= 0.0) break
+            var newlyLocked = false
+            for (i in 0 until n) {
+                if (locked[i]) continue
+                val shareTarget = ((remTarget.toDouble() * weights[i] / weightSum).toInt() / 3) * 3
+                if (parts[i].vertexCount <= shareTarget && remMax - parts[i].vertexCount >= (unlockedCount - 1) * 3) {
+                    locked[i] = true
+                    targets[i] = parts[i].vertexCount
+                    maxCaps[i] = parts[i].vertexCount
+                    remTarget = max(0, remTarget - parts[i].vertexCount)
+                    remMax = max(0, remMax - parts[i].vertexCount)
+                    newlyLocked = true
+                }
+            }
+            if (!newlyLocked) break
+        }
+
+        var weightSum = 0.0
+        for (i in 0 until n) {
+            if (!locked[i]) weightSum += weights[i]
+        }
+        if (weightSum > 0.0) {
+            for (i in 0 until n) {
+                if (locked[i]) continue
+                val rawMax = ((remMax.toDouble() * weights[i] / weightSum).toInt() / 3) * 3
+                val safeMax = max(3, min(parts[i].vertexCount, rawMax))
+                val rawTarget = ((remTarget.toDouble() * weights[i] / weightSum).toInt() / 3) * 3
+                maxCaps[i] = safeMax
+                targets[i] = rawTarget.coerceIn(3, safeMax)
+            }
+        }
+        return targets to maxCaps
+    }
+
+    private fun copyPartCapped(
+        bin: ByteBuffer,
+        part: VectorGlbAsset.Part,
+        out: FloatCollector,
+        maxVerts: Int
+    ) {
         val pBase = part.positionOffset
         val nBase = part.normalOffset
-        for (i in 0 until part.vertexCount) {
-            val po = pBase + i * 12
-            val no = nBase + i * 12
-            out.pushVertexUnit(
-                bin.getFloat(po),
-                bin.getFloat(po + 4),
-                bin.getFloat(po + 8),
-                bin.getFloat(no),
-                bin.getFloat(no + 4),
-                bin.getFloat(no + 8)
-            )
+        val totalTris = part.vertexCount / 3
+        val capTris = max(1, maxVerts / 3)
+        if (totalTris <= capTris) {
+            for (i in 0 until totalTris * 3) {
+                val po = pBase + i * 12
+                val no = nBase + i * 12
+                out.pushVertexUnit(
+                    bin.getFloat(po),
+                    bin.getFloat(po + 4),
+                    bin.getFloat(po + 8),
+                    bin.getFloat(no),
+                    bin.getFloat(no + 4),
+                    bin.getFloat(no + 8)
+                )
+            }
+        } else {
+            for (k in 0 until capTris) {
+                val triIdx = ((k.toLong() * totalTris) / capTris).toInt()
+                val baseVert = triIdx * 3
+                for (v in 0..2) {
+                    val idx = baseVert + v
+                    val po = pBase + idx * 12
+                    val no = nBase + idx * 12
+                    out.pushVertexUnit(
+                        bin.getFloat(po),
+                        bin.getFloat(po + 4),
+                        bin.getFloat(po + 8),
+                        bin.getFloat(no),
+                        bin.getFloat(no + 4),
+                        bin.getFloat(no + 8)
+                    )
+                }
+            }
         }
     }
+
+    private class ClusterPassResult(
+        val sumFloats: FloatArray,
+        val counts: IntArray,
+        val clusterCount: Int,
+        val uniqueTris: IntArray,
+        val uniqueTriCount: Int
+    )
 
     private fun decimatePart(
         bin: ByteBuffer,
         part: VectorGlbAsset.Part,
         out: FloatCollector,
-        map: IntHashTable
+        map: IntHashTable,
+        triSet: LongHashSet,
+        targetVerts: Int,
+        maxVerts: Int
     ) {
         val pBase = part.positionOffset
         val nBase = part.normalOffset
         val vCount = part.vertexCount
+        if (vCount < 3 || maxVerts < 3) return
+
         var minX = Float.POSITIVE_INFINITY
         var minY = Float.POSITIVE_INFINITY
         var minZ = Float.POSITIVE_INFINITY
@@ -519,92 +633,211 @@ internal object VectorUavMeshBuilder {
             if (z > maxZ) maxZ = z
         }
 
-        val scaleX = (CLUSTER_GRID - 1) / max(1e-5f, maxX - minX)
-        val scaleY = (CLUSTER_GRID - 1) / max(1e-5f, maxY - minY)
-        val scaleZ = (CLUSTER_GRID - 1) / max(1e-5f, maxZ - minZ)
-
-        map.clear()
-        var accCap = 4096
-        var sumFloats = FloatArray(accCap * 6)
-        var counts = IntArray(accCap)
-        var clusterCount = 0
-
-        fun clusterOf(vIdx: Int): Int {
-            val po = pBase + vIdx * 12
-            val no = nBase + vIdx * 12
-            val px = bin.getFloat(po)
-            val py = bin.getFloat(po + 4)
-            val pz = bin.getFloat(po + 8)
-            val nx = bin.getFloat(no)
-            val ny = bin.getFloat(no + 4)
-            val nz = bin.getFloat(no + 8)
-            val gx = ((px - minX) * scaleX).toInt().coerceIn(0, CLUSTER_GRID - 1)
-            val gy = ((py - minY) * scaleY).toInt().coerceIn(0, CLUSTER_GRID - 1)
-            val gz = ((pz - minZ) * scaleZ).toInt().coerceIn(0, CLUSTER_GRID - 1)
-            val oct = (if (nx >= 0f) 1 else 0) or (if (ny >= 0f) 2 else 0) or (if (nz >= 0f) 4 else 0)
-            val key = (((gx * CLUSTER_GRID + gy) * CLUSTER_GRID + gz) shl 3) or oct
-            var cid = map.get(key)
-            if (cid < 0) {
-                cid = clusterCount++
-                map.put(key, cid)
-                if (cid >= accCap) {
-                    accCap *= 2
-                    sumFloats = sumFloats.copyOf(accCap * 6)
-                    counts = counts.copyOf(accCap)
-                }
-            }
-            val b = cid * 6
-            sumFloats[b] += px
-            sumFloats[b + 1] += py
-            sumFloats[b + 2] += pz
-            sumFloats[b + 3] += nx
-            sumFloats[b + 4] += ny
-            sumFloats[b + 5] += nz
-            counts[cid]++
-            return cid
-        }
+        val dx = max(1e-5f, maxX - minX)
+        val dy = max(1e-5f, maxY - minY)
+        val dz = max(1e-5f, maxZ - minZ)
+        val maxSpan = max(dx, max(dy, dz))
+        val rx = sqrt((dx / maxSpan).toDouble()).toFloat().coerceIn(0.42f, 1.0f)
+        val ry = sqrt((dy / maxSpan).toDouble()).toFloat().coerceIn(0.42f, 1.0f)
+        val rz = sqrt((dz / maxSpan).toDouble()).toFloat().coerceIn(0.42f, 1.0f)
 
         val triClusters = IntArray(vCount)
-        for (i in 0 until vCount) {
-            triClusters[i] = clusterOf(i)
+
+        fun runPass(gridRes: Int): ClusterPassResult {
+            val gxCells = max(MIN_CLUSTER_GRID, (gridRes * rx).toInt().coerceAtMost(127))
+            val gyCells = max(MIN_CLUSTER_GRID, (gridRes * ry).toInt().coerceAtMost(127))
+            val gzCells = max(MIN_CLUSTER_GRID, (gridRes * rz).toInt().coerceAtMost(127))
+            val scaleX = (gxCells - 1) / dx
+            val scaleY = (gyCells - 1) / dy
+            val scaleZ = (gzCells - 1) / dz
+
+            map.clear()
+            triSet.clear()
+            var accCap = 4096
+            var sumFloats = FloatArray(accCap * 6)
+            var counts = IntArray(accCap)
+            var clusterCount = 0
+
+            for (i in 0 until vCount) {
+                val po = pBase + i * 12
+                val no = nBase + i * 12
+                val px = bin.getFloat(po)
+                val py = bin.getFloat(po + 4)
+                val pz = bin.getFloat(po + 8)
+                val nx = bin.getFloat(no)
+                val ny = bin.getFloat(no + 4)
+                val nz = bin.getFloat(no + 8)
+                val gx = ((px - minX) * scaleX).toInt().coerceIn(0, gxCells - 1)
+                val gy = ((py - minY) * scaleY).toInt().coerceIn(0, gyCells - 1)
+                val gz = ((pz - minZ) * scaleZ).toInt().coerceIn(0, gzCells - 1)
+                val oct = (if (nx >= 0f) 1 else 0) or (if (ny >= 0f) 2 else 0) or (if (nz >= 0f) 4 else 0)
+                val key = (((((gx shl 7) or gy) shl 7) or gz) shl 3) or oct
+                var cid = map.get(key)
+                if (cid < 0) {
+                    cid = clusterCount++
+                    map.put(key, cid)
+                    if (cid >= accCap) {
+                        accCap *= 2
+                        sumFloats = sumFloats.copyOf(accCap * 6)
+                        counts = counts.copyOf(accCap)
+                    }
+                }
+                val b = cid * 6
+                sumFloats[b] += px
+                sumFloats[b + 1] += py
+                sumFloats[b + 2] += pz
+                sumFloats[b + 3] += nx
+                sumFloats[b + 4] += ny
+                sumFloats[b + 5] += nz
+                counts[cid]++
+                triClusters[i] = cid
+            }
+
+            var triCap = max(1024, min(vCount / 3, targetVerts))
+            var uniqueTris = IntArray(triCap * 3)
+            var uniqueTriCount = 0
+            var t = 0
+            while (t + 2 < vCount) {
+                val c0 = triClusters[t]
+                val c1 = triClusters[t + 1]
+                val c2 = triClusters[t + 2]
+                if (c0 != c1 && c1 != c2 && c2 != c0) {
+                    val a: Int
+                    val b: Int
+                    val c: Int
+                    if (c0 < c1 && c0 < c2) {
+                        a = c0
+                        b = c1
+                        c = c2
+                    } else if (c1 < c2) {
+                        a = c1
+                        b = c2
+                        c = c0
+                    } else {
+                        a = c2
+                        b = c0
+                        c = c1
+                    }
+                    val triKey = ((a.toLong() and 0x1FFFFFL) shl 42) or
+                        ((b.toLong() and 0x1FFFFFL) shl 21) or
+                        (c.toLong() and 0x1FFFFFL)
+                    if (triSet.add(triKey)) {
+                        if (uniqueTriCount >= triCap) {
+                            triCap *= 2
+                            uniqueTris = uniqueTris.copyOf(triCap * 3)
+                        }
+                        val o = uniqueTriCount * 3
+                        uniqueTris[o] = c0
+                        uniqueTris[o + 1] = c1
+                        uniqueTris[o + 2] = c2
+                        uniqueTriCount++
+                    }
+                }
+                t += 3
+            }
+
+            return ClusterPassResult(sumFloats, counts, clusterCount, uniqueTris, uniqueTriCount)
         }
 
-        for (c in 0 until clusterCount) {
-            val b = c * 6
-            val invCnt = 1f / max(1, counts[c])
-            sumFloats[b] *= invCnt
-            sumFloats[b + 1] *= invCnt
-            sumFloats[b + 2] *= invCnt
-            val nx = sumFloats[b + 3]
-            val ny = sumFloats[b + 4]
-            val nz = sumFloats[b + 5]
-            val nLen = sqrt(nx * nx + ny * ny + nz * nz)
-            if (nLen > 1e-6f) {
-                val invN = 1f / nLen
-                sumFloats[b + 3] = nx * invN
-                sumFloats[b + 4] = ny * invN
-                sumFloats[b + 5] = nz * invN
+        fun emitResult(res: ClusterPassResult) {
+            val trisToTotal = res.uniqueTriCount
+            if (trisToTotal <= 0) return
+            val sumFloats = res.sumFloats
+            val counts = res.counts
+            for (c in 0 until res.clusterCount) {
+                val b = c * 6
+                val invCnt = 1f / max(1, counts[c])
+                sumFloats[b] *= invCnt
+                sumFloats[b + 1] *= invCnt
+                sumFloats[b + 2] *= invCnt
+                val nx = sumFloats[b + 3]
+                val ny = sumFloats[b + 4]
+                val nz = sumFloats[b + 5]
+                val nLen = sqrt(nx * nx + ny * ny + nz * nz)
+                if (nLen > 1e-6f) {
+                    val invN = 1f / nLen
+                    sumFloats[b + 3] = nx * invN
+                    sumFloats[b + 4] = ny * invN
+                    sumFloats[b + 5] = nz * invN
+                } else {
+                    sumFloats[b + 3] = 0f
+                    sumFloats[b + 4] = 0f
+                    sumFloats[b + 5] = 1f
+                }
+            }
+
+            val capTris = max(1, maxVerts / 3)
+            val uniqueTris = res.uniqueTris
+            if (trisToTotal <= capTris) {
+                for (tIdx in 0 until trisToTotal) {
+                    val o = tIdx * 3
+                    val b0 = uniqueTris[o] * 6
+                    val b1 = uniqueTris[o + 1] * 6
+                    val b2 = uniqueTris[o + 2] * 6
+                    out.pushVertexUnit(sumFloats[b0], sumFloats[b0 + 1], sumFloats[b0 + 2], sumFloats[b0 + 3], sumFloats[b0 + 4], sumFloats[b0 + 5])
+                    out.pushVertexUnit(sumFloats[b1], sumFloats[b1 + 1], sumFloats[b1 + 2], sumFloats[b1 + 3], sumFloats[b1 + 4], sumFloats[b1 + 5])
+                    out.pushVertexUnit(sumFloats[b2], sumFloats[b2 + 1], sumFloats[b2 + 2], sumFloats[b2 + 3], sumFloats[b2 + 4], sumFloats[b2 + 5])
+                }
             } else {
-                sumFloats[b + 3] = 0f
-                sumFloats[b + 4] = 0f
-                sumFloats[b + 5] = 1f
+                for (k in 0 until capTris) {
+                    val tIdx = ((k.toLong() * trisToTotal) / capTris).toInt()
+                    val o = tIdx * 3
+                    val b0 = uniqueTris[o] * 6
+                    val b1 = uniqueTris[o + 1] * 6
+                    val b2 = uniqueTris[o + 2] * 6
+                    out.pushVertexUnit(sumFloats[b0], sumFloats[b0 + 1], sumFloats[b0 + 2], sumFloats[b0 + 3], sumFloats[b0 + 4], sumFloats[b0 + 5])
+                    out.pushVertexUnit(sumFloats[b1], sumFloats[b1 + 1], sumFloats[b1 + 2], sumFloats[b1 + 3], sumFloats[b1 + 4], sumFloats[b1 + 5])
+                    out.pushVertexUnit(sumFloats[b2], sumFloats[b2 + 1], sumFloats[b2 + 2], sumFloats[b2 + 3], sumFloats[b2 + 4], sumFloats[b2 + 5])
+                }
             }
         }
 
-        var t = 0
-        while (t + 2 < vCount) {
-            val c0 = triClusters[t]
-            val c1 = triClusters[t + 1]
-            val c2 = triClusters[t + 2]
-            if (c0 != c1 && c1 != c2 && c2 != c0) {
-                val b0 = c0 * 6
-                val b1 = c1 * 6
-                val b2 = c2 * 6
-                out.pushVertexUnit(sumFloats[b0], sumFloats[b0 + 1], sumFloats[b0 + 2], sumFloats[b0 + 3], sumFloats[b0 + 4], sumFloats[b0 + 5])
-                out.pushVertexUnit(sumFloats[b1], sumFloats[b1 + 1], sumFloats[b1 + 2], sumFloats[b1 + 3], sumFloats[b1 + 4], sumFloats[b1 + 5])
-                out.pushVertexUnit(sumFloats[b2], sumFloats[b2 + 1], sumFloats[b2 + 2], sumFloats[b2 + 3], sumFloats[b2 + 4], sumFloats[b2 + 5])
+        val areaFactor = 2.0 * (rx * ry + ry * rz + rz * rx)
+        var gridRes = sqrt(targetVerts.toDouble() / max(1.0, 3.2 * areaFactor))
+            .toInt()
+            .coerceIn(8, MAX_CLUSTER_GRID)
+        var lowGrid = MIN_CLUSTER_GRID
+        var highGrid = MAX_CLUSTER_GRID
+        val minAcceptVerts = max(3, min((targetVerts * 0.42f).toInt(), vCount / 2))
+
+        var bestValid: ClusterPassResult? = null
+        var lastResult: ClusterPassResult? = null
+
+        for (attempt in 0 until 4) {
+            val res = runPass(gridRes)
+            lastResult = res
+            val emittedVerts = res.uniqueTriCount * 3
+            if (emittedVerts in minAcceptVerts..maxVerts) {
+                emitResult(res)
+                return
             }
-            t += 3
+            if (emittedVerts > maxVerts) {
+                highGrid = min(highGrid, gridRes - 1)
+                if (highGrid < lowGrid || gridRes <= MIN_CLUSTER_GRID) break
+                val ratio = sqrt(targetVerts.toDouble() / emittedVerts.toDouble()).coerceIn(0.35, 0.85)
+                var nextGrid = (gridRes * ratio).toInt().coerceIn(lowGrid, highGrid)
+                if (nextGrid >= gridRes) nextGrid = max(lowGrid, gridRes - 1)
+                gridRes = nextGrid
+            } else {
+                if (emittedVerts > 0 && (bestValid == null || res.uniqueTriCount > bestValid.uniqueTriCount)) {
+                    bestValid = res
+                }
+                lowGrid = max(lowGrid, gridRes + 1)
+                if (lowGrid > highGrid || gridRes >= MAX_CLUSTER_GRID) break
+                val ratio = if (emittedVerts < 3) {
+                    2.0
+                } else {
+                    sqrt(targetVerts.toDouble() / emittedVerts.toDouble()).coerceIn(1.20, 2.20)
+                }
+                var nextGrid = (gridRes * ratio).toInt().coerceIn(lowGrid, highGrid)
+                if (nextGrid <= gridRes) nextGrid = min(highGrid, gridRes + 1)
+                gridRes = nextGrid
+            }
+        }
+
+        val chosen = bestValid ?: lastResult
+        if (chosen != null) {
+            emitResult(chosen)
         }
     }
 
@@ -1675,6 +1908,56 @@ internal object VectorUavMeshBuilder {
             var h = x * -1640531527
             h = h xor (h ushr 16)
             return h
+        }
+    }
+
+    private class LongHashSet(initialCapacity: Int) {
+        private var cap = Integer.highestOneBit((initialCapacity * 2).coerceAtLeast(1024) - 1) shl 1
+        private var keys = LongArray(cap) { -1L }
+        private var used = 0
+
+        fun clear() {
+            keys.fill(-1L)
+            used = 0
+        }
+
+        fun add(key: Long): Boolean {
+            if (used * 10 >= cap * 6) rehash()
+            val mask = cap - 1
+            var idx = mix64(key) and mask
+            while (true) {
+                val k = keys[idx]
+                if (k == key) return false
+                if (k == -1L) {
+                    keys[idx] = key
+                    used++
+                    return true
+                }
+                idx = (idx + 1) and mask
+            }
+        }
+
+        private fun rehash() {
+            val oldK = keys
+            cap *= 2
+            keys = LongArray(cap) { -1L }
+            used = 0
+            val mask = cap - 1
+            for (k in oldK) {
+                if (k != -1L) {
+                    var idx = mix64(k) and mask
+                    while (keys[idx] != -1L) idx = (idx + 1) and mask
+                    keys[idx] = k
+                    used++
+                }
+            }
+        }
+
+        private fun mix64(z: Long): Int {
+            var x = (z xor (z ushr 30)) * -4658895280553007687L
+            x = (x xor (x ushr 27)) * -7723592293110705685L
+            x = x xor (x ushr 31)
+            return x.toInt()
         }
     }
 }

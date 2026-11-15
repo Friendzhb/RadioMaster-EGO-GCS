@@ -77,8 +77,8 @@ object SwarmPalette {
             return
         }
         val s = spacingMeters.coerceIn(0.8f, 5.0f)
-        var fwd = 0f
-        var left = 0f
+        val fwd: Float
+        val left: Float
 
         when (formationType.coerceIn(0, 3)) {
             0 -> { // 三角楔形 (V-Wedge)
