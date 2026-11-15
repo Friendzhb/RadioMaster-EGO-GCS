@@ -56,7 +56,11 @@ class GlPointCloudMapView(
     private val onSingleTapPreviewPin: (wx: Float, wy: Float) -> Unit,
     private val onLongPressQuickFly: (wx: Float, wy: Float) -> Unit,
     private val onFollowStateChanged: (followMode: Int, toastMsg: String?) -> Unit,
-    private val animationTimeNanos: () -> Long = System::nanoTime
+    private val animationTimeNanos: () -> Long = System::nanoTime,
+    private val onWaypointTapped: (index: Int) -> Unit = {},
+    private val onWaypointDragged: (index: Int, wx: Float, wy: Float, finished: Boolean) -> Unit = { _, _, _, _ -> },
+    private val onWaypointAltitudeDragged: (index: Int, wz: Float, finished: Boolean) -> Unit = { _, _, _ -> },
+    private val onMapVisualTick: () -> Unit = {}
 ) : GLSurfaceView(context), GLSurfaceView.Renderer {
 
     companion object {
@@ -378,25 +382,23 @@ class GlPointCloudMapView(
     @Volatile private var pinAnimScale: Float = 1.0f
     private var pinAnimator: ValueAnimator? = null
 
-    @Volatile var followMode: Int = 1
-        private set
+    @Volatile private var wpSpawnAnimIndex: Int = -1
 
-    @Volatile private var camYawDesired = 0.62f
+    @Volatile private var wpSpawnAnimScale: Float = 1.0f
+    private var wpSpawnAnimator: ValueAnimator? = null
 
-    @Volatile private var camPitchDesired = 0.55f
+    private val cameraState = LogarithmicMapInterpolator.CameraTransitionState()
+    val followMode: Int
+        get() = cameraState.followMode
 
-    @Volatile private var worldHalfSpanDesired = 6.4f
-
-    private var camYaw = 0.62f
-    private var camPitch = 0.55f
-    private var worldHalfSpan = 6.4f
-
-    @Volatile private var camPanX = 0f
-
-    @Volatile private var camPanY = 0f
+    private var camYaw = LogarithmicMapInterpolator.DEFAULT_YAW_RAD
+    private var camPitch = LogarithmicMapInterpolator.DEFAULT_PITCH_RAD
+    private var worldHalfSpan = LogarithmicMapInterpolator.DEFAULT_HALF_SPAN
     private var camFocusX = -5.5f
     private var camFocusY = -4.2f
     private var camFocusZ = 0.45f
+    private var curProjBlend = 1.0f
+    private var curUavZoomScale = 1.0f
 
     private var curEyeX = -8f
     private var curEyeY = -8f
@@ -455,14 +457,130 @@ class GlPointCloudMapView(
     private val glTmpInv16 = FloatArray(16)
     private val invVpLock = Any()
     private val sharedInvVp = FloatArray(16)
+    private val sharedVp = FloatArray(16)
+    private var sharedProjBlend = 1.0f
     private var invVpValid = false
 
     private val uiInvCopy16 = FloatArray(16)
+    private val uiVpCopy16 = FloatArray(16)
+    private val uiHitSnapshot = RenderSnapshot()
     private val uiNearIn4 = FloatArray(4)
     private val uiFarIn4 = FloatArray(4)
     private val uiNearOut4 = FloatArray(4)
     private val uiFarOut4 = FloatArray(4)
     private val uiGroundOut2 = FloatArray(2)
+    private val routeLastTipScratch = FloatArray(3)
+
+    private val routeGeometrySink = object : MissionRouteVisualizer.GeometrySink {
+        override fun pushActorTri(
+            x0: Float,
+            y0: Float,
+            z0: Float,
+            arc0: Float,
+            x1: Float,
+            y1: Float,
+            z1: Float,
+            arc1: Float,
+            x2: Float,
+            y2: Float,
+            z2: Float,
+            arc2: Float,
+            r: Float,
+            g: Float,
+            b: Float,
+            a: Float
+        ) {
+            this@GlPointCloudMapView.pushActorTri(x0, y0, z0, arc0, x1, y1, z1, arc1, x2, y2, z2, arc2, r, g, b, a)
+        }
+
+        override fun pushActorLine(
+            x0: Float,
+            y0: Float,
+            z0: Float,
+            x1: Float,
+            y1: Float,
+            z1: Float,
+            r: Float,
+            g: Float,
+            b: Float,
+            a: Float,
+            arc0: Float,
+            arc1: Float
+        ) {
+            this@GlPointCloudMapView.pushActorLine(x0, y0, z0, x1, y1, z1, r, g, b, a, arc0, arc1)
+        }
+
+        override fun pushActorQuadSeg3D(
+            x0: Float,
+            y0: Float,
+            z0: Float,
+            x1: Float,
+            y1: Float,
+            z1: Float,
+            halfW: Float,
+            r: Float,
+            g: Float,
+            b: Float,
+            a: Float,
+            arc0: Float,
+            arc1: Float
+        ) {
+            this@GlPointCloudMapView.pushActorQuadSeg3D(x0, y0, z0, x1, y1, z1, halfW, r, g, b, a, arc0, arc1)
+        }
+
+        override fun pushActorDiscXY(cx: Float, cy: Float, z: Float, rad: Float, segs: Int, r: Float, g: Float, b: Float, a: Float, arc: Float) {
+            this@GlPointCloudMapView.pushActorDiscXY(cx, cy, z, rad, segs, r, g, b, a, arc)
+        }
+
+        override fun pushActorRingXY(cx: Float, cy: Float, z: Float, rad: Float, thick: Float, segs: Int, r: Float, g: Float, b: Float, a: Float, arc: Float) {
+            this@GlPointCloudMapView.pushActorRingXY(cx, cy, z, rad, thick, segs, r, g, b, a, arc)
+        }
+
+        override fun pushGroundLine(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, r: Float, g: Float, b: Float, a: Float) {
+            this@GlPointCloudMapView.pushGroundLine(x0, y0, z0, x1, y1, z1, r, g, b, a)
+        }
+
+        override fun pushGroundDashedSeg(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, r: Float, g: Float, b: Float, a: Float) {
+            this@GlPointCloudMapView.pushGroundDashedSeg(x0, y0, z0, x1, y1, z1, r, g, b, a)
+        }
+
+        override fun pushFxRingXY(cx: Float, cy: Float, z: Float, rad: Float, thick: Float, segs: Int, r: Float, g: Float, b: Float, a: Float) {
+            this@GlPointCloudMapView.pushFxRingXY(cx, cy, z, rad, thick, segs, r, g, b, a)
+        }
+
+        override fun pushFxGradientQuad(
+            x0: Float,
+            y0: Float,
+            z0: Float,
+            r0: Float,
+            g0: Float,
+            b0: Float,
+            a0: Float,
+            x1: Float,
+            y1: Float,
+            z1: Float,
+            r1: Float,
+            g1: Float,
+            b1: Float,
+            a1: Float,
+            x2: Float,
+            y2: Float,
+            z2: Float,
+            r2: Float,
+            g2: Float,
+            b2: Float,
+            a2: Float,
+            x3: Float,
+            y3: Float,
+            z3: Float,
+            r3: Float,
+            g3: Float,
+            b3: Float,
+            a3: Float
+        ) {
+            this@GlPointCloudMapView.pushFxGradientQuad(x0, y0, z0, r0, g0, b0, a0, x1, y1, z1, r1, g1, b1, a1, x2, y2, z2, r2, g2, b2, a2, x3, y3, z3, r3, g3, b3, a3)
+        }
+    }
 
     private val rippleLock = Any()
     private val rippleX = FloatArray(6)
@@ -629,10 +747,12 @@ class GlPointCloudMapView(
         override fun doFrame(frameTimeNanos: Long) {
             if (!loopRunning) return
             if (!isGlSurfacePaused &&
-                framePacer.due(frameTimeNanos, if (hub.perfMode == 2) 30 else 60) &&
-                renderPending.request()
+                framePacer.due(frameTimeNanos, if (hub.perfMode == 2) 30 else 60)
             ) {
-                requestRender()
+                if (renderPending.request()) {
+                    requestRender()
+                }
+                onMapVisualTick()
             }
             if (hudPacer.due(frameTimeNanos, if (hub.perfMode == 2) 7 else 10)) {
                 onHudTick(hub.snapshots.readInto(uiSnapshot))
@@ -641,12 +761,43 @@ class GlPointCloudMapView(
         }
     }
 
+    @Volatile var activeAltitudeDragWpIndex: Int = -1
+        private set
+
+    @Volatile var activeGroundDragWpIndex: Int = -1
+        private set
+
+    private var gesturePannedOrScaled = false
+    private var scrollAccum2dPx = 0f
+    private var candidateDragWpIdx = -1
+    private var candidateDragIsAltitude = false
+    private var activelyDraggingWpIdx = -1
+    private var wpDownPxX = 0f
+    private var wpDownPxY = 0f
+    private var altDragWpX = 0f
+    private var altDragWpY = 0f
+    private var altDragStartZ = 1.2f
+    private var altGrabOffsetY = 0f
+    private var altLastDraggedZ = 1.2f
+    private var lastAltDetentHalfM = -1
+    private val uiHitResult = MissionRouteVisualizer.WaypointHitResult()
+
+    private fun currentPanBoundMeters(): Float = if (hub.isRosMode) 600f else 48f
+
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
-                val factor = 1.0f / detector.scaleFactor.coerceIn(0.8f, 1.25f)
-                worldHalfSpanDesired = (worldHalfSpanDesired * factor).coerceIn(2.2f, 65.0f)
+                gesturePannedOrScaled = true
+                cameraState.onPinchScale(
+                    scaleFactor = detector.scaleFactor,
+                    focusPxX = detector.focusX,
+                    focusPxY = detector.focusY,
+                    viewportW = max(1, width),
+                    viewportH = max(1, height),
+                    projBlend = projBlend,
+                    panBoundMeters = currentPanBoundMeters()
+                )
                 return true
             }
         }
@@ -658,12 +809,9 @@ class GlPointCloudMapView(
             override fun onDown(e: MotionEvent): Boolean = true
 
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+                gesturePannedOrScaled = true
                 if (e2.pointerCount >= 2) {
-                    if (followMode != 0) {
-                        val s = hub.snapshots.readInto(uiSnapshot)
-                        camPanX = s.uavX
-                        camPanY = s.uavY
-                        followMode = 0
+                    if (cameraState.enterFreePanIfNeeded()) {
                         onFollowStateChanged(0, null)
                     }
                     panCameraByScreenDelta(distanceX, distanceY)
@@ -672,25 +820,40 @@ class GlPointCloudMapView(
 
                 if (scaleDetector.isInProgress) return true
 
-                if (is3DMode && followMode != 0) {
-                    if (followMode == 2 && abs(distanceX) > abs(distanceY) * 1.4f && abs(distanceX) > 4f * density) {
-                        followMode = 1
-                        onFollowStateChanged(1, null)
+                if (is3DMode && cameraState.followMode != 0) {
+                    val switched = cameraState.orbit3D(distanceX, distanceY, density)
+                    if (switched >= 0) {
+                        onFollowStateChanged(switched, null)
                     }
-                    if (followMode == 1) {
-                        camYawDesired += distanceX * 0.0072f / density * 1.6f
-                    }
-                    camPitchDesired = (camPitchDesired + distanceY * 0.0062f / density * 1.6f).coerceIn(0.18f, 1.44f)
                 } else {
-                    if (!is3DMode && followMode != 0 && hypot(distanceX, distanceY) > 6f * density) {
-                        val s = hub.snapshots.readInto(uiSnapshot)
-                        camPanX = s.uavX
-                        camPanY = s.uavY
-                        followMode = 0
-                        onFollowStateChanged(0, null)
+                    if (!is3DMode && cameraState.followMode != 0) {
+                        scrollAccum2dPx += hypot(distanceX, distanceY)
+                        if (scrollAccum2dPx <= 6f * density) {
+                            return true
+                        }
+                        if (cameraState.enterFreePanIfNeeded()) {
+                            onFollowStateChanged(0, null)
+                        }
                     }
                     panCameraByScreenDelta(distanceX, distanceY)
                 }
+                return true
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float
+            ): Boolean {
+                if (scaleDetector.isInProgress || cameraState.followMode != 0) return false
+                cameraState.applyFlingMomentum(
+                    velocityPxX = velocityX,
+                    velocityPxY = velocityY,
+                    viewportH = max(1, height),
+                    projBlend = projBlend,
+                    panBoundMeters = currentPanBoundMeters()
+                )
                 return true
             }
 
@@ -704,6 +867,16 @@ class GlPointCloudMapView(
 
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 if (onInterceptDrawerClose()) return true
+                if (multiTouchActive || gesturePannedOrScaled || scaleDetector.isInProgress) return true
+                if (!hub.hudTouchLocked) {
+                    val pickedWp = pickWaypointAtScreenUiThread(e.x, e.y)
+                    if (pickedWp >= 0) {
+                        if (hub.hapticFeedbackEnabled) performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        triggerWaypointSpawnAnim(pickedWp, fromScale = 0.78f)
+                        onWaypointTapped(pickedWp)
+                        return true
+                    }
+                }
                 val world = unprojectToGroundUiThread(e.x, e.y) ?: return true
                 if (hub.hapticFeedbackEnabled) performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                 spawnRipple(world[0], world[1])
@@ -713,7 +886,7 @@ class GlPointCloudMapView(
             }
 
             override fun onLongPress(e: MotionEvent) {
-                if (multiTouchActive || scaleDetector.isInProgress) return
+                if (multiTouchActive || gesturePannedOrScaled || scaleDetector.isInProgress) return
                 if (onInterceptDrawerClose()) return
                 val world = unprojectToGroundUiThread(e.x, e.y) ?: return
                 if (!hub.longPressQuickFlyEnabled) {
@@ -731,14 +904,13 @@ class GlPointCloudMapView(
     )
 
     private fun panCameraByScreenDelta(distanceX: Float, distanceY: Float) {
-        val metersPerPx = (worldHalfSpan * 2.0f) / max(1f, viewportH.toFloat())
-        val effY = camYaw * projBlend
-        val cosY = cos(effY)
-        val sinY = sin(effY)
-        val dxScreen = distanceX * metersPerPx
-        val dyScreen = -distanceY * metersPerPx
-        camPanX += dxScreen * cosY - dyScreen * sinY
-        camPanY += dxScreen * sinY + dyScreen * cosY
+        cameraState.panByScreenDelta(
+            distanceX = distanceX,
+            distanceY = distanceY,
+            viewportH = max(1, height.takeIf { it > 0 } ?: viewportH),
+            projBlend = projBlend,
+            panBoundMeters = currentPanBoundMeters()
+        )
     }
 
     init {
@@ -751,13 +923,147 @@ class GlPointCloudMapView(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isGlSurfacePaused) {
+            resetWaypointTouchState()
+            return true
+        }
         when (event.actionMasked) {
-            MotionEvent.ACTION_POINTER_DOWN -> multiTouchActive = true
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> multiTouchActive = false
+            MotionEvent.ACTION_DOWN -> {
+                multiTouchActive = false
+                gesturePannedOrScaled = false
+                scrollAccum2dPx = 0f
+                activelyDraggingWpIdx = -1
+                activeAltitudeDragWpIndex = -1
+                activeGroundDragWpIndex = -1
+                wpDownPxX = event.x
+                wpDownPxY = event.y
+                if (!hub.hudTouchLocked) {
+                    val hit = pickWaypointInteractionUiThread(event.x, event.y)
+                    candidateDragWpIdx = hit.index
+                    candidateDragIsAltitude = (hit.mode == MissionRouteVisualizer.WaypointHitMode.DRAG_ALTITUDE_Z)
+                    if (hit.index >= 0) {
+                        val b = hit.index * 3
+                        altDragWpX = uiHitSnapshot.waypointQueuePts[b]
+                        altDragWpY = uiHitSnapshot.waypointQueuePts[b + 1]
+                        altDragStartZ = uiHitSnapshot.waypointQueuePts[b + 2]
+                        altLastDraggedZ = altDragStartZ
+                        altGrabOffsetY = event.y - hit.headScreenY
+                        lastAltDetentHalfM = floor(altDragStartZ * 2f).toInt()
+                    }
+                } else {
+                    candidateDragWpIdx = -1
+                    candidateDragIsAltitude = false
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                multiTouchActive = true
+                gesturePannedOrScaled = true
+                candidateDragWpIdx = -1
+                candidateDragIsAltitude = false
+                activelyDraggingWpIdx = -1
+                activeAltitudeDragWpIndex = -1
+                activeGroundDragWpIndex = -1
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (candidateDragWpIdx >= 0 && !multiTouchActive && event.pointerCount == 1) {
+                    if (activelyDraggingWpIdx < 0) {
+                        val moveDist = hypot(event.x - wpDownPxX, event.y - wpDownPxY)
+                        if (moveDist > 6.5f * density) {
+                            if (onInterceptDrawerClose()) {
+                                candidateDragWpIdx = -1
+                                candidateDragIsAltitude = false
+                            } else {
+                                activelyDraggingWpIdx = candidateDragWpIdx
+                                if (candidateDragIsAltitude) {
+                                    activeAltitudeDragWpIndex = activelyDraggingWpIdx
+                                } else {
+                                    activeGroundDragWpIndex = activelyDraggingWpIdx
+                                }
+                                gesturePannedOrScaled = true
+                                if (hub.hapticFeedbackEnabled) {
+                                    performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                }
+                            }
+                        }
+                    }
+                    if (activelyDraggingWpIdx >= 0) {
+                        if (candidateDragIsAltitude) {
+                            val newZ = solveAltitudeForTouchUiThread(event.y)
+                            altLastDraggedZ = newZ
+                            val halfStep = floor(newZ * 2f).toInt()
+                            if (halfStep != lastAltDetentHalfM) {
+                                lastAltDetentHalfM = halfStep
+                                if (hub.hapticFeedbackEnabled) {
+                                    performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                }
+                            }
+                            onWaypointAltitudeDragged(activelyDraggingWpIdx, newZ, false)
+                            if (!isGlSurfacePaused && renderPending.request()) {
+                                requestRender()
+                            }
+                            onMapVisualTick()
+                        } else {
+                            unprojectToGroundUiThread(event.x, event.y)?.let { world ->
+                                onWaypointDragged(activelyDraggingWpIdx, world[0], world[1], false)
+                                if (!isGlSurfacePaused && renderPending.request()) {
+                                    requestRender()
+                                }
+                                onMapVisualTick()
+                            }
+                        }
+                        return true
+                    }
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                resetWaypointTouchState()
+                gesturePannedOrScaled = true
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (activelyDraggingWpIdx >= 0) {
+                    val finishedIdx = activelyDraggingWpIdx
+                    val wasAltitudeDrag = candidateDragIsAltitude
+                    resetWaypointTouchState()
+                    if (wasAltitudeDrag) {
+                        val finalZ = solveAltitudeForTouchUiThread(event.y)
+                        onWaypointAltitudeDragged(finishedIdx, finalZ, true)
+                    } else {
+                        unprojectToGroundUiThread(event.x, event.y)?.let { world ->
+                            spawnRipple(world[0], world[1])
+                            onWaypointDragged(finishedIdx, world[0], world[1], true)
+                        }
+                    }
+                    if (!isGlSurfacePaused && renderPending.request()) {
+                        requestRender()
+                    }
+                    onMapVisualTick()
+                    return true
+                }
+                candidateDragWpIdx = -1
+                candidateDragIsAltitude = false
+                scaleDetector.onTouchEvent(event)
+                gestureDetector.onTouchEvent(event)
+                multiTouchActive = false
+                gesturePannedOrScaled = false
+                scrollAccum2dPx = 0f
+                return true
+            }
         }
         scaleDetector.onTouchEvent(event)
         gestureDetector.onTouchEvent(event)
         return true
+    }
+
+    private fun resetWaypointTouchState() {
+        multiTouchActive = false
+        gesturePannedOrScaled = false
+        scrollAccum2dPx = 0f
+        candidateDragWpIdx = -1
+        candidateDragIsAltitude = false
+        activelyDraggingWpIdx = -1
+        activeAltitudeDragWpIndex = -1
+        activeGroundDragWpIndex = -1
     }
 
     /**
@@ -809,6 +1115,9 @@ class GlPointCloudMapView(
     }
 
     override fun onDetachedFromWindow() {
+        pinAnimator?.cancel()
+        wpSpawnAnimator?.cancel()
+        blendAnimator?.cancel()
         stopLoop()
         super.onDetachedFromWindow()
     }
@@ -824,6 +1133,22 @@ class GlPointCloudMapView(
             duration = AnimHelper.dur(GcsMotionSpec.DurationToken.SPATIAL)
             interpolator = GcsMotionSpec.EASE_PIN_DROP
             addUpdateListener { anim -> pinAnimScale = anim.animatedValue as Float }
+            start()
+        }
+    }
+
+    fun triggerWaypointSpawnAnim(waypointIndex: Int, fromScale: Float = 0.18f) {
+        wpSpawnAnimator?.cancel()
+        wpSpawnAnimIndex = waypointIndex
+        if (GcsMotionSpec.isMinimalMotion()) {
+            wpSpawnAnimScale = 1.0f
+            return
+        }
+        wpSpawnAnimScale = fromScale
+        wpSpawnAnimator = ValueAnimator.ofFloat(fromScale, 1.0f).apply {
+            duration = AnimHelper.dur(GcsMotionSpec.DurationToken.SPATIAL)
+            interpolator = GcsMotionSpec.EASE_PIN_DROP
+            addUpdateListener { anim -> wpSpawnAnimScale = anim.animatedValue as Float }
             start()
         }
     }
@@ -846,51 +1171,25 @@ class GlPointCloudMapView(
     }
 
     fun recenterLockDrone() {
-        camPanX = 0f
-        camPanY = 0f
-        followMode = 1
+        cameraState.recenterLockDrone()
     }
 
     fun cycleFollowMode(): Pair<Int, String> {
-        followMode = when (followMode) {
-            1 -> {
-                camPanX = 0f
-                camPanY = 0f
-                camPitchDesired = 0.38f
-                2
-            }
-            2 -> {
-                val s = hub.snapshots.readInto(uiSnapshot)
-                camPanX = s.uavX
-                camPanY = s.uavY
-                0
-            }
-            else -> {
-                camPanX = 0f
-                camPanY = 0f
-                camPitchDesired = 0.55f
-                1
-            }
-        }
-        val tip = when (followMode) {
+        val nextMode = cameraState.cycleFollowMode()
+        val tip = when (nextMode) {
             2 -> "相机视角：机尾低仰角追尾透视"
             0 -> "相机视角：自由平移漫游 (双击回中)"
             else -> "相机视角：锁定飞机 · 360° 自由环视"
         }
-        return followMode to tip
+        return nextMode to tip
     }
 
     fun zoomBy(factor: Float) {
-        worldHalfSpanDesired = (worldHalfSpanDesired / factor).coerceIn(2.2f, 65.0f)
+        cameraState.zoomByFactor(factor)
     }
 
     fun resetCameraSmooth() {
-        followMode = 1
-        camYawDesired = 0.62f
-        camPitchDesired = 0.55f
-        worldHalfSpanDesired = 6.4f
-        camPanX = 0f
-        camPanY = 0f
+        cameraState.resetCameraSmooth()
         animateProjectionTo(true)
     }
 
@@ -930,6 +1229,71 @@ class GlPointCloudMapView(
 
     internal fun activeTrailPointCount(droneId: Int = 0): Int =
         flightPathTracers[droneId.coerceIn(0, SwarmPalette.MAX_SWARM_DRONES - 1)].size
+
+    fun copyProjectionState(outVp16: FloatArray): Float {
+        synchronized(invVpLock) {
+            if (!invVpValid || outVp16.size < 16) return -1f
+            System.arraycopy(sharedVp, 0, outVp16, 0, 16)
+            return sharedProjBlend
+        }
+    }
+
+    private fun pickWaypointInteractionUiThread(sx: Float, sy: Float): MissionRouteVisualizer.WaypointHitResult {
+        uiHitResult.reset()
+        val vw = max(1, width)
+        val vh = max(1, height)
+        val blendCopy: Float
+        synchronized(invVpLock) {
+            if (!invVpValid) return uiHitResult
+            System.arraycopy(sharedVp, 0, uiVpCopy16, 0, 16)
+            blendCopy = sharedProjBlend
+        }
+        val snap = hub.snapshots.readInto(uiHitSnapshot)
+        if (snap.waypointQueueCount <= 0) return uiHitResult
+        val zScale = 0.08f + 0.92f * blendCopy
+        return MissionRouteVisualizer.pickWaypointInteraction(
+            touchPxX = sx,
+            touchPxY = sy,
+            viewportW = vw,
+            viewportH = vh,
+            vpMatrix = uiVpCopy16,
+            zScale = zScale,
+            blend3D = blendCopy,
+            waypointPts = snap.waypointQueuePts,
+            waypointCount = snap.waypointQueueCount,
+            selectedWaypointIdx = snap.selectedWaypointIdx,
+            maxPickRadiusPx = 32f * density,
+            density = density,
+            outResult = uiHitResult
+        )
+    }
+
+    private fun pickWaypointAtScreenUiThread(sx: Float, sy: Float): Int =
+        pickWaypointInteractionUiThread(sx, sy).index
+
+    private fun solveAltitudeForTouchUiThread(touchY: Float): Float {
+        val vh = max(1, height)
+        val blendCopy: Float
+        synchronized(invVpLock) {
+            if (!invVpValid) return altLastDraggedZ
+            System.arraycopy(sharedVp, 0, uiVpCopy16, 0, 16)
+            blendCopy = sharedProjBlend
+        }
+        val zScale = 0.08f + 0.92f * blendCopy
+        return MissionRouteVisualizer.solveWaypointAltitudeFromScreenY(
+            touchScreenY = touchY,
+            grabOffsetScreenY = altGrabOffsetY,
+            viewportH = vh,
+            vpMatrix = uiVpCopy16,
+            zScale = zScale,
+            blend3D = blendCopy,
+            wx = altDragWpX,
+            wy = altDragWpY,
+            startAltitudeMeters = altDragStartZ,
+            downScreenY = wpDownPxY,
+            density = density
+        )
+    }
 
     private fun unprojectToGroundUiThread(sx: Float, sy: Float): FloatArray? {
         val vw = max(1, width).toFloat()
@@ -1190,8 +1554,9 @@ class GlPointCloudMapView(
             }
 
             val snap = hub.snapshots.readInto(glSnapshot)
+            val frameBlend = projBlend.coerceIn(0f, 1f)
             stepThemeAtmosphereBlend(dt)
-            updateCameraMatrices(dt, snap)
+            updateCameraMatrices(dt, snap, frameBlend)
 
             GLES20.glClearColor(curSkyFlat[0], curSkyFlat[1], curSkyFlat[2], 1.0f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
@@ -1213,7 +1578,7 @@ class GlPointCloudMapView(
             stepDroneRotorSpins(dt, snap)
             buildSceneBatches(dt, snap)
 
-            val zFlat = 0.08f + 0.92f * projBlend
+            val zFlat = 0.08f + 0.92f * curProjBlend
 
             // Pass 1: 透视地面网格与同心测距环 (开启混合，不写深度)
             GLES20.glEnable(GLES20.GL_DEPTH_TEST)
@@ -1239,7 +1604,7 @@ class GlPointCloudMapView(
                 GLES20.glUniformMatrix4fv(uCloudMvp, 1, false, vpMatrix, 0)
                 GLES20.glUniform1f(uCloudZMax, hub.zSliceMax)
                 val fovScale = (viewportH / 720f).coerceAtLeast(0.75f) * 34.0f * hub.pointSizeScale * density
-                GLES20.glUniform1f(uCloudPointScale, fovScale * (0.35f + 0.65f * projBlend))
+                GLES20.glUniform1f(uCloudPointScale, fovScale * (0.35f + 0.65f * curProjBlend))
                 GLES20.glUniform1f(uCloudZFlatten, zFlat)
                 GLES20.glUniform1i(uCloudColorMode, hub.pointColorMode)
                 GLES20.glUniform3f(uCloudEyePos, curEyeX, curEyeY, curEyeZ)
@@ -1248,7 +1613,7 @@ class GlPointCloudMapView(
                 GLES20.glUniform1f(uCloudInnerR, curCutInnerR)
                 GLES20.glUniform1f(uCloudOuterR, curCutOuterR)
                 GLES20.glUniform1f(uCloudFogSpan, worldHalfSpan * 2.2f)
-                GLES20.glUniform1i(uCloudXrayOn, if (hub.xrayOcclusionEnabled && projBlend > 0.12f) 1 else 0)
+                GLES20.glUniform1i(uCloudXrayOn, if (hub.xrayOcclusionEnabled && curProjBlend > 0.12f) 1 else 0)
                 GLES20.glUniform3f(uCloudFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
 
                 GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboCloudId)
@@ -1292,7 +1657,7 @@ class GlPointCloudMapView(
             }
 
             // Pass 5: 硬件深度逆测试 GL_GREATER 遮挡 X-Ray 增强遍 (对任何处于实体墙或透视薄壳后方的轨迹叠加双色抗锯齿流动虚线！)
-            if (hub.xrayOcclusionEnabled && projBlend > 0.12f) {
+            if (hub.xrayOcclusionEnabled && curProjBlend > 0.12f) {
                 GLES20.glDepthFunc(GLES20.GL_GREATER)
                 GLES20.glDepthMask(false)
                 drawActorBatchesOccluded(max(1.25f, 1.55f * density))
@@ -1395,7 +1760,7 @@ class GlPointCloudMapView(
         GLES20.glUseProgram(progSky)
         val horizonUvY = (0.93f - camPitch * 0.35f).coerceIn(0.40f, 0.92f)
         GLES20.glUniform1f(uSkyHorizonY, horizonUvY)
-        GLES20.glUniform1f(uSkyBlend3D, projBlend)
+        GLES20.glUniform1f(uSkyBlend3D, curProjBlend)
         GLES20.glUniform3f(uSkyFlat, curSkyFlat[0], curSkyFlat[1], curSkyFlat[2])
         GLES20.glUniform3f(uSkyZenith, curSkyZenith[0], curSkyZenith[1], curSkyZenith[2])
         GLES20.glUniform3f(uSkyHorizon, curSkyHorizon[0], curSkyHorizon[1], curSkyHorizon[2])
@@ -1410,40 +1775,32 @@ class GlPointCloudMapView(
     }
 
     fun focusWorldPointSmooth(wx: Float, wy: Float) {
-        followMode = 0
-        camPanX = wx
-        camPanY = wy
+        cameraState.focusWorldPointSmooth(wx, wy, currentPanBoundMeters())
         spawnRipple(wx, wy)
         onFollowStateChanged(0, null)
     }
 
-    private fun updateCameraMatrices(dt: Float, snap: RenderSnapshot) {
+    private fun updateCameraMatrices(dt: Float, snap: RenderSnapshot, frameBlend: Float) {
         val damp = hub.cameraDampingScale.coerceIn(0.45f, 2.0f)
-        val kRot = 1f - exp(-dt * 10.5f * damp)
-        val kZoom = 1f - exp(-dt * 13.0f * damp)
+        cameraState.stepGlFrame(
+            dt = dt,
+            uavX = snap.uavX,
+            uavY = snap.uavY,
+            uavZ = snap.uavZ,
+            uavYaw = snap.yaw,
+            projBlend = frameBlend,
+            dampingScale = damp
+        )
+        camYaw = cameraState.camYaw
+        camPitch = cameraState.camPitch
+        worldHalfSpan = cameraState.worldHalfSpan
+        camFocusX = cameraState.camFocusX
+        camFocusY = cameraState.camFocusY
+        camFocusZ = cameraState.camFocusZ
+        curProjBlend = frameBlend
+        curUavZoomScale = LogarithmicMapInterpolator.computeLogAdaptiveUavScale(worldHalfSpan)
 
-        if (followMode == 2) {
-            val chaseYaw = snap.yaw - PI.toFloat() * 0.5f
-            var diff = chaseYaw - camYaw
-            while (diff > PI.toFloat()) diff -= (PI * 2.0).toFloat()
-            while (diff < -PI.toFloat()) diff += (PI * 2.0).toFloat()
-            camYaw += diff * (1f - exp(-dt * 6.5f))
-            camYawDesired = camYaw
-        } else {
-            camYaw += (camYawDesired - camYaw) * kRot
-        }
-        camPitch += (camPitchDesired - camPitch) * kRot
-        worldHalfSpan += (worldHalfSpanDesired - worldHalfSpan) * kZoom
-
-        val b = projBlend
-        val desFX = if (followMode != 0) snap.uavX + camPanX else camPanX
-        val desFY = if (followMode != 0) snap.uavY + camPanY else camPanY
-        val desFZ = if (followMode != 0) (snap.uavZ * 0.45f) * b else 0f
-        val kPos = 1f - exp(-dt * 11.5f * damp)
-        camFocusX += (desFX - camFocusX) * kPos
-        camFocusY += (desFY - camFocusY) * kPos
-        camFocusZ += (desFZ - camFocusZ) * kPos
-
+        val b = curProjBlend
         val effYaw = camYaw * b
         val effPitch = 1.568f * (1f - b) + camPitch * b
         // 51° 自然广角透视视场，强化近大远小的三维空间纵深与视差立体感
@@ -1472,6 +1829,8 @@ class GlPointCloudMapView(
         if (Matrix.invertM(glTmpInv16, 0, vpMatrix, 0)) {
             synchronized(invVpLock) {
                 System.arraycopy(glTmpInv16, 0, sharedInvVp, 0, 16)
+                System.arraycopy(vpMatrix, 0, sharedVp, 0, 16)
+                sharedProjBlend = curProjBlend
                 invVpValid = true
             }
         }
@@ -1579,7 +1938,7 @@ class GlPointCloudMapView(
     }
 
     private fun buildSceneBatches(dt: Float, snap: RenderSnapshot) {
-        val b = projBlend
+        val b = curProjBlend
         val zScale = 0.08f + 0.92f * b
         val uavScaledZ = snap.uavZ * zScale
 
@@ -1662,21 +2021,35 @@ class GlPointCloudMapView(
         var droneBlockedThisFrame = false
         val xrayActive = (b > 0.12f && hub.xrayOcclusionEnabled)
 
-        // 前方轨迹/预览选点第二视线锚点
+        // 前方轨迹/航点/预览选点第二视线锚点
         val hasAheadTrajProbe = snap.bsplineCount > 6
         val probeIdx = ((snap.bsplineCount * 0.38f).toInt()).coerceIn(0, max(0, snap.bsplineCount - 1)) * 3
+        val hasStagedWpAnchor = !snap.hasPreviewPin && snap.isRouteStagedOnly && snap.waypointQueueCount > 0
+        val wpAnchorIdx3 = if (hasStagedWpAnchor) {
+            val targetWp = if (snap.selectedWaypointIdx in 0 until snap.waypointQueueCount) {
+                snap.selectedWaypointIdx
+            } else {
+                snap.waypointQueueCount - 1
+            }
+            targetWp * 3
+        } else {
+            0
+        }
         curAheadX = when {
             snap.hasPreviewPin -> snap.previewX
+            hasStagedWpAnchor -> snap.waypointQueuePts[wpAnchorIdx3]
             hasAheadTrajProbe -> snap.bsplinePts[probeIdx]
             else -> snap.uavX
         }
         curAheadY = when {
             snap.hasPreviewPin -> snap.previewY
+            hasStagedWpAnchor -> snap.waypointQueuePts[wpAnchorIdx3 + 1]
             hasAheadTrajProbe -> snap.bsplinePts[probeIdx + 1]
             else -> snap.uavY
         }
         curAheadZ = when {
             snap.hasPreviewPin -> snap.previewZ * zScale
+            hasStagedWpAnchor -> snap.waypointQueuePts[wpAnchorIdx3 + 2] * zScale
             hasAheadTrajProbe -> snap.bsplinePts[probeIdx + 2] * zScale
             else -> uavScaledZ
         }
@@ -1691,7 +2064,7 @@ class GlPointCloudMapView(
         curSegAheadY = curAheadY - curEyeY
         curSegAheadZ = curAheadZ - curEyeZ
         val s2Len2 = curSegAheadX * curSegAheadX + curSegAheadY * curSegAheadY + curSegAheadZ * curSegAheadZ
-        curInvAheadLen2 = if ((hasAheadTrajProbe || snap.hasPreviewPin) && s2Len2 > 0.15f) 1.0f / s2Len2 else 0f
+        curInvAheadLen2 = if ((hasAheadTrajProbe || snap.hasPreviewPin || hasStagedWpAnchor) && s2Len2 > 0.15f) 1.0f / s2Len2 else 0f
 
         // 随相机视野平滑自适应的透镜内外半径：确保整面挡视野障碍墙开出圆润开阔的观察窗，绝不留锯齿犬牙
         val spanFactor = (worldHalfSpan * 0.06f).coerceIn(0.25f, 0.85f)
@@ -1947,52 +2320,23 @@ class GlPointCloudMapView(
         val bob = sin(shaderClockSec * 3.4f) * 0.028f * b
         pushActorBeaconBox(snap.goalX, snap.goalY, gz + bob, 0.105f, 0f, 0.94f, 0.50f, 0.96f)
 
-        // 6. 连续多航点航线链
-        var lastRouteTipX = snap.uavX
-        var lastRouteTipY = snap.uavY
-        var lastRouteTipZ = uavScaledZ
-        if (snap.waypointQueueCount > 0) {
-            val isStaged = snap.isRouteStagedOnly
-            var prevX = if (isStaged) snap.uavX else snap.goalX
-            var prevY = if (isStaged) snap.uavY else snap.goalY
-            var prevZ = if (isStaged) uavScaledZ else gz
-
-            val lr = if (isStaged) 1.0f else 0.41f
-            val lg = if (isStaged) 0.78f else 0.75f
-            val lb = if (isStaged) 0.14f else 1.0f
-
-            var cumRouteArc = 0f
-            val wps = snap.waypointQueuePts
-            for (w in 0 until snap.waypointQueueCount) {
-                val wx = wps[w * 3]
-                val wy = wps[w * 3 + 1]
-                val wz = wps[w * 3 + 2] * zScale
-                val segLen = hypot(hypot(wx - prevX, wy - prevY), wz - prevZ)
-                pushActorQuadSeg3D(prevX, prevY, prevZ, wx, wy, wz, 0.030f, lr, lg, lb, 0.90f, cumRouteArc, cumRouteArc + segLen)
-                cumRouteArc += segLen
-
-                if (b > 0.05f) {
-                    pushActorLine(wx, wy, 0.01f, wx, wy, wz, lr, lg, lb, 0.75f, 0f, wz)
-                }
-                pushFxRingXY(wx, wy, 0.02f, 0.21f, 0.032f, 18, lr, lg, lb, 0.85f)
-                pushActorBeaconBox(wx, wy, wz, 0.092f, lr, lg, lb, 0.95f)
-                prevX = wx
-                prevY = wy
-                prevZ = wz
-            }
-            if (snap.routeClosedLoop && snap.waypointQueueCount >= 2) {
-                val fx = wps[0]
-                val fy = wps[1]
-                val fz = wps[2] * zScale
-                val closeLen = hypot(hypot(fx - prevX, fy - prevY), fz - prevZ)
-                pushActorLine(prevX, prevY, prevZ, fx, fy, fz, lr, lg, lb, 0.58f, cumRouteArc, cumRouteArc + closeLen)
-            }
-            if (isStaged) {
-                lastRouteTipX = prevX
-                lastRouteTipY = prevY
-                lastRouteTipZ = prevZ
-            }
-        }
+        // 6. 动态三维航点信标与规划航线连接路径 (八面体立体信标 + 垂直拉杆调高手柄 + 流动方向箭头 + 高程垂幕)
+        MissionRouteVisualizer.emitPlannedMissionRoute(
+            snap = snap,
+            zScale = zScale,
+            blend3D = b,
+            uavZoomScale = curUavZoomScale,
+            showCurtain = hub.showTrajCurtain,
+            shaderClockSec = shaderClockSec,
+            spawnAnimIdx = wpSpawnAnimIndex,
+            spawnAnimScale = wpSpawnAnimScale,
+            sink = routeGeometrySink,
+            outLastTipXYZ = routeLastTipScratch,
+            activeAltDragIdx = activeAltitudeDragWpIndex
+        )
+        val lastRouteTipX = routeLastTipScratch[0]
+        val lastRouteTipY = routeLastTipScratch[1]
+        val lastRouteTipZ = routeLastTipScratch[2]
 
         // 7. 三维选点预览光柱 (全队编队模式下同步渲染全部机位的分色几何编队落位预览柱)
         if (snap.hasPreviewPin) {
@@ -2443,15 +2787,11 @@ class GlPointCloudMapView(
         }
     }
 
-    private fun computeAdaptiveUavZoomScale(): Float = if (worldHalfSpan > 6.2f) {
-        (1.0f + (worldHalfSpan - 6.2f) * 0.048f).coerceAtMost(1.88f)
-    } else {
-        1.0f
-    }
+    private fun computeAdaptiveUavZoomScale(): Float = curUavZoomScale
 
     private fun drawVectorGlbModels(snap: RenderSnapshot, zScale: Float, occluded: Boolean) {
         if (!vectorGlb.ready) return
-        val blend = projBlend
+        val blend = curProjBlend
         val isLight = GcsTheme.of(hub.themeId).isLight
         val showVectors = blend > 0.08f
         val zoomScale = computeAdaptiveUavZoomScale()
@@ -3290,7 +3630,7 @@ class GlPointCloudMapView(
 
         val powerSave = hub.perfMode == 2
         val isLight = GcsTheme.of(hub.themeId).isLight
-        val widthZoom = 0.85f + 0.15f * computeAdaptiveUavZoomScale()
+        val widthZoom = 0.72f + 0.28f * computeAdaptiveUavZoomScale()
 
         if (swarmCnt > 1) {
             for (id in 0 until swarmCnt) {

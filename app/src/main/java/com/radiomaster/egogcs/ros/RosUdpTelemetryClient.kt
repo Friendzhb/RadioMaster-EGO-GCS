@@ -72,6 +72,7 @@ class RosUdpTelemetryClient(private val hub: GcsSharedHub, private val engine: E
                 if (generation.get() != token) return
                 socket = s
             }
+            LanNetworkBinder.bindDatagramSocketToLan(s, host)
             s.bind(InetSocketAddress(cfg.udpPort))
             if (generation.get() != token) return
             val bytes = ByteArray(UdpTelemetryAssembler.MAX_DATAGRAM + 1)

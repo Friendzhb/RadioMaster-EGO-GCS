@@ -59,6 +59,17 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         val isSafe: Boolean
     )
 
+    data class WaypointPlacementResult(
+        val index: Int,
+        val totalCount: Int,
+        val x: Float,
+        val y: Float,
+        val z: Float,
+        val routeArcMeters: Float,
+        val clearance: Float,
+        val isSafe: Boolean
+    )
+
     data class DroneGoalCmd(
         val droneId: Int,
         val gx: Float,
@@ -115,8 +126,21 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         private const val MAP_HALF = 8.0f
         private const val GRID_N = 64
         private const val GRID_CELLS = GRID_N * GRID_N
-        private const val MAX_WAYPOINT_QUEUE = 16
+        private const val MAX_WAYPOINT_QUEUE = RenderSnapshot.MAX_MISSION_WAYPOINTS
         private const val MAX_INFLATE_VOXELS = 4090
+
+        private val HAS_ANDROID_SYSTEM_CLOCK: Boolean = try {
+            SystemClock.elapsedRealtime()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+
+        private fun nowElapsedMs(): Long =
+            if (HAS_ANDROID_SYSTEM_CLOCK) SystemClock.elapsedRealtime() else System.nanoTime() / 1_000_000L
+
+        private fun nowElapsedNs(): Long =
+            if (HAS_ANDROID_SYSTEM_CLOCK) SystemClock.elapsedRealtimeNanos() else System.nanoTime()
         private val RADAR_COS_60 = FloatArray(60) { b -> cos(-PI.toFloat() + (b.toFloat() / 60f) * (PI.toFloat() * 2f)) }
         private val RADAR_SIN_60 = FloatArray(60) { b -> sin(-PI.toFloat() + (b.toFloat() / 60f) * (PI.toFloat() * 2f)) }
     }
@@ -220,6 +244,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     private val waypointQueue = ArrayDeque<FloatArray>()
     private val activeMissionBackup = ArrayList<FloatArray>()
     private var missionForwardDir = true
+    private var selectedWaypointIndex: Int = -1
 
     private val astarBuf = FloatArray(600 * 3)
     private var astarCount = 0
@@ -260,7 +285,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     private var rosCloudCounter = 0
     private var rosCloudHz = 0
     private var lastCloudScanPts = 0
-    private var lastHzTickMs = SystemClock.elapsedRealtime()
+    private var lastHzTickMs = nowElapsedMs()
 
     private var replanTimer = 0f
     private var lastTickNs = System.nanoTime()
@@ -326,6 +351,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
         }
     }
 
@@ -346,7 +372,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             return if (stagedWaypoints.isNotEmpty()) {
                 Triple(stagedWaypoints.size, true, computeStagedRouteLengthLocked())
             } else {
-                Triple(waypointQueue.size, false, 0f)
+                Triple(waypointQueue.size, false, computeActiveRouteLengthLocked())
             }
         }
     }
@@ -391,6 +417,30 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         }
     }
 
+    private fun queryColumnTopZLocked(tx: Float, ty: Float): Float {
+        var topZ = 0f
+        if (!hub.isRosMode) {
+            val horizMargin = max(0.08f, hub.obstaclesInflation * 0.55f)
+            for (i in 0 until obstacles.size) {
+                val ob = obstacles[i]
+                if (signedDistToObs(tx, ty, ob) <= horizMargin && ob.h > topZ) {
+                    topZ = ob.h
+                }
+            }
+        } else {
+            for (i in 0 until rosVoxelCount) {
+                val b = i * 3
+                val dx = rosVoxelsBuf[b] - tx
+                val dy = rosVoxelsBuf[b + 1] - ty
+                if (dx * dx + dy * dy <= 0.2025f) {
+                    val vz = rosVoxelsBuf[b + 2] + rosEstimatedVoxelHalf
+                    if (vz > topZ) topZ = vz
+                }
+            }
+        }
+        return topZ
+    }
+
     private fun computeStagedRouteLengthLocked(): Float {
         if (stagedWaypoints.isEmpty()) return 0f
         var sum = 0f
@@ -402,6 +452,31 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             px = wp[0]
             py = wp[1]
             pz = wp[2]
+        }
+        if (hub.routeLoopMode == 1 && stagedWaypoints.size >= 2) {
+            val first = stagedWaypoints.peekFirst()
+            if (first != null) {
+                sum += hypot(hypot(first[0] - px, first[1] - py), first[2] - pz)
+            }
+        }
+        return sum
+    }
+
+    private fun computeActiveRouteLengthLocked(): Float {
+        if (waypointQueue.isEmpty()) return 0f
+        var sum = hypot(hypot(goalX - uavX, goalY - uavY), goalZ - uavZ)
+        var px = goalX
+        var py = goalY
+        var pz = goalZ
+        for (wp in waypointQueue) {
+            sum += hypot(hypot(wp[0] - px, wp[1] - py), wp[2] - pz)
+            px = wp[0]
+            py = wp[1]
+            pz = wp[2]
+        }
+        if (hub.routeLoopMode == 1 && activeMissionBackup.size >= 2) {
+            val first = activeMissionBackup[0]
+            sum += hypot(hypot(first[0] - px, first[1] - py), first[2] - pz)
         }
         return sum
     }
@@ -425,8 +500,139 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         }
     }
 
+    /**
+     * Dynamically places a 3D waypoint marker directly onto the map at `(wx, wy, wz)`,
+     * connecting it to the planned (or live) mission route and selecting it for immediate inspection/editing.
+     */
+    fun placeDynamicWaypoint(wx: Float, wy: Float, wz: Float = hub.goalZ): WaypointPlacementResult {
+        synchronized(lock) {
+            val tx = if (!hub.isRosMode) wx.coerceIn(-7.6f, 7.6f) else wx
+            val ty = if (!hub.isRosMode) wy.coerceIn(-7.6f, 7.6f) else wy
+            val tz = wz.coerceIn(0.4f, 4.0f)
+            val (clr, safe) = evaluatePointClearanceLocked(tx, ty, tz)
+
+            hasPreviewPin = false
+            val targetDeque = if (stagedWaypoints.isEmpty() && waypointQueue.isNotEmpty()) {
+                waypointQueue
+            } else {
+                stagedWaypoints
+            }
+            if (targetDeque.size >= MAX_WAYPOINT_QUEUE) {
+                targetDeque.pollFirst()
+            }
+            val pt = floatArrayOf(tx, ty, tz)
+            targetDeque.addLast(pt)
+            if (targetDeque === waypointQueue && activeMissionBackup.size < MAX_WAYPOINT_QUEUE) {
+                activeMissionBackup.add(floatArrayOf(tx, ty, tz))
+            }
+            selectedWaypointIndex = targetDeque.size - 1
+            val arcLen = if (targetDeque === stagedWaypoints) {
+                computeStagedRouteLengthLocked()
+            } else {
+                computeActiveRouteLengthLocked()
+            }
+            return WaypointPlacementResult(
+                index = selectedWaypointIndex,
+                totalCount = targetDeque.size,
+                x = tx,
+                y = ty,
+                z = tz,
+                routeArcMeters = arcLen,
+                clearance = clr,
+                isSafe = safe
+            )
+        }
+    }
+
+    fun selectOrchestratedWaypoint(index: Int): WaypointNodeInfo? {
+        synchronized(lock) {
+            val targetDeque = if (stagedWaypoints.isNotEmpty()) stagedWaypoints else waypointQueue
+            if (index !in 0 until targetDeque.size) {
+                selectedWaypointIndex = -1
+                return null
+            }
+            hasPreviewPin = false
+            selectedWaypointIndex = index
+            val wp = targetDeque.elementAt(index)
+            hub.goalZ = wp[2].coerceIn(0.4f, 4.0f)
+            val (clr, safe) = evaluatePointClearanceLocked(wp[0], wp[1], wp[2])
+            return WaypointNodeInfo(index, wp[0], wp[1], wp[2], clr, safe)
+        }
+    }
+
+    fun getSelectedWaypointInfo(): Pair<Boolean, WaypointNodeInfo?> {
+        synchronized(lock) {
+            val isStaged = stagedWaypoints.isNotEmpty() || waypointQueue.isEmpty()
+            val targetDeque = if (stagedWaypoints.isNotEmpty()) stagedWaypoints else waypointQueue
+            if (selectedWaypointIndex !in 0 until targetDeque.size) {
+                selectedWaypointIndex = -1
+                return isStaged to null
+            }
+            val wp = targetDeque.elementAt(selectedWaypointIndex)
+            val (clr, safe) = evaluatePointClearanceLocked(wp[0], wp[1], wp[2])
+            return isStaged to WaypointNodeInfo(selectedWaypointIndex, wp[0], wp[1], wp[2], clr, safe)
+        }
+    }
+
+    fun updateOrchestratedWaypointXY(index: Int, wx: Float, wy: Float): WaypointNodeInfo? {
+        synchronized(lock) {
+            val targetDeque = if (stagedWaypoints.isNotEmpty()) stagedWaypoints else waypointQueue
+            if (index !in 0 until targetDeque.size) return null
+            val tx = if (!hub.isRosMode) wx.coerceIn(-7.6f, 7.6f) else wx
+            val ty = if (!hub.isRosMode) wy.coerceIn(-7.6f, 7.6f) else wy
+            hasPreviewPin = false
+            selectedWaypointIndex = index
+            var curIdx = 0
+            var updatedZ = hub.goalZ
+            for (wp in targetDeque) {
+                if (curIdx == index) {
+                    wp[0] = tx
+                    wp[1] = ty
+                    updatedZ = wp[2]
+                    break
+                }
+                curIdx++
+            }
+            val (clr, safe) = evaluatePointClearanceLocked(tx, ty, updatedZ)
+            return WaypointNodeInfo(index, tx, ty, updatedZ, clr, safe)
+        }
+    }
+
+    fun updateOrchestratedWaypointZ(index: Int, wz: Float): WaypointNodeInfo? {
+        synchronized(lock) {
+            val targetDeque = if (stagedWaypoints.isNotEmpty()) stagedWaypoints else waypointQueue
+            if (index !in 0 until targetDeque.size) return null
+            val clampedZ = wz.coerceIn(0.4f, 4.0f)
+            hasPreviewPin = false
+            selectedWaypointIndex = index
+            hub.goalZ = clampedZ
+            var curIdx = 0
+            var wx = 0f
+            var wy = 0f
+            for (wp in targetDeque) {
+                if (curIdx == index) {
+                    wx = wp[0]
+                    wy = wp[1]
+                    wp[2] = clampedZ
+                    break
+                }
+                curIdx++
+            }
+            val (clr, safe) = evaluatePointClearanceLocked(wx, wy, clampedZ)
+            return WaypointNodeInfo(index, wx, wy, clampedZ, clr, safe)
+        }
+    }
+
     fun nudgeGoalZ(delta: Float): Pair<Float, PinInspectResult?> {
         synchronized(lock) {
+            val targetDeque = if (stagedWaypoints.isNotEmpty()) stagedWaypoints else waypointQueue
+            if (!hasPreviewPin && selectedWaypointIndex in 0 until targetDeque.size) {
+                val wp = targetDeque.elementAt(selectedWaypointIndex)
+                val nextZ = (wp[2] + delta).coerceIn(0.4f, 4.0f)
+                wp[2] = nextZ
+                hub.goalZ = nextZ
+                return nextZ to null
+            }
             val nextZ = (hub.goalZ + delta).coerceIn(0.4f, 4.0f)
             hub.goalZ = nextZ
             if (hasPreviewPin) {
@@ -470,6 +676,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
             goalX = tx
             goalY = ty
             goalZ = tz
@@ -488,6 +695,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
                 stagedWaypoints.pollFirst()
             }
             stagedWaypoints.addLast(floatArrayOf(previewX, previewY, previewZ))
+            selectedWaypointIndex = stagedWaypoints.size - 1
             hasPreviewPin = false
             return Triple(true, stagedWaypoints.size, computeStagedRouteLengthLocked())
         }
@@ -497,12 +705,15 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         synchronized(lock) {
             if (stagedWaypoints.isNotEmpty()) {
                 stagedWaypoints.pollLast()
+                selectedWaypointIndex = stagedWaypoints.size - 1
                 return Triple(stagedWaypoints.size, true, computeStagedRouteLengthLocked())
             }
             if (waypointQueue.isNotEmpty()) {
                 waypointQueue.pollLast()
-                return Triple(waypointQueue.size, false, 0f)
+                selectedWaypointIndex = waypointQueue.size - 1
+                return Triple(waypointQueue.size, false, computeActiveRouteLengthLocked())
             }
+            selectedWaypointIndex = -1
             return Triple(0, false, 0f)
         }
     }
@@ -512,16 +723,26 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             if (stagedWaypoints.isEmpty()) return null
             hasPreviewPin = false
             hub.autoPatrol = false
+            hub.waypointPlacementMode = false
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
+            val sanitizedList = ArrayList<FloatArray>(stagedWaypoints.size)
             for (wp in stagedWaypoints) {
-                activeMissionBackup.add(floatArrayOf(wp[0], wp[1], wp[2]))
+                val resolved = if (!hub.isRosMode && !evaluatePointClearanceLocked(wp[0], wp[1], wp[2]).second) {
+                    findNearestSafePointLocked(wp[0], wp[1], wp[2])
+                } else {
+                    floatArrayOf(wp[0], wp[1], wp[2])
+                }
+                sanitizedList.add(resolved)
+                activeMissionBackup.add(floatArrayOf(resolved[0], resolved[1], resolved[2]))
             }
-            val first = stagedWaypoints.pollFirst() ?: return null
-            val total = 1 + stagedWaypoints.size
-            while (stagedWaypoints.isNotEmpty()) {
-                waypointQueue.addLast(stagedWaypoints.pollFirst()!!)
+            stagedWaypoints.clear()
+            val first = sanitizedList.firstOrNull() ?: return null
+            val total = sanitizedList.size
+            for (i in 1 until sanitizedList.size) {
+                waypointQueue.addLast(sanitizedList[i])
             }
             goalX = first[0]
             goalY = first[1]
@@ -589,6 +810,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             }
             val z = uavZ.coerceIn(0.4f, 4.0f)
             stagedWaypoints.addLast(floatArrayOf(uavX, uavY, z))
+            selectedWaypointIndex = stagedWaypoints.size - 1
             return Triple(true, stagedWaypoints.size, computeStagedRouteLengthLocked())
         }
     }
@@ -604,6 +826,11 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             list[newIdx] = tmp
             targetDeque.clear()
             for (item in list) targetDeque.addLast(item)
+            if (selectedWaypointIndex == index) {
+                selectedWaypointIndex = newIdx
+            } else if (selectedWaypointIndex == newIdx) {
+                selectedWaypointIndex = index
+            }
             return true
         }
     }
@@ -629,6 +856,12 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             list.removeAt(index)
             targetDeque.clear()
             for (item in list) targetDeque.addLast(item)
+            selectedWaypointIndex = when {
+                targetDeque.isEmpty() -> -1
+                selectedWaypointIndex == index -> min(index, targetDeque.size - 1)
+                selectedWaypointIndex > index -> selectedWaypointIndex - 1
+                else -> selectedWaypointIndex
+            }
             return targetDeque.size
         }
     }
@@ -711,9 +944,13 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         synchronized(lock) {
             val targetDeque = if (stagedWaypoints.isNotEmpty()) stagedWaypoints else waypointQueue
             if (targetDeque.size < 2) return false
+            val n = targetDeque.size
             val rev = targetDeque.toList().asReversed()
             targetDeque.clear()
             for (item in rev) targetDeque.addLast(item)
+            if (selectedWaypointIndex in 0 until n) {
+                selectedWaypointIndex = (n - 1) - selectedWaypointIndex
+            }
             return true
         }
     }
@@ -753,6 +990,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             stagedWaypoints.clear()
+            selectedWaypointIndex = -1
 
             val baseZ = hub.goalZ.coerceIn(0.6f, 3.5f)
             val cx = if (hub.isRosMode) uavX else 0.0f
@@ -852,6 +1090,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
             voxelMap.clear(hub.mapVoxelSize)
             rebuildOccupancyLocked(hub.obstaclesInflation)
             ensureSwarmSafeHomesAndPosesLocked()
@@ -870,6 +1109,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
             goalX = homeX
             goalY = homeY
             goalZ = hub.goalZ
@@ -886,6 +1126,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
             goalX = uavX
             goalY = uavY
             goalZ = uavZ
@@ -1046,6 +1287,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
 
             if (!hub.swarmModeEnabled) {
                 goalX = tx
@@ -1168,6 +1410,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             waypointQueue.clear()
             activeMissionBackup.clear()
             missionForwardDir = true
+            selectedWaypointIndex = -1
 
             if (!hub.swarmModeEnabled) {
                 val r = triggerReturnToHome()
@@ -1267,7 +1510,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             u.smoothRoll += (rollRad - u.smoothRoll) * 0.35f
             u.smoothPitch += (pitchRad - u.smoothPitch) * 0.35f
             u.online = true
-            u.lastRosRxMs = SystemClock.elapsedRealtime()
+            u.lastRosRxMs = nowElapsedMs()
             appendPeerTrailLocked(u, x, y, z)
         }
     }
@@ -1309,7 +1552,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         var sumX = uavX
         var sumY = uavY
         var validN = 1
-        val nowMs = SystemClock.elapsedRealtime()
+        val nowMs = nowElapsedMs()
         for (id in 1 until count) {
             val p = peerUnits[id]
             if (hub.isRosMode && (!p.online || nowMs - p.lastRosRxMs > 4500L)) continue
@@ -1653,7 +1896,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             val dtEst = 0.02f
             ax = ((lvX - vx) / dtEst).coerceIn(-12f, 12f)
             ay = ((lvY - vy) / dtEst).coerceIn(-12f, 12f)
-            hub.lastRosOdomWallMs = SystemClock.elapsedRealtime()
+            hub.lastRosOdomWallMs = nowElapsedMs()
             uavX = x
             uavY = y
             uavZ = z
@@ -1790,7 +2033,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
      * 自动无缝采纳 ELRS 2.4GHz/900MHz Backpack 转发的 MAVLink 姿态与解锁心跳。
      */
     fun onMavlinkHeartbeatFallback(mode: String, armed: Boolean) {
-        val now = SystemClock.elapsedRealtime()
+        val now = nowElapsedMs()
         if (hub.isRosMode && (now - hub.lastRosOdomWallMs) < 1500L) return
         synchronized(lock) {
             rosPx4Mode = mode
@@ -1815,7 +2058,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     }
 
     fun onMavlinkAttitudeFallback(rollFlu: Float, pitchFlu: Float, yawEnu: Float) {
-        val now = SystemClock.elapsedRealtime()
+        val now = nowElapsedMs()
         if (!hub.isRosMode || (now - hub.lastRosOdomWallMs) < 1500L) return
         synchronized(lock) {
             rosRawRoll = rollFlu.coerceIn(-1.2f, 1.2f)
@@ -1884,7 +2127,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             u.rosTiltS1 = s1Rad.coerceIn(-1.15f, 1.15f)
             u.rosTiltS2 = s2Rad.coerceIn(-1.15f, 1.15f)
             u.rosHasLiveTilt = true
-            u.lastTiltRxMs = SystemClock.elapsedRealtime()
+            u.lastTiltRxMs = nowElapsedMs()
             u.online = true
             u.lastRosRxMs = u.lastTiltRxMs
         }
@@ -1904,7 +2147,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         if (!hub.isDroneTiltRig(0)) {
             if (isActuatorFallback && m0 >= 0f) {
                 synchronized(lock) {
-                    val now = SystemClock.elapsedRealtime()
+                    val now = nowElapsedMs()
                     rosHasLiveMotorTelemetry = true
                     rosLastMotorRxMs = now
                     simMotorNorm[0] = m0.coerceIn(0f, 1f)
@@ -1918,7 +2161,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         synchronized(lock) {
             val prev1 = rosTiltS1Rad
             val prev2 = rosTiltS2Rad
-            val now = SystemClock.elapsedRealtime()
+            val now = nowElapsedMs()
             val dtSec = ((now - rosLastTiltRxMs).coerceIn(5L, 250L)) * 0.001f
             rosTiltS1Rad = s1Rad.coerceIn(-1.15f, 1.15f)
             rosTiltS2Rad = s2Rad.coerceIn(-1.15f, 1.15f)
@@ -1948,6 +2191,10 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
                 rosBatCurrentAmps = currentAmps
             }
         }
+    }
+
+    internal fun stepSingleTickForTest() {
+        safeTick()
     }
 
     private fun safeTick() {
@@ -1981,7 +2228,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
                         lastCloudScanPts = simScanCount
                     }
                 } else {
-                    val nowMs = SystemClock.elapsedRealtime()
+                    val nowMs = nowElapsedMs()
                     if (nowMs - lastHzTickMs >= 1000L) {
                         rosOdomHz = rosOdomCounter
                         rosCloudHz = rosCloudCounter
@@ -2350,7 +2597,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
     }
 
     private fun replanLocked(isNew: Boolean) {
-        val t0 = SystemClock.elapsedRealtimeNanos()
+        val t0 = nowElapsedNs()
         val distGoal = hypot(hypot(goalX - uavX, goalY - uavY), goalZ - uavZ)
         if (distGoal < 0.22f) {
             fsmState = "WAIT_TARGET"
@@ -2618,7 +2865,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             arc += hypot(hypot(bsplineBuf[b] - bsplineBuf[a], bsplineBuf[b + 1] - bsplineBuf[a + 1]), bsplineBuf[b + 2] - bsplineBuf[a + 2])
         }
         trajLen = arc
-        val elapsedMs = (SystemClock.elapsedRealtimeNanos() - t0) * 1e-6f
+        val elapsedMs = (nowElapsedNs() - t0) * 1e-6f
         solveMs = elapsedMs.coerceIn(0.18f, 4.9f)
     }
 
@@ -2758,28 +3005,49 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         var wi = 0
         if (stagedWaypoints.isNotEmpty()) {
             for (wp in stagedWaypoints) {
-                if (wi >= 16) break
+                if (wi >= RenderSnapshot.MAX_MISSION_WAYPOINTS) break
                 frame.waypointQueuePts[wi * 3] = wp[0]
                 frame.waypointQueuePts[wi * 3 + 1] = wp[1]
                 frame.waypointQueuePts[wi * 3 + 2] = wp[2]
+                val (clr, safe) = evaluatePointClearanceLocked(wp[0], wp[1], wp[2])
+                frame.waypointClearances[wi] = clr
+                frame.waypointSafeFlags[wi] = safe
+                frame.waypointColumnTopZs[wi] = queryColumnTopZLocked(wp[0], wp[1])
                 wi++
             }
             frame.waypointQueueCount = wi
+            frame.selectedWaypointIdx = if (selectedWaypointIndex in 0 until wi) selectedWaypointIndex else -1
             frame.isRouteStagedOnly = true
             frame.stagedRouteArcLen = computeStagedRouteLengthLocked()
             frame.routeClosedLoop = (hub.routeLoopMode == 1 && wi >= 2)
+            if (wi > 0) {
+                frame.routeLoopAnchorX = frame.waypointQueuePts[0]
+                frame.routeLoopAnchorY = frame.waypointQueuePts[1]
+                frame.routeLoopAnchorZ = frame.waypointQueuePts[2]
+            }
         } else {
             for (wp in waypointQueue) {
-                if (wi >= 16) break
+                if (wi >= RenderSnapshot.MAX_MISSION_WAYPOINTS) break
                 frame.waypointQueuePts[wi * 3] = wp[0]
                 frame.waypointQueuePts[wi * 3 + 1] = wp[1]
                 frame.waypointQueuePts[wi * 3 + 2] = wp[2]
+                val (clr, safe) = evaluatePointClearanceLocked(wp[0], wp[1], wp[2])
+                frame.waypointClearances[wi] = clr
+                frame.waypointSafeFlags[wi] = safe
+                frame.waypointColumnTopZs[wi] = queryColumnTopZLocked(wp[0], wp[1])
                 wi++
             }
             frame.waypointQueueCount = wi
+            frame.selectedWaypointIdx = if (selectedWaypointIndex in 0 until wi) selectedWaypointIndex else -1
             frame.isRouteStagedOnly = false
-            frame.stagedRouteArcLen = 0f
+            frame.stagedRouteArcLen = computeActiveRouteLengthLocked()
             frame.routeClosedLoop = (hub.routeLoopMode == 1 && activeMissionBackup.size >= 2)
+            if (activeMissionBackup.isNotEmpty()) {
+                val anchor = activeMissionBackup[0]
+                frame.routeLoopAnchorX = anchor[0]
+                frame.routeLoopAnchorY = anchor[1]
+                frame.routeLoopAnchorZ = anchor[2]
+            }
         }
 
         System.arraycopy(smoothBins60, 0, frame.radarSmooth60, 0, 60)
@@ -2810,7 +3078,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         frame.tiltManipulability = simManipulability
         frame.tiltThrustMarginPct = if (hub.isDroneTiltRig(0)) simThrustMarginPct else (100 - ((simMotorNorm[0] + simMotorNorm[1] + simMotorNorm[2] + simMotorNorm[3]) * 25f).roundToInt()).coerceIn(5, 90)
         frame.tiltServoSaturated = simServoSaturated
-        val nowElapsed = SystemClock.elapsedRealtime()
+        val nowElapsed = nowElapsedMs()
         frame.hasLiveTiltTelemetry = hub.isRosMode && rosHasLiveTilt && (nowElapsed - rosLastTiltRxMs < 3000L)
         frame.homeX = homeX
         frame.homeY = homeY
@@ -3090,7 +3358,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         cmdServo1Rad = (desiredCommonTilt + diffTrim).coerceIn(-maxTiltRad, maxTiltRad)
         cmdServo2Rad = (desiredCommonTilt - diffTrim).coerceIn(-maxTiltRad, maxTiltRad)
 
-        val liveTiltFresh = d0TiltRig && hub.isRosMode && rosHasLiveTilt && (SystemClock.elapsedRealtime() - rosLastTiltRxMs < 3000L)
+        val liveTiltFresh = d0TiltRig && hub.isRosMode && rosHasLiveTilt && (nowElapsedMs() - rosLastTiltRxMs < 3000L)
         if (!d0TiltRig) {
             simServo1Rad = 0f
             simServo2Rad = 0f
@@ -3169,7 +3437,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         }
 
         // 一阶无刷电机推力分配更新 (tau_m = 28ms, W-DLS 高频姿态力矩由四电机差动承担)
-        val nowTickMs = SystemClock.elapsedRealtime()
+        val nowTickMs = nowElapsedMs()
         val motorTelemetryFresh = hub.isRosMode && rosHasLiveMotorTelemetry && (nowTickMs - rosLastMotorRxMs < 1500L)
         if (!motorTelemetryFresh) {
             val effectivelyArmed = if (hub.isRosMode) resolveEffectiveRosArmedLocked(nowTickMs) else true

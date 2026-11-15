@@ -8,13 +8,9 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
-import java.net.HttpURLConnection
-import java.net.Inet4Address
 import java.net.InetSocketAddress
-import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
@@ -598,7 +594,7 @@ class TcpRosNativeClient(
     }
 
     private fun streamTcpRosTopic(host: String, port: Int, topic: String, kind: String, droneId: Int, scratch: StreamScratch) {
-        val sock = Socket()
+        val sock = LanNetworkBinder.createBoundSocket(host)
         openSockets.add(sock)
         try {
             sock.tcpNoDelay = true
@@ -1258,22 +1254,8 @@ class TcpRosNativeClient(
         return postXml(uri, xml)
     }
 
-    private fun postXml(uri: String, xmlBody: String): String {
-        val conn = (URL(uri).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 3500
-            readTimeout = 4000
-            doOutput = true
-            setRequestProperty("Content-Type", "text/xml")
-        }
-        return try {
-            val bytes = xmlBody.toByteArray(Charsets.UTF_8)
-            conn.outputStream.use { it.write(bytes) }
-            conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        } finally {
-            conn.disconnect()
-        }
-    }
+    private fun postXml(uri: String, xmlBody: String): String =
+        LanNetworkBinder.postXmlRpc(uri, xmlBody, connectTimeoutMs = 3500, readTimeoutMs = 4000)
 
     private fun extractHttpUris(xml: String): List<String> {
         val regex = Regex("http://[^<\\s\"']+")
@@ -1336,28 +1318,8 @@ class TcpRosNativeClient(
         return null
     }
 
-    private fun detectLocalWifiIp(remoteHost: String): String {
-        try {
-            Socket().use { probe ->
-                probe.connect(InetSocketAddress(remoteHost, 11311), 1500)
-                val addr = probe.localAddress?.hostAddress
-                if (!addr.isNullOrBlank() && addr != "127.0.0.1") return addr
-            }
-        } catch (_: Throwable) {}
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val nif = interfaces.nextElement()
-                if (!nif.isUp || nif.isLoopback) continue
-                val addrs = nif.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val a = addrs.nextElement()
-                    if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress ?: continue
-                }
-            }
-        } catch (_: Throwable) {}
-        return "127.0.0.1"
-    }
+    private fun detectLocalWifiIp(remoteHost: String): String =
+        LanNetworkBinder.detectLocalLanIpForRemote(remoteHost, 11311)
 
     private fun escapeXml(s: String): String =
         s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

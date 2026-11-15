@@ -15,8 +15,10 @@ class SnapshotExchangeTest {
         val read = exchange.readInto(RenderSnapshot())
         compare(source, read)
         source.voxels.fill(-100f)
+        source.waypointSafeFlags.fill(false)
         source.swarmAgents[0].trailPts.fill(-100f)
         assertNotEquals(source.voxels[0], read.voxels[0])
+        assertFalse(source.waypointSafeFlags.contentEquals(read.waypointSafeFlags))
         assertNotEquals(source.swarmAgents[0].trailPts[0], read.swarmAgents[0].trailPts[0])
     }
 
@@ -66,6 +68,7 @@ class SnapshotExchangeTest {
                 is Boolean -> f.setBoolean(value, !old)
                 is String -> f.set(value, "field-$i")
                 is FloatArray -> old.fill(i + 0.5f)
+                is BooleanArray -> old.indices.forEach { idx -> old[idx] = ((i + idx) and 1) == 0 }
                 is Array<*> -> old.forEach { fill(requireNotNull(it)) }
                 else -> error("Uncovered field: ${f.name}")
             }
@@ -79,6 +82,11 @@ class SnapshotExchangeTest {
                 is FloatArray -> {
                     assertNotSame(left, f.get(b))
                     assertArrayEquals(f.name, left, f.get(b) as FloatArray, 0f)
+                }
+                is BooleanArray -> {
+                    val right = f.get(b) as BooleanArray
+                    assertNotSame(left, right)
+                    assertArrayEquals(f.name, left, right)
                 }
                 is Array<*> -> left.forEachIndexed { i, x -> compare(requireNotNull(x), requireNotNull((f.get(b) as Array<*>)[i])) }
                 else -> assertEquals(f.name, left, f.get(b))

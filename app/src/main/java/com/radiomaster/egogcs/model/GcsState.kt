@@ -265,6 +265,10 @@ class SwarmAgentFrame {
  * 包含完整三维位置、速度、真实四元数与欧拉角姿态 (Roll / Pitch / Yaw)、多机编队态势及 EGO 三维膨胀体素地图。
  */
 class RenderSnapshot {
+    companion object {
+        const val MAX_MISSION_WAYPOINTS = 32
+    }
+
     var uavX: Float = -5.5f
     var uavY: Float = -4.2f
     var uavZ: Float = 1.2f
@@ -365,11 +369,18 @@ class RenderSnapshot {
     val lioPathPts: FloatArray = FloatArray(820 * 3)
     var lioPathCount: Int = 0
 
-    val waypointQueuePts: FloatArray = FloatArray(16 * 3)
+    val waypointQueuePts: FloatArray = FloatArray(MAX_MISSION_WAYPOINTS * 3)
+    val waypointSafeFlags: BooleanArray = BooleanArray(MAX_MISSION_WAYPOINTS) { true }
+    val waypointClearances: FloatArray = FloatArray(MAX_MISSION_WAYPOINTS) { 9.5f }
+    val waypointColumnTopZs: FloatArray = FloatArray(MAX_MISSION_WAYPOINTS)
     var waypointQueueCount: Int = 0
+    var selectedWaypointIdx: Int = -1
     var isRouteStagedOnly: Boolean = false
     var stagedRouteArcLen: Float = 0f
     var routeClosedLoop: Boolean = false
+    var routeLoopAnchorX: Float = 0f
+    var routeLoopAnchorY: Float = 0f
+    var routeLoopAnchorZ: Float = 1.2f
 
     val radarSmooth60: FloatArray = FloatArray(60) { 9.5f }
 
@@ -440,9 +451,13 @@ class RenderSnapshot {
         trailCount = source.trailCount
         lioPathCount = source.lioPathCount
         waypointQueueCount = source.waypointQueueCount
+        selectedWaypointIdx = source.selectedWaypointIdx
         isRouteStagedOnly = source.isRouteStagedOnly
         stagedRouteArcLen = source.stagedRouteArcLen
         routeClosedLoop = source.routeClosedLoop
+        routeLoopAnchorX = source.routeLoopAnchorX
+        routeLoopAnchorY = source.routeLoopAnchorY
+        routeLoopAnchorZ = source.routeLoopAnchorZ
         source.motorNorm4.copyInto(motorNorm4)
         source.obsPrimitives.copyInto(obsPrimitives)
         source.voxels.copyInto(voxels)
@@ -452,6 +467,9 @@ class RenderSnapshot {
         source.trailPts.copyInto(trailPts)
         source.lioPathPts.copyInto(lioPathPts)
         source.waypointQueuePts.copyInto(waypointQueuePts)
+        source.waypointSafeFlags.copyInto(waypointSafeFlags)
+        source.waypointClearances.copyInto(waypointClearances)
+        source.waypointColumnTopZs.copyInto(waypointColumnTopZs)
         source.radarSmooth60.copyInto(radarSmooth60)
         for (i in swarmAgents.indices) swarmAgents[i].copyFrom(source.swarmAgents[i])
     }
@@ -603,6 +621,8 @@ class GcsSharedHub {
     @Volatile var routeLoopMode: Int = 0
 
     @Volatile var routeFinishAction: Int = 0
+
+    @Volatile var waypointPlacementMode: Boolean = false
 
     // EGO-Planner-Swarm 多机协同编队模式参数
     @Volatile var swarmModeEnabled: Boolean = false

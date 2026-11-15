@@ -11,6 +11,7 @@ import android.graphics.drawable.Drawable
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ReplacementSpan
+import android.widget.ImageView
 import android.widget.TextView
 import kotlin.math.cos
 import kotlin.math.min
@@ -96,6 +97,42 @@ object GcsIcons {
     private const val TAG_ICON_SPEC = -0x24681357
 
     /**
+     * 计算行内矢量图标相对于文字基线的精确亚像素绘制起点 Y：
+     * 严格对齐字体 ascent/descent 光学中线，不做行框强制截断，杜绝紧凑字号配大图标时向顶/底偏位。
+     */
+    internal fun computeInlineDrawTop(
+        baselineY: Int,
+        fontAscent: Float,
+        fontDescent: Float,
+        iconSizePx: Int
+    ): Float {
+        val textCenterY = baselineY + (fontAscent + fontDescent) * 0.5f
+        return textCenterY - iconSizePx * 0.5f
+    }
+
+    /**
+     * 计算 24x24 矢量视口在任意宿主键矩形 bounds 内的亚像素居中平移与缩放系数：
+     * 即使宿主按钮为非正方形（如 28x26dp），图标仍以纯浮点精度正中对齐且保持 1:1 几何比例。
+     */
+    internal fun computeViewportTransform(
+        boundsLeft: Int,
+        boundsTop: Int,
+        boundsRight: Int,
+        boundsBottom: Int,
+        glyphSizePx: Int,
+        out: FloatArray = FloatArray(3)
+    ): FloatArray {
+        val w = (if (boundsRight > boundsLeft) boundsRight - boundsLeft else glyphSizePx).toFloat()
+        val h = (if (boundsBottom > boundsTop) boundsBottom - boundsTop else glyphSizePx).toFloat()
+        val targetSide = min(min(w, h), glyphSizePx.toFloat()).coerceAtLeast(1f)
+        val scale = targetSide / 24f
+        out[0] = boundsLeft + (w - targetSide) * 0.5f
+        out[1] = boundsTop + (h - targetSide) * 0.5f
+        out[2] = scale
+        return out
+    }
+
+    /**
      * 为 TextView 绑定商业矢量前置/后置图标与文本；若内容未变则零分配直接跳过，杜绝高频刷新抖动。
      * 当 overrideIconColor == null 时，矢量图标在绘制时自动继承 TextView 当前 textColor。
      */
@@ -152,8 +189,31 @@ object GcsIcons {
         tv.text = ssb
     }
 
-    fun drawable(type: Type, sizePx: Int, color: Int): Drawable =
-        VectorGlyphDrawable(type, sizePx, color)
+    fun drawable(type: Type, sizePx: Int, color: Int): GlyphDrawable =
+        GlyphDrawable(type, sizePx, color)
+
+    /**
+     * 为纯图标按钮 ImageView 绑定或原地刷新矢量图标：
+     * - 采用 FIT_XY 让 Drawable 直接接管完整内框并用浮点亚像素中心对齐，消除 ImageView.ScaleType.CENTER 的整像素取整偏位；
+     * - 同类型同尺寸复刷时仅原地更新颜色，完整保留正在进行的内部齿轮旋转角度，并确保外层矩形边框永不倾斜错位。
+     */
+    fun bindImage(imageView: ImageView, type: Type, sizePx: Int, color: Int): GlyphDrawable {
+        imageView.rotation = 0f
+        if (imageView.scaleType != ImageView.ScaleType.FIT_XY) {
+            imageView.scaleType = ImageView.ScaleType.FIT_XY
+        }
+        val existing = imageView.drawable as? GlyphDrawable
+        if (existing != null && existing.type == type && existing.sizePx == sizePx) {
+            existing.updateBaseColor(color)
+            return existing
+        }
+        val fresh = GlyphDrawable(type, sizePx, color)
+        if (existing != null && existing.rotationDeg != 0f) {
+            fresh.rotationDeg = existing.rotationDeg
+        }
+        imageView.setImageDrawable(fresh)
+        return fresh
+    }
 
     private class InlineVectorSpan(
         type: Type,
@@ -163,7 +223,7 @@ object GcsIcons {
         private val explicitColor: Int?
     ) : ReplacementSpan() {
 
-        private val glyph = VectorGlyphDrawable(type, sizePx, explicitColor ?: -1).apply {
+        private val glyph = GlyphDrawable(type, sizePx, explicitColor ?: -1).apply {
             setBounds(0, 0, sizePx, sizePx)
         }
 
@@ -175,20 +235,12 @@ object GcsIcons {
             fm: Paint.FontMetricsInt?
         ): Int {
             if (fm != null) {
+                // 保持原始字体度量不变，防止开关动态增删前置图标（如图层勾选芯片）时文字基线上下跳动
                 val pfm = paint.fontMetricsInt
-                val fullH = pfm.bottom - pfm.top
-                if (sizePx + 2 > fullH) {
-                    val extra = (sizePx + 2 - fullH + 1) / 2
-                    fm.top = pfm.top - extra
-                    fm.ascent = minOf(pfm.ascent, fm.top + 1)
-                    fm.bottom = pfm.bottom + extra
-                    fm.descent = maxOf(pfm.descent, fm.bottom - 1)
-                } else {
-                    fm.ascent = pfm.ascent
-                    fm.top = pfm.top
-                    fm.descent = pfm.descent
-                    fm.bottom = pfm.bottom
-                }
+                fm.ascent = pfm.ascent
+                fm.top = pfm.top
+                fm.descent = pfm.descent
+                fm.bottom = pfm.bottom
             }
             return preGapPx + sizePx + postGapPx
         }
@@ -206,9 +258,7 @@ object GcsIcons {
         ) {
             glyph.updateBaseColor(explicitColor ?: paint.color)
             val fm = paint.fontMetrics
-            val textCenterY = y + (fm.ascent + fm.descent) * 0.5f
-            val maxTop = (bottom - sizePx).coerceAtLeast(top).toFloat()
-            val drawTop = (textCenterY - sizePx * 0.5f).coerceIn(top.toFloat(), maxTop)
+            val drawTop = computeInlineDrawTop(y, fm.ascent, fm.descent, sizePx)
 
             canvas.save()
             canvas.translate(x + preGapPx, drawTop)
@@ -217,9 +267,9 @@ object GcsIcons {
         }
     }
 
-    private class VectorGlyphDrawable(
-        private val type: Type,
-        private val sizePx: Int,
+    class GlyphDrawable(
+        val type: Type,
+        val sizePx: Int,
         initColor: Int
     ) : Drawable() {
 
@@ -237,11 +287,24 @@ object GcsIcons {
 
         private val path = Path()
         private val arcRect = RectF()
+        private val viewportScratch = FloatArray(3)
+
+        var rotationDeg: Float = 0f
+            set(value) {
+                if (field != value) {
+                    field = value
+                    invalidateSelf()
+                }
+            }
+
+        val baseColor: Int
+            get() = strokePaint.color
 
         fun updateBaseColor(c: Int) {
             if (strokePaint.color != c) {
                 strokePaint.color = c
                 fillPaint.color = c
+                invalidateSelf()
             }
         }
 
@@ -263,13 +326,14 @@ object GcsIcons {
 
         override fun draw(canvas: Canvas) {
             val b: Rect = bounds
-            val w = (if (b.isEmpty) sizePx else b.width()).toFloat()
-            val h = (if (b.isEmpty) sizePx else b.height()).toFloat()
-            val s = min(w, h) / 24f
+            val tf = computeViewportTransform(b.left, b.top, b.right, b.bottom, sizePx, viewportScratch)
 
             canvas.save()
-            canvas.translate(b.left + (w - 24f * s) * 0.5f, b.top + (h - 24f * s) * 0.5f)
-            canvas.scale(s, s)
+            canvas.translate(tf[0], tf[1])
+            canvas.scale(tf[2], tf[2])
+            if (rotationDeg != 0f) {
+                canvas.rotate(rotationDeg, 12f, 12f)
+            }
 
             strokePaint.strokeWidth = 2.05f
             path.reset()

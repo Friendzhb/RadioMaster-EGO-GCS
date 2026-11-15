@@ -42,6 +42,7 @@ import com.radiomaster.egogcs.model.TopicConfig
 import com.radiomaster.egogcs.ota.OtaUpdateManager
 import com.radiomaster.egogcs.ros.DiscoveredDrone
 import com.radiomaster.egogcs.ros.LanDroneScanner
+import com.radiomaster.egogcs.ros.LanNetworkBinder
 import com.radiomaster.egogcs.ros.RosBridgeClient
 import com.radiomaster.egogcs.ros.RosConnectionManager
 import com.radiomaster.egogcs.ros.RosTopicEntry
@@ -62,7 +63,10 @@ import com.radiomaster.egogcs.ui.GcsSettingsModal
 import com.radiomaster.egogcs.ui.GcsTheme
 import com.radiomaster.egogcs.ui.GcsTheme.Role
 import com.radiomaster.egogcs.ui.GlPointCloudMapView
+import com.radiomaster.egogcs.ui.MissionRouteVisualizer
+import com.radiomaster.egogcs.ui.TouchChainGuard
 import com.radiomaster.egogcs.ui.UavAttitudeHudView
+import com.radiomaster.egogcs.ui.WaypointCalloutOverlayView
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -105,6 +109,7 @@ class MainActivity : Activity() {
     private lateinit var bottomLeftCluster: LinearLayout
 
     private lateinit var mapView: GlPointCloudMapView
+    private lateinit var waypointCalloutOverlay: WaypointCalloutOverlayView
     private lateinit var hsiView: DjiHsiRadarView
     private lateinit var attitudeHudView: UavAttitudeHudView
     private lateinit var hdTelemetryBox: LinearLayout
@@ -188,6 +193,7 @@ class MainActivity : Activity() {
     // 左侧飞行安全操控栏
     private lateinit var btnBrake: TextView
     private lateinit var btnRth: TextView
+    private lateinit var btnWaypointPlot: TextView
     private lateinit var demoControlGroup: LinearLayout
     private lateinit var btnPatrol: TextView
     private lateinit var btnDemoScene: TextView
@@ -200,6 +206,8 @@ class MainActivity : Activity() {
     private lateinit var btnDockFlyNow: TextView
     private lateinit var dockRouteRow: LinearLayout
     private lateinit var btnDockStartRoute: TextView
+    private lateinit var btnDockPlotToggle: TextView
+    private lateinit var tvDockRouteAltVal: TextView
     private lateinit var btnDockUndo: TextView
     private lateinit var btnDockOpenOrchestrate: TextView
     private lateinit var btnDockClearRoute: TextView
@@ -239,8 +247,8 @@ class MainActivity : Activity() {
             AnimHelper.animateArmedConfirm(btnClearMapInPopover, armed = false)
             val pal = GcsTheme.of(hub.themeId)
             btnClearMapInPopover.setTextColor(pal.textPrimary)
-            GcsIcons.bind(btnClearMapInPopover, Type.TRASH, "清建图", d, iconDp = 11.5f)
-            btnClearMapInPopover.background = glassBg(dp(6f))
+            GcsIcons.bind(btnClearMapInPopover, Type.TRASH, "清建图", d, iconDp = 11f, gapDp = 3.5f)
+            btnClearMapInPopover.background = glassBg(dp(5.5f))
         }
     }
 
@@ -402,6 +410,7 @@ class MainActivity : Activity() {
             }
         }
 
+        LanNetworkBinder.init(applicationContext)
         hwBridge = Ax12HardwareBridge(this, hub, simEngine)
 
         val wsClient = RosBridgeClient(hub, simEngine) { msg ->
@@ -721,6 +730,7 @@ class MainActivity : Activity() {
 
         if (!rthConfirmPending) styleRthDefault()
         styleDemoScenePill()
+        syncWaypointPlotPillUi()
         syncPatrolPillUi()
         syncTopQuickSlotsVisual()
         syncMenuButtonVisual()
@@ -736,6 +746,8 @@ class MainActivity : Activity() {
         syncSwarmAllControlsUi()
         syncTiltAllControlsUi()
         syncTelemetryFullscreenToggleVisual()
+        setWideTerminalMode(drawerWideMode, applyImmediately = false)
+        syncFlightRecorderUi()
         refreshWaypointOrchestratorList()
         if (cachedTopicEntries.isNotEmpty()) renderFilteredTopicRows()
 
@@ -818,7 +830,11 @@ class MainActivity : Activity() {
 
         val modalOpen = ::settingsModal.isInitialized && settingsModal.isOpen
         val fullScreenTelemetryActive = drawerOpen && activeTabIndex == TAB_STATUS && telemetryFullscreenMode
-        mapView.setGlSurfacePaused(fullScreenTelemetryActive || modalOpen)
+        val mapObscured = fullScreenTelemetryActive || modalOpen
+        mapView.setGlSurfacePaused(mapObscured)
+        if (::waypointCalloutOverlay.isInitialized) {
+            waypointCalloutOverlay.visibility = if (mapObscured) View.GONE else View.VISIBLE
+        }
 
         if (!activityResumed) return
         val hideAttitudeForPopover = layerPopoverOpen && screenHeightDp < 395f
@@ -939,15 +955,14 @@ class MainActivity : Activity() {
         if (!::btnSettingsToggle.isInitialized) return
         val pal = GcsTheme.of(hub.themeId)
         val active = ::settingsModal.isInitialized && settingsModal.isOpen
-        btnSettingsToggle.setImageDrawable(
-            GcsIcons.drawable(
-                Type.SETTINGS_GEAR,
-                dp(13.5f),
-                if (active) pal.accentBright else pal.textPrimary
-            )
+        GcsIcons.bindImage(
+            btnSettingsToggle,
+            Type.SETTINGS_GEAR,
+            dp(13.5f),
+            if (active) pal.accentBright else pal.textPrimary
         )
         btnSettingsToggle.background = if (active) {
-            pillBg(pal.accentSoftFill, pal.accent)
+            pillBg(pal.accentSoftFill, pal.accent, radiusDp = 6f)
         } else {
             glassBg(dp(6f))
         }
@@ -1023,7 +1038,7 @@ class MainActivity : Activity() {
         if (drawerOpen) {
             btnMenuToggle.setTextColor(pal.accentBright)
             GcsIcons.bind(btnMenuToggle, Type.CLOSE_X, "收起", d, iconDp = 11.5f, gapDp = 3.5f)
-            btnMenuToggle.background = pillBg(pal.accentSoftFill, pal.accent)
+            btnMenuToggle.background = pillBg(pal.accentSoftFill, pal.accent, radiusDp = 6f)
         } else {
             btnMenuToggle.setTextColor(pal.textPrimary)
             GcsIcons.bind(btnMenuToggle, Type.MENU_BARS, "菜单", d, iconDp = 11.5f, gapDp = 3.5f)
@@ -1108,12 +1123,13 @@ class MainActivity : Activity() {
                 if (wide) Type.COLLAPSE_WIDTH else Type.EXPAND_WIDTH,
                 if (wide) "标准" else "宽屏",
                 d,
-                iconDp = 11f
+                iconDp = 11f,
+                gapDp = 3.5f
             )
             btnWideTerminal.background = if (wide) {
-                pillBg(pal.accentSoftFill, pal.accent)
+                pillBg(pal.accentSoftFill, pal.accent, radiusDp = 5.5f)
             } else {
-                glassBg(dp(6f))
+                glassBg(dp(5.5f))
             }
         }
         if (applyImmediately) {
@@ -1334,6 +1350,76 @@ class MainActivity : Activity() {
         AnimHelper.animateFloatingBadge(occlusionBadge, show = occluded, density = d, slideDp = -4f)
     }
 
+    private fun syncWaypointPlotPillUi() {
+        val pal = GcsTheme.of(hub.themeId)
+        val active = hub.waypointPlacementMode
+        if (::btnWaypointPlot.isInitialized) {
+            val activeStroke = Color.parseColor("#FFB300")
+            val activeFill = Color.argb(if (pal.isLight) 42 else 58, 255, 179, 0)
+            btnWaypointPlot.setTextColor(
+                if (active) {
+                    if (pal.isLight) Color.rgb(185, 102, 0) else Color.parseColor("#FFE082")
+                } else {
+                    pal.textSecondary
+                }
+            )
+            GcsIcons.bind(
+                btnWaypointPlot,
+                if (active) Type.ROUTE_NODES else Type.PLUS_NODE,
+                if (active) "布点: 开" else "布点: 关",
+                d,
+                iconDp = 11.5f
+            )
+            btnWaypointPlot.background = pillBg(
+                if (active) activeFill else pal.glassFill,
+                if (active) activeStroke else pal.glassStroke
+            )
+            btnWaypointPlot.invalidate()
+        }
+        if (::btnDockPlotToggle.isInitialized) {
+            val activeStroke = Color.parseColor("#FFB300")
+            val activeFill = Color.argb(if (pal.isLight) 44 else 64, 255, 179, 0)
+            btnDockPlotToggle.setTextColor(
+                if (active) {
+                    if (pal.isLight) Color.rgb(185, 102, 0) else Color.parseColor("#FFE082")
+                } else {
+                    pal.textSecondary
+                }
+            )
+            GcsIcons.bind(
+                btnDockPlotToggle,
+                Type.PLUS_NODE,
+                if (active) "布点中" else "连布",
+                d,
+                iconDp = 10.8f,
+                gapDp = 3f
+            )
+            btnDockPlotToggle.background = pillBg(
+                if (active) activeFill else pal.wellFill,
+                if (active) activeStroke else pal.cardStroke,
+                radiusDp = 5.5f
+            )
+            btnDockPlotToggle.invalidate()
+        }
+    }
+
+    private fun setWaypointPlacementMode(enabled: Boolean, showToast: Boolean = false) {
+        hub.waypointPlacementMode = enabled
+        if (enabled) {
+            simEngine.clearPreviewPin()
+        }
+        syncWaypointPlotPillUi()
+        refreshCommandDockUi(pulseDock = true)
+        if (showToast) {
+            val msg = if (enabled) {
+                "动态航点布设已开启：点击地图连续放置 3D 航点，按住航点可拖拽微调"
+            } else {
+                "已退出动态航点连续布设"
+            }
+            AnimHelper.showDjiToast(toastBanner, msg, d)
+        }
+    }
+
     private fun syncPatrolPillUi() {
         val pal = GcsTheme.of(hub.themeId)
         btnPatrol.setTextColor(if (hub.autoPatrol) pal.secondaryAccent else pal.textMuted)
@@ -1364,6 +1450,9 @@ class MainActivity : Activity() {
     }
 
     private fun refreshCommandDockUi(latestPin: EgoSimEngine.PinInspectResult? = null, pulseDock: Boolean = false) {
+        if (::waypointCalloutOverlay.isInitialized) {
+            waypointCalloutOverlay.onMapFrame()
+        }
         val pal = GcsTheme.of(hub.themeId)
         val snap = hub.snapshots.readInto(readSnapshot)
         val hasPin = latestPin != null || simEngine.hasActivePreviewPin()
@@ -1430,7 +1519,7 @@ class MainActivity : Activity() {
             return
         }
 
-        if (routeCnt > 0) {
+        if (routeCnt > 0 || hub.waypointPlacementMode) {
             val switchedRow = dockRouteRow.visibility != View.VISIBLE && dockLogicalActive
             dockLogicalActive = true
             dockPinRow.visibility = View.GONE
@@ -1438,30 +1527,95 @@ class MainActivity : Activity() {
             if (switchedRow) AnimHelper.animateStateFlip(dockRouteRow)
             AnimHelper.animateCommandDock(commandDock, show = true, density = d, pulseOnUpdate = pulseDock)
             syncBottomHudAvoidance()
+            syncWaypointPlotPillUi()
 
+            val (_, selectedWp) = simEngine.getSelectedWaypointInfo()
+            val dispAlt = selectedWp?.z ?: hub.goalZ
+            if (::tvDockRouteAltVal.isInitialized) {
+                setTextIfChanged(tvDockRouteAltVal, String.format(Locale.US, "%.2fm", dispAlt))
+            }
+
+            if (routeCnt <= 0) {
+                tvDockHeader.setTextColor(if (pal.isLight) Color.rgb(185, 102, 0) else Color.parseColor("#FFE082"))
+                GcsIcons.bind(
+                    tvDockHeader,
+                    Type.PLUS_NODE,
+                    String.format(Locale.US, "动态布点中 · 点击地图放置第 1 个 3D 航点 (预设高 %.1fm)", dispAlt),
+                    d,
+                    iconDp = 11.5f
+                )
+                btnDockStartRoute.visibility = View.GONE
+                btnDockUndo.visibility = View.GONE
+                GcsIcons.bind(btnDockClearRoute, Type.CLOSE_X, "退出", d, iconDp = 10.5f)
+                return
+            }
+
+            btnDockUndo.visibility = View.VISIBLE
             val loopTag = when (hub.routeLoopMode) {
                 1 -> " · 循环"
                 2 -> " · 往返"
                 else -> ""
             }
+            val etaSec = MissionRouteVisualizer.computeMissionEtaSeconds(arcLen, routeCnt, hub.maxVel)
             if (isStaged) {
-                tvDockHeader.setTextColor(if (pal.isLight) Color.rgb(185, 102, 0) else Color.parseColor("#FFD54F"))
-                GcsIcons.bind(
-                    tvDockHeader,
-                    Type.ROUTE_NODES,
-                    String.format(Locale.US, "待飞航线：%d 站 · %.1fm%s", routeCnt, arcLen, loopTag),
-                    d,
-                    iconDp = 11.5f
-                )
+                if (selectedWp != null && !selectedWp.isSafe) {
+                    tvDockHeader.setTextColor(Color.parseColor("#FF5252"))
+                    GcsIcons.bind(
+                        tvDockHeader,
+                        Type.WARNING,
+                        String.format(
+                            Locale.US,
+                            "航点 #%d/%d 贴近障碍(净空%.2fm) · 拉动垂直拉杆调高或平移",
+                            selectedWp.index + 1,
+                            routeCnt,
+                            selectedWp.clearance
+                        ),
+                        d,
+                        iconDp = 11.5f
+                    )
+                } else if (selectedWp != null) {
+                    tvDockHeader.setTextColor(if (pal.isLight) Color.rgb(185, 102, 0) else Color.parseColor("#FFD54F"))
+                    GcsIcons.bind(
+                        tvDockHeader,
+                        Type.ROUTE_NODES,
+                        String.format(
+                            Locale.US,
+                            "航点 #%d/%d 高%.2fm · 总%.1fm · 约%ds%s",
+                            selectedWp.index + 1,
+                            routeCnt,
+                            selectedWp.z,
+                            arcLen,
+                            etaSec,
+                            loopTag
+                        ),
+                        d,
+                        iconDp = 11.5f
+                    )
+                } else {
+                    tvDockHeader.setTextColor(if (pal.isLight) Color.rgb(185, 102, 0) else Color.parseColor("#FFD54F"))
+                    GcsIcons.bind(
+                        tvDockHeader,
+                        Type.ROUTE_NODES,
+                        String.format(Locale.US, "待飞航线：%d 站 · %.1fm · 约 %ds%s", routeCnt, arcLen, etaSec, loopTag),
+                        d,
+                        iconDp = 11.5f
+                    )
+                }
                 btnDockStartRoute.visibility = View.VISIBLE
                 GcsIcons.bind(btnDockStartRoute, Type.PLAY, "启动($routeCnt)", d, iconDp = 11f)
                 GcsIcons.bind(btnDockClearRoute, Type.TRASH, "清空", d, iconDp = 11f)
             } else {
                 tvDockHeader.setTextColor(pal.secondaryAccent)
+                val selSuffix = if (selectedWp != null) {
+                    String.format(Locale.US, " · 选中#%d(%.2fm)", selectedWp.index + 1, selectedWp.z)
+                } else {
+                    ""
+                }
+                val etaSuffix = if (etaSec > 0) " · 约${etaSec}s" else ""
                 GcsIcons.bind(
                     tvDockHeader,
                     Type.SEND_FLY,
-                    "航线执行中 · 剩余 $routeCnt 站$loopTag",
+                    "航线执行中 · 剩余 $routeCnt 站$etaSuffix$loopTag$selSuffix",
                     d,
                     iconDp = 11.5f
                 )
@@ -1480,9 +1634,19 @@ class MainActivity : Activity() {
         val delta = sign * hub.altStepMeters
         val (_, pinInfo) = simEngine.nudgeGoalZ(delta)
         GcsSettingsModal.persistAllSettings(this, hub)
-        mapView.triggerPinSpringAnim()
-        if (::tvDockAltVal.isInitialized && commandDock.visibility == View.VISIBLE) {
-            AnimHelper.animateValueStepNudge(tvDockAltVal, sign, d)
+        val (_, selWp) = simEngine.getSelectedWaypointInfo()
+        if (pinInfo == null && selWp != null) {
+            mapView.triggerWaypointSpawnAnim(selWp.index, fromScale = 0.85f)
+            refreshWaypointOrchestratorList()
+        } else {
+            mapView.triggerPinSpringAnim()
+        }
+        if (commandDock.visibility == View.VISIBLE) {
+            if (dockPinRow.visibility == View.VISIBLE && ::tvDockAltVal.isInitialized) {
+                AnimHelper.animateValueStepNudge(tvDockAltVal, sign, d)
+            } else if (dockRouteRow.visibility == View.VISIBLE && ::tvDockRouteAltVal.isInitialized) {
+                AnimHelper.animateValueStepNudge(tvDockRouteAltVal, sign, d)
+            }
         }
         refreshCommandDockUi(pinInfo, pulseDock = true)
     }
@@ -1506,6 +1670,8 @@ class MainActivity : Activity() {
         AnimHelper.animateStateFlip(btnRth)
 
         val cmds = simEngine.dispatchSwarmReturnToHome()
+        hub.waypointPlacementMode = false
+        syncWaypointPlotPillUi()
         syncPatrolPillUi()
         refreshCommandDockUi()
         refreshWaypointOrchestratorList()
@@ -1526,8 +1692,8 @@ class MainActivity : Activity() {
             clearMapConfirmPending = true
             AnimHelper.animateArmedConfirm(btnClearMapInPopover, armed = true)
             btnClearMapInPopover.setTextColor(Color.WHITE)
-            GcsIcons.bind(btnClearMapInPopover, Type.WARNING, "再点清图", d, iconDp = 11.5f)
-            btnClearMapInPopover.background = pillBg(Color.argb(165, 255, 59, 48), Color.parseColor("#FF6961"))
+            GcsIcons.bind(btnClearMapInPopover, Type.WARNING, "再点清", d, iconDp = 11f, gapDp = 3f)
+            btnClearMapInPopover.background = pillBg(Color.argb(165, 255, 59, 48), Color.parseColor("#FF6961"), radiusDp = 5.5f)
             AnimHelper.showDjiToast(toastBanner, "2.5 秒内再次点击确认清空点云建图", d)
             uiHandler.removeCallbacks(resetClearMapConfirmRunnable)
             uiHandler.postDelayed(resetClearMapConfirmRunnable, 2500L)
@@ -1547,6 +1713,8 @@ class MainActivity : Activity() {
         AnimHelper.animateEmergencyBrake(viewForHaptic)
 
         val cmds = simEngine.dispatchSwarmEmergencyHover()
+        hub.waypointPlacementMode = false
+        syncWaypointPlotPillUi()
         syncPatrolPillUi()
         refreshCommandDockUi()
         refreshWaypointOrchestratorList()
@@ -1563,7 +1731,11 @@ class MainActivity : Activity() {
     // ==================== 五区无重叠主座舱装配 ====================
 
     private fun buildNativeDjiCockpit(): View {
-        cockpitRoot = FrameLayout(this).apply {
+        cockpitRoot = TouchChainGuard.IconSlopFrameLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.ROOT_COCKPIT,
+            density = d
+        ).apply {
             setBackgroundColor(Color.TRANSPARENT)
         }
 
@@ -1607,6 +1779,12 @@ class MainActivity : Activity() {
                         refreshCommandDockUi()
                         val rigTag = if (hub.isDroneTiltRig(pickedDrone)) "矢量 4M2S" else "普通 X4"
                         AnimHelper.showDjiToast(toastBanner, "已切换主控焦点 -> UAV-#$pickedDrone ($rigTag)", d)
+                    } else if (hub.waypointPlacementMode) {
+                        val placed = simEngine.placeDynamicWaypoint(wx, wy)
+                        mapView.triggerWaypointSpawnAnim(placed.index)
+                        mapView.spawnRipple(placed.x, placed.y)
+                        refreshCommandDockUi(pulseDock = true)
+                        refreshWaypointOrchestratorList()
                     } else {
                         val wasAlreadyVisible = commandDock.visibility == View.VISIBLE
                         val info = simEngine.placePreviewPin(wx, wy)
@@ -1648,21 +1826,86 @@ class MainActivity : Activity() {
                         AnimHelper.showDjiToast(toastBanner, toastMsg, d)
                     }
                 }
+            },
+            onWaypointTapped = { idx ->
+                val node = simEngine.selectOrchestratedWaypoint(idx)
+                refreshCommandDockUi(pulseDock = true)
+                refreshWaypointOrchestratorList()
+                if (node != null) {
+                    val warn = if (!node.isSafe) " · 贴近障碍" else ""
+                    AnimHelper.showDjiToast(
+                        toastBanner,
+                        String.format(Locale.US, "已选中 3D 航点 #%d (%.1f, %.1f, 高 %.1fm)%s", idx + 1, node.x, node.y, node.z, warn),
+                        d
+                    )
+                }
+            },
+            onWaypointDragged = { idx, wx, wy, finished ->
+                val updated = simEngine.updateOrchestratedWaypointXY(idx, wx, wy)
+                refreshCommandDockUi()
+                if (finished) {
+                    if (updated != null) {
+                        mapView.spawnRipple(updated.x, updated.y)
+                    }
+                    refreshWaypointOrchestratorList()
+                }
+            },
+            onWaypointAltitudeDragged = { idx, wz, finished ->
+                val updated = simEngine.updateOrchestratedWaypointZ(idx, wz)
+                refreshCommandDockUi()
+                if (finished) {
+                    refreshWaypointOrchestratorList()
+                    if (updated != null) {
+                        AnimHelper.showDjiToast(
+                            toastBanner,
+                            String.format(
+                                Locale.US,
+                                "航点 #%d 高度已调至 %.2fm (净空 %.1fm)",
+                                idx + 1,
+                                updated.z,
+                                updated.clearance
+                            ),
+                            d
+                        )
+                    }
+                }
+            },
+            onMapVisualTick = {
+                if (::waypointCalloutOverlay.isInitialized) {
+                    waypointCalloutOverlay.onMapFrame()
+                }
             }
         )
+        TouchChainGuard.markPassThroughSurface(mapView)
         cockpitRoot.addView(mapView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 
+        // 3D 航点屏幕投影数字标牌层 (位于 OpenGL 地图正上方、所有 HUD 控件下层，100% 透传触控)
+        waypointCalloutOverlay = WaypointCalloutOverlayView(this, hub, mapView)
+        TouchChainGuard.markPassThroughSurface(waypointCalloutOverlay)
+        cockpitRoot.addView(waypointCalloutOverlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+
         // 顶部细长电量进度条 (0..2.5dp)
-        val batTrack = FrameLayout(this).apply { setBackgroundColor(Color.argb(46, 128, 145, 168)) }
+        val batTrack = FrameLayout(this).apply {
+            isMotionEventSplittingEnabled = false
+            isClickable = true
+            setBackgroundColor(Color.argb(46, 128, 145, 168))
+        }
+        TouchChainGuard.markDecorativeStrip(batTrack)
         topBatFill = View(this).apply { setBackgroundColor(Color.parseColor("#00E676")) }
         batTrack.addView(topBatFill, FrameLayout.LayoutParams((resources.displayMetrics.widthPixels * 0.86f).roundToInt(), MATCH_PARENT))
         cockpitRoot.addView(batTrack, FrameLayout.LayoutParams(MATCH_PARENT, dp(2.5f), Gravity.TOP))
 
         // 1. 紧凑顶栏 (y = 2.5..38.5dp, 保证 640dp 横屏零溢出挤压)
-        topBarView = LinearLayout(this).apply {
+        topBarView = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.SOLID_BAR,
+            density = d
+        ).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             minimumHeight = dp(38f)
+            clipChildren = false
+            clipToPadding = false
             setPadding(dp(8f), dp(3.5f), dp(8f), dp(3f))
             GcsTheme.markRole(this, Role.TOP_GRADIENT_BAR)
         }
@@ -1758,6 +2001,8 @@ class MainActivity : Activity() {
         quickSlotsContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
             visibility = if (screenWidthDp >= 690f) View.VISIBLE else View.GONE
         }
         val mPill = TextView(this).apply {
@@ -1842,6 +2087,8 @@ class MainActivity : Activity() {
             maxLines = 1
             setHorizontallyScrolling(false)
             gravity = Gravity.CENTER
+            minWidth = dp(54f)
+            minimumHeight = dp(26f)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(7.5f), dp(4f), dp(7.5f), dp(4f))
@@ -1852,7 +2099,7 @@ class MainActivity : Activity() {
         topBarView.addView(btnMenuToggle, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(4.5f) })
 
         btnSettingsToggle = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER
+            scaleType = ImageView.ScaleType.FIT_XY
             contentDescription = "系统设置"
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
@@ -1865,12 +2112,19 @@ class MainActivity : Activity() {
         cockpitRoot.addView(topBarView, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP))
 
         // 2. 顶部居中统一流式堆栈 (航向罗盘 + 回中提示 + 遮挡透视提示 + Toast，垂直流式排布绝不互叠)
-        topCenterStack = LinearLayout(this).apply {
+        topCenterStack = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.FLOATING_CLUSTER,
+            density = d
+        ).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
+            clipChildren = false
+            clipToPadding = false
         }
 
         compassView = DjiCompassTapeView(this, hub).apply {
+            isClickable = true
             GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 6.5f)
         }
         topCenterStack.addView(compassView, LinearLayout.LayoutParams(dp(196f), dp(27f)))
@@ -1954,7 +2208,15 @@ class MainActivity : Activity() {
         )
 
         // 3. 左侧飞行安全操控区 (紧凑 84dp 宽度，底部留足 90dp+ 净空)
-        leftSafetyRail = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        leftSafetyRail = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.FLOATING_CLUSTER,
+            density = d
+        ).apply {
+            orientation = LinearLayout.VERTICAL
+            clipChildren = false
+            clipToPadding = false
+        }
 
         btnBrake = createActionPill(Type.BRAKE_HOLD, "紧急悬停", "#FF3B30", true).apply {
             setOnClickListener { executeEmergencyHover(it) }
@@ -1968,7 +2230,19 @@ class MainActivity : Activity() {
         AnimHelper.attachSpringTouch(btnRth, GcsMotionSpec.PressRole.CRITICAL_SAFETY)
         leftSafetyRail.addView(btnRth, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(5f) })
 
-        demoControlGroup = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        btnWaypointPlot = createActionPill(Type.PLUS_NODE, "布点: 关", "#FFB300", false).apply {
+            setOnClickListener {
+                AnimHelper.animateStateFlip(it)
+                setWaypointPlacementMode(!hub.waypointPlacementMode, showToast = true)
+            }
+        }
+        leftSafetyRail.addView(btnWaypointPlot, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(5f) })
+
+        demoControlGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            clipChildren = false
+            clipToPadding = false
+        }
         btnPatrol = createActionPill(Type.PLAY, "巡航: 开", "#00E676", true).apply {
             setOnClickListener {
                 AnimHelper.animateStateFlip(it)
@@ -1998,9 +2272,15 @@ class MainActivity : Activity() {
         )
 
         // 4. 左下角 HSI 避障球 (94x94dp) 与紧凑飞行仪表框
-        bottomLeftCluster = LinearLayout(this).apply {
+        bottomLeftCluster = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.FLOATING_CLUSTER,
+            density = d
+        ).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.BOTTOM
+            clipChildren = false
+            clipToPadding = false
         }
         hsiView = DjiHsiRadarView(this, hub).apply {
             setOnClickListener {
@@ -2117,9 +2397,15 @@ class MainActivity : Activity() {
         )
 
         // 6. 右侧紧凑相机控制条 (y = 42..183dp, 绝不压盖下方 258..352dp 的三维姿态视窗)
-        rightCamStack = LinearLayout(this).apply {
+        rightCamStack = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.FLOATING_CLUSTER,
+            density = d
+        ).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
+            clipChildren = false
+            clipToPadding = false
         }
         btn3DRef = createCamPillBtn(Type.CUBE_3D, "3D视图", true).apply {
             setOnClickListener {
@@ -2242,6 +2528,7 @@ class MainActivity : Activity() {
         // 10. 居中模态设置中心 (置于最顶层，遮罩覆盖全屏)
         val modalRoot = settingsModal.buildModalView()
         cockpitRoot.addView(modalRoot, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        TouchChainGuard.disableMotionSplittingHierarchy(cockpitRoot)
 
         // 11. 异形屏/挖孔屏安全区自适应（RadioMaster AX12 无挖孔屏保持紧凑 8~10dp 边距零浪费）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -2287,8 +2574,15 @@ class MainActivity : Activity() {
     }
 
     private fun buildLayerQuickPopover(): LinearLayout {
-        val card = LinearLayout(this).apply {
+        val card = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.SOLID_BAR,
+            density = d,
+            activePredicate = { layerPopoverOpen }
+        ).apply {
             orientation = LinearLayout.VERTICAL
+            clipChildren = false
+            clipToPadding = false
             setPadding(dp(9f), dp(8f), dp(9f), dp(8f))
             GcsTheme.markRole(this, Role.GLASS_POPOVER, cornerDp = 9f)
             isClickable = true
@@ -2421,7 +2715,11 @@ class MainActivity : Activity() {
         g4.addView(popSwitchCurtain, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(4.5f) })
         card.addView(g4, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(4.5f) })
 
-        val actRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val actRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            clipChildren = false
+            clipToPadding = false
+        }
         val btnResetCam = createSmallIconBtn(Type.UNDO, "复位") {
             mapView.resetCameraSmooth()
             syncCameraControlLabels()
@@ -2461,9 +2759,16 @@ class MainActivity : Activity() {
     }
 
     private fun buildContextualCommandDock(): LinearLayout {
-        val dock = LinearLayout(this).apply {
+        val dock = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.SOLID_BAR,
+            density = d,
+            activePredicate = { dockLogicalActive }
+        ).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
+            clipChildren = false
+            clipToPadding = false
             setPadding(dp(9f), dp(6f), dp(9f), dp(6f))
             isClickable = true
         }
@@ -2482,6 +2787,8 @@ class MainActivity : Activity() {
         dockPinRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
         }
 
         btnDockFlyNow = TextView(this).apply {
@@ -2539,9 +2846,10 @@ class MainActivity : Activity() {
                     AnimHelper.showDjiToast(toastBanner, "选点位于障碍内部，无法加入航线", d)
                 } else {
                     AnimHelper.triggerRoleHaptic(it, GcsMotionSpec.HapticRole.DETENT_SELECT)
+                    mapView.triggerWaypointSpawnAnim(total - 1)
                     refreshCommandDockUi(pulseDock = true)
                     refreshWaypointOrchestratorList()
-                    AnimHelper.showDjiToast(toastBanner, "已加入航点 #$total", d)
+                    AnimHelper.showDjiToast(toastBanner, "已加入 3D 航点 #$total", d)
                 }
             }
         }
@@ -2587,9 +2895,10 @@ class MainActivity : Activity() {
         altInline.addView(btnPlus)
 
         val btnCancelPin = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER
-            setImageDrawable(GcsIcons.drawable(Type.CLOSE_X, dp(12.5f), Color.rgb(130, 145, 165)))
+            contentDescription = "取消选点"
+            GcsIcons.bindImage(this, Type.CLOSE_X, dp(12.5f), GcsTheme.of(hub.themeId).textSecondary)
             GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 5.5f)
+            GcsTheme.markIconRole(this, Role.TEXT_SECONDARY)
             setOnClickListener {
                 simEngine.clearPreviewPin()
                 refreshCommandDockUi()
@@ -2606,6 +2915,8 @@ class MainActivity : Activity() {
         dockRouteRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
             visibility = View.GONE
         }
 
@@ -2626,6 +2937,45 @@ class MainActivity : Activity() {
         }
         AnimHelper.attachSpringTouch(btnDockStartRoute)
 
+        btnDockPlotToggle = createSmallIconBtn(Type.PLUS_NODE, "连布") {
+            setWaypointPlacementMode(!hub.waypointPlacementMode, showToast = true)
+        }
+
+        val routeAltInline = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(27f)
+            GcsTheme.markRole(this, Role.WELL_TRACK, cornerDp = 5.5f)
+        }
+        val btnRouteAltMinus = TextView(this).apply {
+            text = "−"
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(6.5f), dp(3f), dp(6.5f), dp(3f))
+            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+            setOnClickListener { adjustTargetAltitudeByStep(-1f) }
+        }
+        AnimHelper.attachSpringTouch(btnRouteAltMinus, GcsMotionSpec.PressRole.SEGMENT_CHIP)
+        tvDockRouteAltVal = monoLabel(String.format(Locale.US, "%.1fm", hub.goalZ), "#69B7FF", 9.5f, Role.TEXT_ACCENT).apply {
+            setPadding(dp(4.5f), 0, dp(4.5f), 0)
+        }
+        val btnRouteAltPlus = TextView(this).apply {
+            text = "+"
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(6.5f), dp(3f), dp(6.5f), dp(3f))
+            GcsTheme.markRole(this, Role.TEXT_PRIMARY)
+            setOnClickListener { adjustTargetAltitudeByStep(+1f) }
+        }
+        AnimHelper.attachSpringTouch(btnRouteAltPlus, GcsMotionSpec.PressRole.SEGMENT_CHIP)
+        routeAltInline.addView(btnRouteAltMinus)
+        routeAltInline.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, dp(13f)))
+        routeAltInline.addView(tvDockRouteAltVal)
+        routeAltInline.addView(View(this).apply { GcsTheme.markRole(this, Role.DIVIDER) }, LinearLayout.LayoutParams(1, dp(13f)))
+        routeAltInline.addView(btnRouteAltPlus)
+
         btnDockOpenOrchestrate = createSmallIconBtn(Type.ROUTE_NODES, "航点") {
             if (!drawerOpen || activeTabIndex != TAB_ORCHESTRATE) {
                 toggleOrJumpDrawerTab(TAB_ORCHESTRATE)
@@ -2640,8 +2990,10 @@ class MainActivity : Activity() {
         }
 
         btnDockClearRoute = createSmallIconBtn(Type.TRASH, "清空") {
-            val (_, isStaged, _) = simEngine.routeStatusSummary()
-            if (isStaged) {
+            val (cnt, isStaged, _) = simEngine.routeStatusSummary()
+            if (cnt <= 0 && hub.waypointPlacementMode) {
+                setWaypointPlacementMode(false, showToast = true)
+            } else if (isStaged) {
                 simEngine.clearWaypointQueue()
                 refreshCommandDockUi()
                 refreshWaypointOrchestratorList()
@@ -2651,10 +3003,12 @@ class MainActivity : Activity() {
             }
         }
 
-        dockRouteRow.addView(btnDockStartRoute, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(5f) })
-        dockRouteRow.addView(btnDockOpenOrchestrate, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(5f) })
-        dockRouteRow.addView(btnDockUndo)
-        dockRouteRow.addView(btnDockClearRoute, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(5f) })
+        dockRouteRow.addView(btnDockStartRoute, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(4.5f) })
+        dockRouteRow.addView(btnDockPlotToggle, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(4.5f) })
+        dockRouteRow.addView(routeAltInline, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(4.5f) })
+        dockRouteRow.addView(btnDockOpenOrchestrate, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(4.5f) })
+        dockRouteRow.addView(btnDockUndo, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = dp(4.5f) })
+        dockRouteRow.addView(btnDockClearRoute)
         dock.addView(dockRouteRow)
 
         return dock
@@ -2667,6 +3021,7 @@ class MainActivity : Activity() {
             AnimHelper.triggerHaptic(sourceView, HapticFeedbackConstants.LONG_PRESS)
             mapView.recenterLockDrone()
             syncCameraControlLabels()
+            syncWaypointPlotPillUi()
             syncPatrolPillUi()
             refreshCommandDockUi(pulseDock = true)
             refreshWaypointOrchestratorList()
@@ -2684,8 +3039,15 @@ class MainActivity : Activity() {
     // ==================== 四标签主作业抽屉 (连接 | 航线 | 话题 | 状态) ====================
 
     private fun buildSlideOverDrawer(drawerWidthPx: Int): LinearLayout {
-        val container = LinearLayout(this).apply {
+        val container = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.SOLID_BAR,
+            density = d,
+            activePredicate = { drawerOpen }
+        ).apply {
             orientation = LinearLayout.VERTICAL
+            clipChildren = false
+            clipToPadding = false
             GcsTheme.markRole(this, Role.GLASS_DRAWER, cornerDp = 11f)
             isClickable = true
             isFocusable = true
@@ -2727,9 +3089,9 @@ class MainActivity : Activity() {
         }
 
         val btnCloseDrawer = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER
-            setImageDrawable(GcsIcons.drawable(Type.CLOSE_X, dp(13.5f), Color.rgb(140, 155, 175)))
-            setPadding(dp(8f), 0, dp(9f), 0)
+            contentDescription = "收起抽屉"
+            GcsIcons.bindImage(this, Type.CLOSE_X, dp(13.5f), GcsTheme.of(hub.themeId).textSecondary)
+            GcsTheme.markIconRole(this, Role.TEXT_SECONDARY)
             setOnClickListener { setDrawerOpenState(false) }
         }
         AnimHelper.attachSpringTouch(btnCloseDrawer, GcsMotionSpec.PressRole.ICON_CONTROL)
@@ -2768,7 +3130,6 @@ class MainActivity : Activity() {
         bodyHost.addView(pTopics)
         bodyHost.addView(pStatus)
         container.addView(bodyHost, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-
         return container
     }
 
@@ -3367,19 +3728,27 @@ class MainActivity : Activity() {
 
         val tplRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         tplRow2.addView(
-            createSmallIconBtn(Type.PLUS_NODE, "采集当前机位为航点") {
-                val (_, total, _) = simEngine.appendCurrentUavAsWaypoint()
-                refreshCommandDockUi(pulseDock = true)
-                refreshWaypointOrchestratorList()
-                AnimHelper.showDjiToast(toastBanner, "已采集当前机位为航点 #$total", d)
+            createSmallIconBtn(Type.TARGET_PIN, "地图连布") {
+                setDrawerOpenState(false)
+                setWaypointPlacementMode(true, showToast = true)
             },
-            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.35f)
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 0.95f)
         )
         tplRow2.addView(
-            createSmallIconBtn(Type.SLIDERS, "速度与高度设置") {
+            createSmallIconBtn(Type.PLUS_NODE, "采集当前机位") {
+                val (_, total, _) = simEngine.appendCurrentUavAsWaypoint()
+                mapView.triggerWaypointSpawnAnim(total - 1)
+                refreshCommandDockUi(pulseDock = true)
+                refreshWaypointOrchestratorList()
+                AnimHelper.showDjiToast(toastBanner, "已采集当前机位为 3D 航点 #$total", d)
+            },
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.15f).apply { leftMargin = dp(4.5f) }
+        )
+        tplRow2.addView(
+            createSmallIconBtn(Type.SLIDERS, "速度与高度") {
                 setSettingsModalOpen(true, jumpCategory = GcsSettingsModal.CAT_CONTROL)
             },
-            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(5f) }
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 0.95f).apply { leftMargin = dp(4.5f) }
         )
         tplCard.addView(tplRow2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(5.5f) })
         col.addView(tplCard, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8f) })
@@ -3566,31 +3935,54 @@ class MainActivity : Activity() {
         }
 
         btnOrchPrimaryExecute.alpha = 1.0f
+        val etaSec = MissionRouteVisualizer.computeMissionEtaSeconds(arcLen, nodes.size, hub.maxVel)
         if (isStaged) {
             setTextIfChanged(
                 tvWaypointQueueSummary,
-                String.format(Locale.US, "待飞 %d 站 · 总长 %.1fm", nodes.size, arcLen)
+                String.format(Locale.US, "待飞 %d 站 · 总长 %.1fm · 约 %ds", nodes.size, arcLen, etaSec)
             )
             GcsIcons.bind(btnOrchPrimaryExecute, Type.PLAY, "启动编排航线 (${nodes.size}站)", d, iconDp = 11.5f)
             btnOrchPrimaryExecute.background = roundedColor(Color.parseColor("#00B865"), dp(6f))
         } else {
-            setTextIfChanged(tvWaypointQueueSummary, "执行中 · 剩余 ${nodes.size} 站")
+            val etaSuffix = if (etaSec > 0) " · 约 ${etaSec}s" else ""
+            setTextIfChanged(tvWaypointQueueSummary, "执行中 · 剩余 ${nodes.size} 站$etaSuffix")
             GcsIcons.bind(btnOrchPrimaryExecute, Type.STOP_SQUARE, "终止航线并悬停", d, iconDp = 11.5f)
             btnOrchPrimaryExecute.background = roundedColor(Color.parseColor("#FF3B30"), dp(6f))
         }
 
+        val (_, selectedWpNode) = simEngine.getSelectedWaypointInfo()
+        val selectedIdx = selectedWpNode?.index ?: -1
+
         for (i in nodes.indices) {
             val wp = nodes[i]
-            val row = LinearLayout(this).apply {
+            val isRowSelected = (i == selectedIdx)
+            val row = TouchChainGuard.IconSlopLinearLayout(
+                context = this,
+                containerMode = TouchChainGuard.ContainerMode.SCROLLABLE_ICON_ROW,
+                density = d,
+                compactSlopDp = 6.5f
+            ).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                clipChildren = false
+                clipToPadding = false
                 setPadding(dp(7f), dp(5f), dp(7f), dp(5f))
-                background = roundedColor(pal.wellFill, dp(6f))
+                background = if (isRowSelected) {
+                    pillBg(pal.accentSoftFill, pal.accent, radiusDp = 6f)
+                } else {
+                    roundedColor(pal.wellFill, dp(6f))
+                }
             }
 
             val infoTv = TextView(this).apply {
                 maxLines = 2
-                setTextColor(if (wp.isSafe) pal.textPrimary else Color.parseColor("#FF5252"))
+                setTextColor(
+                    when {
+                        !wp.isSafe -> Color.parseColor("#FF5252")
+                        isRowSelected -> pal.accentBright
+                        else -> pal.textPrimary
+                    }
+                )
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.6f)
                 typeface = Typeface.MONOSPACE
                 GcsIcons.bind(
@@ -3603,20 +3995,22 @@ class MainActivity : Activity() {
                 )
                 setOnClickListener {
                     AnimHelper.triggerHaptic(it)
+                    simEngine.selectOrchestratedWaypoint(i)
                     mapView.focusWorldPointSmooth(wp.x, wp.y)
+                    mapView.triggerWaypointSpawnAnim(i, fromScale = 0.80f)
                     syncCameraControlLabels()
-                    AnimHelper.pulseViewSubtle(row)
+                    refreshCommandDockUi()
+                    refreshWaypointOrchestratorList()
                 }
             }
 
-            fun tinySquareIcon(ic: Type, enabled: Boolean, onTap: () -> Unit): ImageView = ImageView(this).apply {
-                scaleType = ImageView.ScaleType.CENTER
-                setImageDrawable(
-                    GcsIcons.drawable(
-                        ic,
-                        dp(11f),
-                        if (enabled) pal.textPrimary else pal.textHint
-                    )
+            fun tinySquareIcon(ic: Type, desc: String, enabled: Boolean, onTap: () -> Unit): ImageView = ImageView(this).apply {
+                contentDescription = desc
+                GcsIcons.bindImage(
+                    this,
+                    ic,
+                    dp(11f),
+                    if (enabled) pal.textPrimary else pal.textHint
                 )
                 background = roundedColor(if (enabled) pal.cardFill else Color.TRANSPARENT, dp(4.5f))
                 isEnabled = enabled
@@ -3641,13 +4035,13 @@ class MainActivity : Activity() {
                 AnimHelper.attachSpringTouch(this, GcsMotionSpec.PressRole.SEGMENT_CHIP)
             }
 
-            val btnUp = tinySquareIcon(Type.ARROW_UP, i > 0) {
+            val btnUp = tinySquareIcon(Type.ARROW_UP, "上移航点", i > 0) {
                 if (simEngine.moveOrchestratedWaypoint(i, -1)) {
                     refreshCommandDockUi()
                     refreshWaypointOrchestratorList()
                 }
             }
-            val btnDown = tinySquareIcon(Type.ARROW_DOWN, i < nodes.lastIndex) {
+            val btnDown = tinySquareIcon(Type.ARROW_DOWN, "下移航点", i < nodes.lastIndex) {
                 if (simEngine.moveOrchestratedWaypoint(i, +1)) {
                     refreshCommandDockUi()
                     refreshWaypointOrchestratorList()
@@ -3655,15 +4049,17 @@ class MainActivity : Activity() {
             }
             val btnZMinus = tinyTextStepBtn("-") {
                 simEngine.nudgeOrchestratedWaypointZ(i, -hub.altStepMeters)
+                mapView.triggerWaypointSpawnAnim(i, fromScale = 0.86f)
                 refreshCommandDockUi()
                 refreshWaypointOrchestratorList()
             }
             val btnZPlus = tinyTextStepBtn("+") {
                 simEngine.nudgeOrchestratedWaypointZ(i, +hub.altStepMeters)
+                mapView.triggerWaypointSpawnAnim(i, fromScale = 0.86f)
                 refreshCommandDockUi()
                 refreshWaypointOrchestratorList()
             }
-            val btnDel = tinySquareIcon(Type.CLOSE_X, true) {
+            val btnDel = tinySquareIcon(Type.CLOSE_X, "删除航点", true) {
                 simEngine.removeOrchestratedWaypointAt(i)
                 refreshCommandDockUi()
                 refreshWaypointOrchestratorList()
@@ -3806,9 +4202,10 @@ class MainActivity : Activity() {
             setWideTerminalMode(!drawerWideMode, applyImmediately = true, animateWidth = true)
         }
         val btnCopyEcho = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER
-            setImageDrawable(GcsIcons.drawable(Type.COPY, dp(13f), Color.rgb(120, 160, 210)))
+            contentDescription = "复制话题数据"
+            GcsIcons.bindImage(this, Type.COPY, dp(13f), GcsTheme.of(hub.themeId).accentBright)
             GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 6f)
+            GcsTheme.markIconRole(this, Role.TEXT_ACCENT)
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
                 val entry = selectedTopicEntry
@@ -4378,18 +4775,33 @@ class MainActivity : Activity() {
         }
 
         var autoConnectedThisRun = false
+        val liveInputHints = buildString {
+            if (::inpMasterUri.isInitialized) append(inpMasterUri.text).append(' ')
+            if (::inpWsUrl.isInitialized) append(inpWsUrl.text).append(' ')
+            if (::inpSwarmPeerIps.isInitialized) append(inpSwarmPeerIps.text)
+        }.trim()
 
         lanScanner.startScan(
             baseConfig = rosManager.topics.copy(),
+            manualHintRaw = liveInputHints,
             onProgress = { _, hint ->
                 runOnUiThread { setTextIfChanged(tvScanStatus, hint) }
             },
             onDroneFound = { drone ->
                 runOnUiThread {
-                    discoveredDrones.add(drone)
-                    addDiscoveredDroneRow(drone)
+                    val existingIdx = discoveredDrones.indexOfFirst { it.ip == drone.ip }
+                    if (existingIdx >= 0) {
+                        discoveredDrones[existingIdx] = drone
+                        discoveredListContainer.removeAllViews()
+                        for (dItem in discoveredDrones) {
+                            addDiscoveredDroneRow(dItem)
+                        }
+                    } else {
+                        discoveredDrones.add(drone)
+                        addDiscoveredDroneRow(drone)
+                    }
 
-                    if (hub.autoConnectDiscovered && !hub.rosConnected && !autoConnectedThisRun) {
+                    if (drone.rosReady && hub.autoConnectDiscovered && !hub.rosConnected && !autoConnectedThisRun) {
                         autoConnectedThisRun = true
                         applyDiscoveredDroneAndConnect(drone, fromAuto = true)
                     }
@@ -4398,16 +4810,23 @@ class MainActivity : Activity() {
             onComplete = { allFound, subnet ->
                 runOnUiThread {
                     GcsIcons.bind(btnDrawerScan, Type.SEARCH, "重新扫描飞机", d, iconDp = 12f)
+                    val rosReadyCount = allFound.count { it.rosReady }
                     if (allFound.isEmpty()) {
-                        setTextIfChanged(tvScanStatus, "在 $subnet 未发现开放 11311 或 9090 的设备")
+                        setTextIfChanged(tvScanStatus, "在 $subnet 未发现机载 ROS1 (11311/9090) 或在线机载主机")
                         if (!silentIfEmpty) {
-                            AnimHelper.showDjiToast(toastBanner, "未搜到无人机，请确认同网段或手动输入 IP", d)
+                            AnimHelper.showDjiToast(toastBanner, "未搜到无人机，请检查机载 Wi-Fi/网口连接或手动输入 IP", d)
+                            if (autoOpenConnTabOnEmpty) toggleOrJumpDrawerTab(TAB_CONN)
+                        }
+                    } else if (rosReadyCount == 0) {
+                        setTextIfChanged(tvScanStatus, "扫描完成 ($subnet)：发现 ${allFound.size} 台在线机载主机，待启动 roscore/9090")
+                        if (!silentIfEmpty) {
+                            AnimHelper.showDjiToast(toastBanner, "已搜到机载主机 ${allFound.first().ip}，请启动 roscore 后连接", d)
                             if (autoOpenConnTabOnEmpty) toggleOrJumpDrawerTab(TAB_CONN)
                         }
                     } else {
-                        setTextIfChanged(tvScanStatus, "扫描完成 ($subnet)：发现 ${allFound.size} 台设备")
+                        setTextIfChanged(tvScanStatus, "扫描完成 ($subnet)：发现 $rosReadyCount 台可用 ROS 无人机")
                         if (!autoConnectedThisRun && !silentIfEmpty) {
-                            AnimHelper.showDjiToast(toastBanner, "发现 ${allFound.size} 台无人机，请点选连接", d)
+                            AnimHelper.showDjiToast(toastBanner, "发现 $rosReadyCount 台无人机，请点选连接", d)
                         }
                     }
                 }
@@ -4417,6 +4836,7 @@ class MainActivity : Activity() {
 
     private fun addDiscoveredDroneRow(drone: DiscoveredDrone) {
         val pal = GcsTheme.of(hub.themeId)
+        val strokeColor = if (drone.rosReady) pal.secondaryAccent else Color.parseColor("#FFB300")
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -4424,62 +4844,97 @@ class MainActivity : Activity() {
             background = GradientDrawable().apply {
                 setColor(pal.wellFill)
                 cornerRadius = dp(6f).toFloat()
-                setStroke(1, pal.secondaryAccent)
+                setStroke(1, strokeColor)
             }
         }
 
         val infoCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val protoTag = if (drone.protocol == "tcpros") "TCPROS:${drone.port}" else "WS:${drone.port}"
+        val protoTag = when {
+            !drone.rosReady -> "SSH:${drone.port}"
+            drone.protocol == "tcpros" -> "TCPROS:${drone.port}"
+            else -> "WS:${drone.port}"
+        }
         val titleTv = TextView(this).apply {
             maxLines = 1
             setHorizontallyScrolling(false)
             setTextColor(pal.textPrimary)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.6f)
             typeface = Typeface.MONOSPACE
-            GcsIcons.bind(this, Type.DRONE_QUAD, "${drone.ip} · ${drone.rttMs}ms", d, iconDp = 12f)
+            GcsIcons.bind(
+                this,
+                if (drone.rosReady) Type.DRONE_QUAD else Type.WARNING,
+                "${drone.ip} · ${drone.rttMs}ms",
+                d,
+                iconDp = 12f
+            )
         }
         val subTv = TextView(this).apply {
             text = "$protoTag | ${drone.stackSummary}"
             maxLines = 1
             setHorizontallyScrolling(false)
             ellipsize = TextUtils.TruncateAt.END
-            setTextColor(pal.secondaryAccent)
+            setTextColor(if (drone.rosReady) pal.secondaryAccent else Color.parseColor("#FFB300"))
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.2f)
         }
         infoCol.addView(titleTv)
         infoCol.addView(subTv)
 
+        row.addView(infoCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+
+        if (drone.rosReady) {
+            val btnJoinSwarm = TextView(this).apply {
+                gravity = Gravity.CENTER
+                maxLines = 1
+                setHorizontallyScrolling(false)
+                setTextColor(Color.parseColor("#00E676"))
+                setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.8f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(7.5f), dp(5f), dp(7.5f), dp(5f))
+                background = pillBg(Color.argb(38, 0, 230, 118), Color.parseColor("#00E676"))
+                GcsIcons.bind(this, Type.SWARM_FLEET, "编入多机", d, iconDp = 10.5f, gapDp = 2.5f)
+                setOnClickListener { enrollDiscoveredDroneIntoSwarm(drone) }
+            }
+            AnimHelper.attachSpringTouch(btnJoinSwarm)
+            row.addView(btnJoinSwarm, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(5f) })
+        }
+
         val btnBind = TextView(this).apply {
             gravity = Gravity.CENTER
             maxLines = 1
             setHorizontallyScrolling(false)
-            setTextColor(Color.WHITE)
+            setTextColor(if (drone.rosReady) Color.WHITE else Color.rgb(24, 28, 36))
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(9.5f), dp(5f), dp(9.5f), dp(5f))
-            background = roundedColor(pal.accent, dp(5f))
-            GcsIcons.bind(this, Type.LINK, "连接", d, iconDp = 11f)
-            setOnClickListener { applyDiscoveredDroneAndConnect(drone, fromAuto = false) }
+            background = roundedColor(
+                if (drone.rosReady) pal.accent else Color.parseColor("#FFB300"),
+                dp(5f)
+            )
+            GcsIcons.bind(
+                this,
+                if (drone.rosReady) Type.LINK else Type.TARGET_PIN,
+                if (drone.rosReady) "连接" else "填入IP",
+                d,
+                iconDp = 11f
+            )
+            setOnClickListener {
+                if (drone.rosReady) {
+                    applyDiscoveredDroneAndConnect(drone, fromAuto = false)
+                } else {
+                    inpMasterUri.setText(drone.suggestedConfig.masterUri)
+                    inpWsUrl.setText(drone.suggestedConfig.wsUrl)
+                    saveCurrentTopics(quiet = true)
+                    AnimHelper.showDjiToast(
+                        toastBanner,
+                        "已填入机载 IP ${drone.ip}，请在机载端启动 roscore 后点击立即连接",
+                        d
+                    )
+                }
+            }
         }
         AnimHelper.attachSpringTouch(btnBind)
-
-        val btnJoinSwarm = TextView(this).apply {
-            gravity = Gravity.CENTER
-            maxLines = 1
-            setHorizontallyScrolling(false)
-            setTextColor(Color.parseColor("#00E676"))
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.8f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(7.5f), dp(5f), dp(7.5f), dp(5f))
-            background = pillBg(Color.argb(38, 0, 230, 118), Color.parseColor("#00E676"))
-            GcsIcons.bind(this, Type.SWARM_FLEET, "编入多机", d, iconDp = 10.5f, gapDp = 2.5f)
-            setOnClickListener { enrollDiscoveredDroneIntoSwarm(drone) }
-        }
-        AnimHelper.attachSpringTouch(btnJoinSwarm)
-
-        row.addView(infoCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        row.addView(btnJoinSwarm, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(5f) })
         row.addView(btnBind, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(5f) })
+
         discoveredListContainer.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(5f) })
         AnimHelper.pulseViewSubtle(row)
     }
@@ -4664,7 +5119,7 @@ class MainActivity : Activity() {
             }
         }
 
-        if (!s.hasPreviewPin && (s.waypointQueueCount > 0 || commandDock.visibility == View.VISIBLE)) {
+        if (!s.hasPreviewPin && (s.waypointQueueCount > 0 || hub.waypointPlacementMode || commandDock.visibility == View.VISIBLE)) {
             refreshCommandDockUi()
         }
 
@@ -4947,9 +5402,17 @@ class MainActivity : Activity() {
     // ==================== 多机集群协同编队座舱栏与抽屉控制组件 ====================
 
     private fun buildSwarmTacticalHudBar(): LinearLayout {
-        val bar = LinearLayout(this).apply {
+        val bar = TouchChainGuard.IconSlopLinearLayout(
+            context = this,
+            containerMode = TouchChainGuard.ContainerMode.SOLID_BAR,
+            density = d,
+            compactSlopDp = 5f,
+            standardSlopDp = 4f
+        ).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
             setPadding(dp(4.5f), dp(3f), dp(4.5f), dp(3f))
             GcsTheme.markRole(this, Role.GLASS_PANEL, cornerDp = 14f)
             visibility = if (hub.swarmModeEnabled) View.VISIBLE else View.GONE
@@ -5884,7 +6347,7 @@ class MainActivity : Activity() {
         setTextColor(pal.textPrimary)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.2f)
         typeface = Typeface.DEFAULT_BOLD
-        setPadding(dp(10.5f), dp(5f), dp(11f), dp(5f))
+        setPadding(dp(10.5f), dp(5f), dp(10.5f), dp(5f))
         val ac = Color.parseColor(accentHex)
         background = pillBg(if (active) Color.argb(56, Color.red(ac), Color.green(ac), Color.blue(ac)) else pal.glassFill, ac)
         GcsIcons.bind(this, icon, label, d, iconDp = 11.5f, gapDp = 4f)

@@ -5,6 +5,8 @@ import com.radiomaster.egogcs.engine.EgoSimEngine
 import com.radiomaster.egogcs.model.GcsSharedHub
 import com.radiomaster.egogcs.model.SwarmPalette
 import com.radiomaster.egogcs.model.TopicConfig
+import java.net.Proxy
+import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
@@ -95,7 +97,17 @@ class RosBridgeClient(
             return
         }
 
-        ws = client.newWebSocket(
+        val wsHost = try {
+            URI(cfg.wsUrl.trim()).host.orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+        val lanBoundClient = client.newBuilder()
+            .proxy(Proxy.NO_PROXY)
+            .socketFactory(LanNetworkBinder.socketFactoryForHost(wsHost))
+            .build()
+
+        ws = lanBoundClient.newWebSocket(
             req,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {

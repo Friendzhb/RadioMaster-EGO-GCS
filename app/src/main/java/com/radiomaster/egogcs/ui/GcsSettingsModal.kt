@@ -302,7 +302,12 @@ class GcsSettingsModal(
         allSeekBars.clear()
         allSliderValBadges.clear()
 
-        scrimRoot = FrameLayout(context).apply {
+        scrimRoot = TouchChainGuard.IconSlopFrameLayout(
+            context = context,
+            containerMode = TouchChainGuard.ContainerMode.MODAL_SCRIM,
+            density = d,
+            activePredicate = { isOpen }
+        ).apply {
             setBackgroundColor(GcsTheme.of(hub.themeId).modalScrim)
             visibility = View.GONE
             isClickable = true
@@ -310,16 +315,22 @@ class GcsSettingsModal(
             setOnClickListener { setVisible(false) }
         }
 
-        dialogCard = LinearLayout(context).apply {
+        dialogCard = TouchChainGuard.IconSlopLinearLayout(
+            context = context,
+            containerMode = TouchChainGuard.ContainerMode.SOLID_BAR,
+            density = d
+        ).apply {
             orientation = LinearLayout.VERTICAL
             GcsTheme.markRole(this, Role.MODAL_CARD, cornerDp = 11f)
             isClickable = true
-            setOnClickListener { }
         }
 
         val header = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            isMotionEventSplittingEnabled = false
+            clipChildren = false
+            clipToPadding = false
             setPadding(dp(12f), dp(6f), dp(8f), dp(6f))
             GcsTheme.markRole(this, Role.MODAL_HEADER)
         }
@@ -356,7 +367,8 @@ class GcsSettingsModal(
         AnimHelper.attachSpringTouch(btnHeaderQuickUpdate)
 
         btnCloseHeader = ImageView(context).apply {
-            scaleType = ImageView.ScaleType.CENTER
+            scaleType = ImageView.ScaleType.FIT_XY
+            contentDescription = "关闭设置"
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
                 setVisible(false)
@@ -479,8 +491,8 @@ class GcsSettingsModal(
         scrimRoot.setBackgroundColor(pal.modalScrim)
         GcsTheme.applyTree(dialogCard, pal, d)
 
-        btnCloseHeader.setImageDrawable(GcsIcons.drawable(Type.CLOSE_X, dp(14f), pal.textPrimary))
-        btnCloseHeader.background = roundedColor(pal.cardFill, dp(6f))
+        GcsIcons.bindImage(btnCloseHeader, Type.CLOSE_X, dp(13.5f), pal.textPrimary)
+        btnCloseHeader.background = pillBg(pal.cardFill, pal.cardStroke, radiusDp = 6f)
 
         for (ab in allActionBtns) {
             ab.setTextColor(pal.textPrimary)
@@ -1232,6 +1244,8 @@ class GcsSettingsModal(
         val otaActionRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
         }
         btnOtaSyncMirrors = actionBtn(Type.RADAR_SIGNAL, "刷新加速源") {
             otaManager.refreshLiveMirrors(manualTrigger = true)
@@ -1409,7 +1423,11 @@ class GcsSettingsModal(
         }
         sysCard.addView(tvSysDiagSummary)
 
-        val maintRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        val maintRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            clipChildren = false
+            clipToPadding = false
+        }
         maintRow.addView(
             actionBtn(Type.DOWNLOAD, "导出点云") {
                 onExportPcd()

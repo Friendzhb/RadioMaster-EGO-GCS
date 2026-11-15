@@ -10,6 +10,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.TextView
 import kotlin.math.roundToInt
@@ -52,6 +53,7 @@ object GcsTheme {
 
     private const val TAG_ROLE = -0x35792468
     private const val TAG_CORNER_DP = -0x35792469
+    private const val TAG_ICON_ROLE = -0x3579246A
 
     data class Palette(
         val id: Int,
@@ -364,6 +366,10 @@ object GcsTheme {
         view.setTag(TAG_CORNER_DP, cornerDp)
     }
 
+    fun markIconRole(view: ImageView, iconRole: Role) {
+        view.setTag(TAG_ICON_ROLE, iconRole)
+    }
+
     /**
      * 启用 OpenType 等宽数字特性 (Tabular Figures `tnum`) 与亚像素抗锯齿，杜绝 60Hz 刷新时数字位宽抖动。
      */
@@ -542,6 +548,19 @@ object GcsTheme {
                     view.invalidate()
                 }
             }
+        }
+
+        val iconRole = view.getTag(TAG_ICON_ROLE) as? Role
+        if (iconRole != null && view is ImageView) {
+            val iconCol = when (iconRole) {
+                Role.TEXT_PRIMARY -> p.textPrimary
+                Role.TEXT_SECONDARY -> p.textSecondary
+                Role.TEXT_MUTED -> p.textMuted
+                Role.TEXT_ACCENT -> p.accentBright
+                Role.TEXT_CONSOLE -> p.textConsole
+                else -> p.textSecondary
+            }
+            (view.drawable as? GcsIcons.GlyphDrawable)?.updateBaseColor(iconCol)
         }
 
         if (view is ViewGroup) {

@@ -5,16 +5,22 @@ import android.annotation.SuppressLint
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.animation.CycleInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.dynamicanimation.animation.DynamicAnimation
+import androidx.dynamicanimation.animation.FloatPropertyCompat
+import androidx.dynamicanimation.animation.SpringAnimation
+import androidx.dynamicanimation.animation.SpringForce
 import com.radiomaster.egogcs.ui.GcsMotionSpec.DurationToken
 import com.radiomaster.egogcs.ui.GcsMotionSpec.HapticRole
 import com.radiomaster.egogcs.ui.GcsMotionSpec.PressRole
 import com.radiomaster.egogcs.ui.GcsMotionSpec.SpringToken
+import java.util.WeakHashMap
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.sign
@@ -34,6 +40,14 @@ object AnimHelper {
     private var dockVisibleLogical: Boolean = false
     private var drawerWidthAnimator: ValueAnimator? = null
     private var lastSliderTickMs: Long = 0L
+    private val glyphSpringCache = WeakHashMap<GcsIcons.GlyphDrawable, SpringAnimation>()
+
+    private val GLYPH_ROTATION_PROP = object : FloatPropertyCompat<GcsIcons.GlyphDrawable>("glyphRotationDeg") {
+        override fun getValue(drawable: GcsIcons.GlyphDrawable): Float = drawable.rotationDeg
+        override fun setValue(drawable: GcsIcons.GlyphDrawable, value: Float) {
+            drawable.rotationDeg = value
+        }
+    }
 
     @Volatile var hapticsEnabled: Boolean = true
 
@@ -79,14 +93,47 @@ object AnimHelper {
     }
 
     /**
-     * 按控件角色绑定零泄漏物理按压弹簧，连点或滑出边界时保持速度连续回弹。
+     * 按控件角色绑定零泄漏物理按压弹簧与完整 `MotionEvent` 消费链：
+     * - 还原 `scale < 1` 期间被逆矩阵放大的局部坐标，防止边缘连点提前掉按压态；
+     * - 锁定活动触点 ID 并完整消费 `DOWN -> MOVE -> UP/CANCEL` 序列，杜绝手势滑出图标时漏穿触发底层地图平移或地面打点。
      */
     @SuppressLint("ClickableViewAccessibility")
     fun attachSpringTouch(view: View, role: PressRole = PressRole.PILL_BUTTON) {
+        if (!view.isClickable && !view.isLongClickable) {
+            view.isClickable = true
+        }
+        val touchSlop = ViewConfiguration.get(view.context).scaledTouchSlop.toFloat()
+        var activePointerId = MotionEvent.INVALID_POINTER_ID
+        var trackingInside = false
+        var downRawX = 0f
+        var downRawY = 0f
+        var scrollableHost = false
+
+        fun springBack(v: View) {
+            GcsMotionSpec.springTo(v, DynamicAnimation.SCALE_X, 1.0f, role.springToken)
+            GcsMotionSpec.springTo(v, DynamicAnimation.SCALE_Y, 1.0f, role.springToken)
+        }
+
         view.setOnTouchListener { v, event ->
-            if (!v.isEnabled) return@setOnTouchListener false
+            if (!v.isEnabled) {
+                if (trackingInside) {
+                    trackingInside = false
+                    activePointerId = MotionEvent.INVALID_POINTER_ID
+                    v.isPressed = false
+                    springBack(v)
+                }
+                return@setOnTouchListener false
+            }
+
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    activePointerId = event.getPointerId(0)
+                    trackingInside = true
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    scrollableHost = TouchChainGuard.hasScrollableAncestor(v)
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
+
                     triggerRoleHaptic(v, role.downHaptic)
                     val targetScale = if (GcsMotionSpec.isMinimalMotion()) {
                         role.minimalScale
@@ -95,13 +142,128 @@ object AnimHelper {
                     }
                     GcsMotionSpec.springTo(v, DynamicAnimation.SCALE_X, targetScale, role.springToken)
                     GcsMotionSpec.springTo(v, DynamicAnimation.SCALE_Y, targetScale, role.springToken)
+
+                    val origX = event.x
+                    val origY = event.y
+                    val ux = TouchChainGuard.unscaleAxis(origX, v.pivotX, v.scaleX)
+                    val uy = TouchChainGuard.unscaleAxis(origY, v.pivotY, v.scaleY)
+                    event.setLocation(ux, uy)
+                    try {
+                        v.onTouchEvent(event)
+                    } finally {
+                        event.setLocation(origX, origY)
+                    }
+                    true
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    GcsMotionSpec.springTo(v, DynamicAnimation.SCALE_X, 1.0f, role.springToken)
-                    GcsMotionSpec.springTo(v, DynamicAnimation.SCALE_Y, 1.0f, role.springToken)
+
+                MotionEvent.ACTION_MOVE -> {
+                    val pIdx = event.findPointerIndex(activePointerId)
+                    if (pIdx < 0) {
+                        if (trackingInside) {
+                            trackingInside = false
+                            v.isPressed = false
+                            springBack(v)
+                        }
+                        return@setOnTouchListener true
+                    }
+                    val ux = TouchChainGuard.unscaleAxis(event.getX(pIdx), v.pivotX, v.scaleX)
+                    val uy = TouchChainGuard.unscaleAxis(event.getY(pIdx), v.pivotY, v.scaleY)
+                    if (scrollableHost && trackingInside) {
+                        val dxRaw = abs(event.rawX - downRawX)
+                        val dyRaw = abs(event.rawY - downRawY)
+                        if (dyRaw > touchSlop || dxRaw > touchSlop * 1.5f) {
+                            v.parent?.requestDisallowInterceptTouchEvent(false)
+                        }
+                    }
+                    val stillInside = TouchChainGuard.isPointInUnscaledBounds(ux, uy, v.width, v.height, touchSlop)
+                    if (!stillInside && trackingInside) {
+                        trackingInside = false
+                        springBack(v)
+                    }
+                    val origX = event.x
+                    val origY = event.y
+                    event.setLocation(ux, uy)
+                    try {
+                        v.onTouchEvent(event)
+                    } finally {
+                        event.setLocation(origX, origY)
+                    }
+                    true
                 }
+
+                MotionEvent.ACTION_POINTER_UP -> {
+                    val liftedId = event.getPointerId(event.actionIndex)
+                    if (liftedId == activePointerId) {
+                        activePointerId = MotionEvent.INVALID_POINTER_ID
+                        if (trackingInside) {
+                            trackingInside = false
+                            springBack(v)
+                        }
+                        val cancelEv = MotionEvent.obtain(
+                            event.downTime,
+                            event.eventTime,
+                            MotionEvent.ACTION_CANCEL,
+                            0f,
+                            0f,
+                            event.metaState
+                        )
+                        try {
+                            v.onTouchEvent(cancelEv)
+                        } finally {
+                            cancelEv.recycle()
+                        }
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_POINTER_DOWN -> true
+
+                MotionEvent.ACTION_UP -> {
+                    val pIdx = event.findPointerIndex(activePointerId)
+                    val wasTracking = trackingInside && pIdx >= 0
+                    trackingInside = false
+                    activePointerId = MotionEvent.INVALID_POINTER_ID
+                    springBack(v)
+
+                    if (wasTracking) {
+                        val ux = TouchChainGuard.unscaleAxis(event.getX(pIdx), v.pivotX, v.scaleX)
+                        val uy = TouchChainGuard.unscaleAxis(event.getY(pIdx), v.pivotY, v.scaleY)
+                        val origX = event.x
+                        val origY = event.y
+                        event.setLocation(ux, uy)
+                        try {
+                            v.onTouchEvent(event)
+                        } finally {
+                            event.setLocation(origX, origY)
+                        }
+                    } else {
+                        val cancelEv = MotionEvent.obtain(
+                            event.downTime,
+                            event.eventTime,
+                            MotionEvent.ACTION_CANCEL,
+                            0f,
+                            0f,
+                            event.metaState
+                        )
+                        try {
+                            v.onTouchEvent(cancelEv)
+                        } finally {
+                            cancelEv.recycle()
+                        }
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_CANCEL -> {
+                    trackingInside = false
+                    activePointerId = MotionEvent.INVALID_POINTER_ID
+                    springBack(v)
+                    v.onTouchEvent(event)
+                    true
+                }
+
+                else -> true
             }
-            false
         }
     }
 
@@ -477,7 +639,9 @@ object AnimHelper {
 
     fun animatePopover(popover: View, show: Boolean, density: Float) {
         popover.animate().cancel()
-        popover.pivotX = popover.width.takeIf { it > 0 }?.toFloat() ?: (200f * density)
+        popover.pivotX = popover.width.takeIf { it > 0 }?.toFloat()
+            ?: popover.layoutParams?.width?.takeIf { it > 0 }?.toFloat()
+            ?: (264f * density)
         popover.pivotY = 10f * density
         if (show) {
             popover.visibility = View.VISIBLE
@@ -552,9 +716,30 @@ object AnimHelper {
         }
     }
 
+    /**
+     * 仅围绕 24x24 图标视口几何中心旋转内部齿轮字形，严禁旋转外层非正方形圆角矩形按钮容器 (28x26dp)，
+     * 彻底杜绝点击设置后外框倾斜、越界裁切及挤占相邻控件。
+     */
     fun animateGearRotation(gearView: View, open: Boolean) {
+        gearView.rotation = 0f
         val targetDeg = if (open) 75f else 0f
-        GcsMotionSpec.springTo(gearView, DynamicAnimation.ROTATION, targetDeg, SpringToken.GEAR_ROTATE)
+        val glyph = (gearView as? ImageView)?.drawable as? GcsIcons.GlyphDrawable ?: return
+        if (GcsMotionSpec.isMinimalMotion()) {
+            glyphSpringCache[glyph]?.cancel()
+            glyph.rotationDeg = targetDeg
+            return
+        }
+        val profile = GcsMotionSpec.effectiveProfile()
+        val anim = glyphSpringCache.getOrPut(glyph) {
+            SpringAnimation(glyph, GLYPH_ROTATION_PROP, targetDeg).apply {
+                minimumVisibleChange = DynamicAnimation.MIN_VISIBLE_CHANGE_ROTATION_DEGREES
+                spring = SpringForce(targetDeg)
+            }
+        }
+        val force = anim.spring ?: SpringForce(targetDeg).also { anim.spring = it }
+        force.stiffness = GcsMotionSpec.scaleSpringStiffness(SpringToken.GEAR_ROTATE, profile)
+        force.dampingRatio = GcsMotionSpec.scaleSpringDamping(SpringToken.GEAR_ROTATE, profile)
+        anim.animateToFinalPosition(targetDeg)
     }
 
     fun animateCommandDock(dock: View, show: Boolean, density: Float, pulseOnUpdate: Boolean = false) {

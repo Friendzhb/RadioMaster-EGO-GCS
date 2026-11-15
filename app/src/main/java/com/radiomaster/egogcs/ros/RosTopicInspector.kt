@@ -6,13 +6,9 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
-import java.net.HttpURLConnection
-import java.net.Inet4Address
 import java.net.InetSocketAddress
-import java.net.NetworkInterface
 import java.net.Socket
 import java.net.SocketTimeoutException
-import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -778,7 +774,7 @@ class RosTopicInspector(
         scratchInit: ByteArray
     ): HandshakeOutcome {
         var scratch = scratchInit
-        val s = Socket()
+        val s = LanNetworkBinder.createBoundSocket(host)
         try {
             s.tcpNoDelay = true
             s.receiveBufferSize = 1024 * 1024
@@ -1923,46 +1919,11 @@ pose:
         return postXml(uri, xml)
     }
 
-    private fun postXml(uri: String, xmlBody: String): String {
-        val conn = (URL(uri).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 2800
-            readTimeout = 3500
-            doOutput = true
-            setRequestProperty("Content-Type", "text/xml")
-            setRequestProperty("Connection", "close")
-        }
-        return try {
-            val bytes = xmlBody.toByteArray(Charsets.UTF_8)
-            conn.outputStream.use { it.write(bytes) }
-            conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        } finally {
-            conn.disconnect()
-        }
-    }
+    private fun postXml(uri: String, xmlBody: String): String =
+        LanNetworkBinder.postXmlRpc(uri, xmlBody, connectTimeoutMs = 2800, readTimeoutMs = 3500)
 
-    private fun detectLocalIp(remoteHost: String): String {
-        try {
-            Socket().use { probe ->
-                probe.connect(InetSocketAddress(remoteHost, 11311), 1200)
-                val addr = probe.localAddress?.hostAddress
-                if (!addr.isNullOrBlank() && addr != "127.0.0.1") return addr
-            }
-        } catch (_: Throwable) {}
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val nif = interfaces.nextElement()
-                if (!nif.isUp || nif.isLoopback) continue
-                val addrs = nif.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val a = addrs.nextElement()
-                    if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress ?: continue
-                }
-            }
-        } catch (_: Throwable) {}
-        return "127.0.0.1"
-    }
+    private fun detectLocalIp(remoteHost: String): String =
+        LanNetworkBinder.detectLocalLanIpForRemote(remoteHost, 11311)
 
     private fun nowTimeStr(): String =
         SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
