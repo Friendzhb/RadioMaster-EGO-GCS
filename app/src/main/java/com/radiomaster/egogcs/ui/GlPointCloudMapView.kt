@@ -67,6 +67,8 @@ class GlPointCloudMapView(
         private const val MAX_FX_TRI_VERTS = 32_000
         private const val MAX_ACTOR_LINE_VERTS = 18_000
         private const val MAX_ACTOR_TRI_VERTS = 36_000
+        private const val MAX_TRAIL_TRI_VERTS = 8_192
+        private const val MAX_TRAIL_LINE_VERTS = 1_536
 
         // 8 floats per vertex (32 bytes): x, y, z, r, g, b, a, arcDist
         private const val FLOATS_PER_VERT = 8
@@ -354,7 +356,7 @@ class GlPointCloudMapView(
                     vec3 brightDash = mix(vColor.rgb, vec3(0.55, 0.98, 1.00), 0.45);
                     vec3 railRgb = mix(vColor.rgb, vec3(0.15, 0.78, 0.95), 0.35);
                     vec3 outRgb = mix(railRgb, brightDash, dashMask);
-                    float outAlpha = mix(0.16, 0.92, dashMask) * clamp(vColor.a, 0.35, 1.0);
+                    float outAlpha = mix(0.16, 0.92, dashMask) * clamp(vColor.a, 0.0, 1.0);
                     gl_FragColor = vec4(outRgb, outAlpha);
                 } else {
                     float pulse = 0.82 + 0.18 * sin(uTime * 4.2);
@@ -424,6 +426,18 @@ class GlPointCloudMapView(
     internal val droneTextureUploadCount: Int get() = vectorGlb.textureUploadCount
     private var boundMapEglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private val droneRotorSpins = Array(SwarmPalette.MAX_SWARM_DRONES) { RotorSpinState() }
+    private val flightPathTracers = Array(SwarmPalette.MAX_SWARM_DRONES) { id ->
+        FlightPathTracer(
+            capacity = if (id == 0) {
+                FlightPathTracer.DEFAULT_MAX_POINTS
+            } else {
+                FlightPathTracer.SWARM_WINGMAN_MAX_POINTS
+            }
+        )
+    }
+    private var seenTrailClearEpoch = hub.trailClearEpoch
+    private var lastTrailRosMode = hub.isRosMode
+    private var lastTrailSwarmCount = 1
     private var droneOccludedBlend = 0f
     private var shaderClockSec = 0f
 
@@ -484,6 +498,11 @@ class GlPointCloudMapView(
     private val actorTriArray = FloatArray(MAX_ACTOR_TRI_VERTS * FLOATS_PER_VERT)
     private var actorTriVerts = 0
 
+    private val trailTriArray = FloatArray(MAX_TRAIL_TRI_VERTS * FLOATS_PER_VERT)
+    private var trailTriVerts = 0
+    private val trailLineArray = FloatArray(MAX_TRAIL_LINE_VERTS * FLOATS_PER_VERT)
+    private var trailLineVerts = 0
+
     private val envLineBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ENV_LINE_VERTS * STRIDE_VERT)
         .order(ByteOrder.nativeOrder()).asFloatBuffer()
     private val envTriBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ENV_TRI_VERTS * STRIDE_VERT)
@@ -491,6 +510,10 @@ class GlPointCloudMapView(
     private val actorLineBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ACTOR_LINE_VERTS * STRIDE_VERT)
         .order(ByteOrder.nativeOrder()).asFloatBuffer()
     private val actorTriBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ACTOR_TRI_VERTS * STRIDE_VERT)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val trailTriBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_TRAIL_TRI_VERTS * STRIDE_VERT)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val trailLineBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_TRAIL_LINE_VERTS * STRIDE_VERT)
         .order(ByteOrder.nativeOrder()).asFloatBuffer()
 
     // Shader Programs & Uniform/Attrib Handles
@@ -572,6 +595,8 @@ class GlPointCloudMapView(
     private var vboFxTriId = 0
     private var vboActorLineId = 0
     private var vboActorTriId = 0
+    private var vboTrailTriId = 0
+    private var vboTrailLineId = 0
 
     private val gridKey = GeometryKey(16)
     private val voxelKey = GeometryKey(4096 * 4 + 64)
@@ -896,6 +921,16 @@ class GlPointCloudMapView(
         }
     }
 
+    fun clearFlightTrails() {
+        hub.trailClearEpoch++
+        if (!isGlSurfacePaused && renderPending.request()) {
+            requestRender()
+        }
+    }
+
+    internal fun activeTrailPointCount(droneId: Int = 0): Int =
+        flightPathTracers[droneId.coerceIn(0, SwarmPalette.MAX_SWARM_DRONES - 1)].size
+
     private fun unprojectToGroundUiThread(sx: Float, sy: Float): FloatArray? {
         val vw = max(1, width).toFloat()
         val vh = max(1, height).toFloat()
@@ -946,7 +981,7 @@ class GlPointCloudMapView(
     private fun isMapContextResident(ctx: EGLContext): Boolean {
         if (ctx == EGL14.EGL_NO_CONTEXT || ctx != boundMapEglContext) return false
         if (progSky == 0 || progCloud == 0 || progPrim == 0 || progCutaway == 0 || progOccluded == 0) return false
-        if (vboCloudId == 0 || vboSolidTriId == 0 || vboStaticGridId == 0) return false
+        if (vboCloudId == 0 || vboSolidTriId == 0 || vboStaticGridId == 0 || vboTrailTriId == 0 || vboTrailLineId == 0) return false
         return GLES20.glIsProgram(progSky) &&
             GLES20.glIsProgram(progCloud) &&
             GLES20.glIsProgram(progPrim) &&
@@ -955,6 +990,8 @@ class GlPointCloudMapView(
             GLES20.glIsBuffer(vboCloudId) &&
             GLES20.glIsBuffer(vboSolidTriId) &&
             GLES20.glIsBuffer(vboStaticGridId) &&
+            GLES20.glIsBuffer(vboTrailTriId) &&
+            GLES20.glIsBuffer(vboTrailLineId) &&
             vectorGlb.isContextResident(ctx)
     }
 
@@ -974,7 +1011,7 @@ class GlPointCloudMapView(
         val vbos = intArrayOf(
             vboCloudId, vboGroundLineId, vboSolidTriId, vboSolidEdgeId,
             vboGlassTriId, vboGlassEdgeId, vboFxTriId, vboActorLineId,
-            vboActorTriId, vboStaticGridId
+            vboActorTriId, vboStaticGridId, vboTrailTriId, vboTrailLineId
         )
         for (b in vbos) {
             if (b != 0 && GLES20.glIsBuffer(b)) {
@@ -991,6 +1028,8 @@ class GlPointCloudMapView(
         vboActorLineId = 0
         vboActorTriId = 0
         vboStaticGridId = 0
+        vboTrailTriId = 0
+        vboTrailLineId = 0
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -1067,8 +1106,8 @@ class GlPointCloudMapView(
         aOccColor = GLES20.glGetAttribLocation(progOccluded, "aColor")
         aOccArc = GLES20.glGetAttribLocation(progOccluded, "aArc")
 
-        val bufs = IntArray(10)
-        GLES20.glGenBuffers(10, bufs, 0)
+        val bufs = IntArray(12)
+        GLES20.glGenBuffers(12, bufs, 0)
         vboCloudId = bufs[0]
         vboGroundLineId = bufs[1]
         vboSolidTriId = bufs[2]
@@ -1079,6 +1118,8 @@ class GlPointCloudMapView(
         vboActorLineId = bufs[7]
         vboActorTriId = bufs[8]
         vboStaticGridId = bufs[9]
+        vboTrailTriId = bufs[10]
+        vboTrailLineId = bufs[11]
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboStaticGridId)
         GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, 128 * STRIDE_VERT, null, GLES20.GL_STATIC_DRAW)
 
@@ -1108,6 +1149,12 @@ class GlPointCloudMapView(
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboActorTriId)
         GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ACTOR_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
+
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailTriId)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_TRAIL_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
+
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailLineId)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_TRAIL_LINE_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
         vectorGlb.create()
@@ -1160,6 +1207,8 @@ class GlPointCloudMapView(
             fxAlphaTriVerts = 0
             actorLineVerts = 0
             actorTriVerts = 0
+            trailTriVerts = 0
+            trailLineVerts = 0
 
             stepDroneRotorSpins(dt, snap)
             buildSceneBatches(dt, snap)
@@ -1215,12 +1264,21 @@ class GlPointCloudMapView(
             }
 
             uploadActorVbos()
+            uploadTrailVbos()
 
             // Pass 3: 前景实体无人机与规划航线遍 (在半透明遮挡体素之前绘制！确保随后透镜外壳按真实物理顺序覆盖在其前方)
             GLES20.glDepthFunc(GLES20.GL_LEQUAL)
             GLES20.glDepthMask(true)
             drawActorBatchesVisible(max(1.2f, 1.5f * density))
             drawVectorGlbModels(snap, zFlat, occluded = false)
+
+            // Pass 3b: FIFO 渐隐尾迹丝带与中心发光导丝 (深度测试 GL_LEQUAL 使其自然收束于机体后方，关闭深度写入避免半透明边缘互切)
+            if (trailTriVerts > 0 || trailLineVerts > 0) {
+                GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+                GLES20.glDepthMask(false)
+                GLES20.glEnable(GLES20.GL_BLEND)
+                drawTrailBatchesVisible(max(1.25f, 1.48f * density))
+            }
 
             // Pass 4: 视线走廊遮挡体素「单层外表皮深度预通透镜」(Single-Skin Depth-Prepass Cutaway Lens)
             // 4a: 静默深度预通 (仅写最近外表面 Z 值，零颜色输出) -> 4b: GL_EQUAL 单层外皮逐像素平滑消隐 (100% 消除内部共享乱面与多层叠加混浊！)
@@ -1238,6 +1296,7 @@ class GlPointCloudMapView(
                 GLES20.glDepthFunc(GLES20.GL_GREATER)
                 GLES20.glDepthMask(false)
                 drawActorBatchesOccluded(max(1.25f, 1.55f * density))
+                drawTrailBatchesOccluded(max(1.20f, 1.45f * density))
                 drawVectorGlbModels(snap, zFlat, occluded = true)
             }
 
@@ -1827,13 +1886,11 @@ class GlPointCloudMapView(
         val targetOccBlend = if (droneBlockedThisFrame) 1f else 0f
         droneOccludedBlend += (targetOccBlend - droneOccludedBlend) * (1f - exp(-dt * 9.0f))
 
-        // 3. 历史航迹与 FAST-LIO 全局路径
+        // 3. FIFO 渐隐飞行路径追踪尾迹与 FAST-LIO 全局路径
         if (hub.showFlightTrail && snap.lioPathCount > 1) {
             pushActorRibbon3D(snap.lioPathPts, snap.lioPathCount, zScale, 0.036f, 0.16f, 0.76f, 1.0f, 0.90f)
         }
-        if (hub.showFlightTrail && snap.trailCount > 1) {
-            pushActorPolyline3D(snap.trailPts, snap.trailCount, zScale, 0.80f, 0.88f, 0.98f, 0.52f)
-        }
+        stepAndEmitFlightPathTrails(snap, zScale)
         if (snap.astarCount > 1) {
             pushActorPolyline3D(snap.astarPts, snap.astarCount, 0.02f, 0.18f, 0.65f, 1.0f, 0.60f, fixedZ = 0.025f)
         }
@@ -2327,11 +2384,8 @@ class GlPointCloudMapView(
             val col = SwarmPalette.RGB_FLOAT[id]
             val isFocus = (id == snap.activeDroneId)
 
-            // 0 号机的轨迹已在上方主通道绘制，此处补充 1..cnt-1 号机的分色轨迹与目标柱
+            // 0 号机的轨迹已在上方主通道绘制，此处补充 1..cnt-1 号机的分色轨迹与目标柱 (渐隐 FIFO 尾迹已由 stepAndEmitFlightPathTrails 统一构建)
             if (id > 0) {
-                if (hub.showFlightTrail && ag.trailCount > 1) {
-                    pushActorPolyline3D(ag.trailPts, ag.trailCount, zScale, col[0], col[1], col[2], 0.46f)
-                }
                 if (ag.bsplineCount > 1) {
                     if (hub.showTrajCurtain && blend > 0.08f) {
                         pushAltitudeCurtain(ag.bsplinePts, ag.bsplineCount, zScale, col[0], col[1], col[2], 0.13f * blend)
@@ -3193,6 +3247,204 @@ class GlPointCloudMapView(
         GLES20.glDisableVertexAttribArray(aPrimPos)
         GLES20.glDisableVertexAttribArray(aPrimColor)
         if (aPrimArc >= 0) GLES20.glDisableVertexAttribArray(aPrimArc)
+    }
+
+    private fun stepAndEmitFlightPathTrails(snap: RenderSnapshot, zScale: Float) {
+        val clearEpoch = hub.trailClearEpoch
+        val rosMode = hub.isRosMode
+        val swarmCnt = snap.swarmCount.coerceIn(1, SwarmPalette.MAX_SWARM_DRONES)
+
+        if (clearEpoch != seenTrailClearEpoch || rosMode != lastTrailRosMode) {
+            seenTrailClearEpoch = clearEpoch
+            lastTrailRosMode = rosMode
+            for (tracer in flightPathTracers) tracer.clear()
+        }
+        if (swarmCnt != lastTrailSwarmCount) {
+            for (id in 1 until SwarmPalette.MAX_SWARM_DRONES) {
+                if (id >= swarmCnt || id >= lastTrailSwarmCount) {
+                    flightPathTracers[id].clear()
+                }
+            }
+            lastTrailSwarmCount = swarmCnt
+        }
+
+        // Maintain bounded O(1) FIFO histories from live poses
+        val leadTracer = flightPathTracers[0]
+        if (snap.trailCount > 1) {
+            leadTracer.seedIfEmpty(snap.trailPts, snap.trailCount)
+        }
+        leadTracer.recordPose(snap.uavX, snap.uavY, snap.uavZ)
+
+        if (swarmCnt > 1) {
+            for (id in 1 until swarmCnt) {
+                val ag = snap.swarmAgents[id]
+                val wt = flightPathTracers[id]
+                if (ag.trailCount > 1) {
+                    wt.seedIfEmpty(ag.trailPts, ag.trailCount)
+                }
+                wt.recordPose(ag.uavX, ag.uavY, ag.uavZ)
+            }
+        }
+
+        if (!hub.showFlightTrail) return
+
+        val powerSave = hub.perfMode == 2
+        val isLight = GcsTheme.of(hub.themeId).isLight
+        val widthZoom = 0.85f + 0.15f * computeAdaptiveUavZoomScale()
+
+        if (swarmCnt > 1) {
+            for (id in 0 until swarmCnt) {
+                val col = SwarmPalette.RGB_FLOAT[id]
+                val isFocus = id == snap.activeDroneId
+                val ux = if (id == 0) snap.uavX else snap.swarmAgents[id].uavX
+                val uy = if (id == 0) snap.uavY else snap.swarmAgents[id].uavY
+                val uz = if (id == 0) snap.uavZ else snap.swarmAgents[id].uavZ
+                val pointBudget = if (id == 0) {
+                    if (powerSave) FlightPathTracer.POWER_SAVE_MAX_POINTS else FlightPathTracer.DEFAULT_MAX_POINTS
+                } else {
+                    if (powerSave) FlightPathTracer.POWER_SAVE_WINGMAN_POINTS else FlightPathTracer.SWARM_WINGMAN_MAX_POINTS
+                }
+                val tracer = flightPathTracers[id]
+                tracer.emitFadingPolyline(
+                    liveX = ux,
+                    liveY = uy,
+                    liveZ = uz,
+                    zScale = zScale,
+                    eyeX = curEyeX,
+                    eyeY = curEyeY,
+                    eyeZ = curEyeZ,
+                    activePointLimit = pointBudget,
+                    tailR = col[0] * 0.58f,
+                    tailG = col[1] * 0.66f,
+                    tailB = min(1f, col[2] * 0.78f + 0.18f),
+                    headR = col[0],
+                    headG = col[1],
+                    headB = col[2],
+                    maxAlpha = if (isFocus) 0.90f else 0.74f,
+                    headHalfWidth = (if (isFocus) 0.042f else 0.034f) * widthZoom,
+                    tailHalfWidth = 0.007f * widthZoom,
+                    triArray = trailTriArray,
+                    triVertStart = trailTriVerts,
+                    maxTriVerts = MAX_TRAIL_TRI_VERTS,
+                    lineArray = trailLineArray,
+                    lineVertStart = trailLineVerts,
+                    maxLineVerts = MAX_TRAIL_LINE_VERTS
+                )
+                trailTriVerts = tracer.lastTriVertCount
+                trailLineVerts = tracer.lastLineVertCount
+            }
+        } else {
+            val pointBudget = if (powerSave) {
+                FlightPathTracer.POWER_SAVE_MAX_POINTS
+            } else {
+                FlightPathTracer.DEFAULT_MAX_POINTS
+            }
+            val tailR = if (isLight) 0.10f else 0.14f
+            val tailG = if (isLight) 0.44f else 0.54f
+            val tailB = if (isLight) 0.92f else 1.00f
+            val headR = if (isLight) 0.00f else 0.14f
+            val headG = if (isLight) 0.78f else 0.96f
+            val headB = if (isLight) 0.90f else 0.88f
+
+            leadTracer.emitFadingPolyline(
+                liveX = snap.uavX,
+                liveY = snap.uavY,
+                liveZ = snap.uavZ,
+                zScale = zScale,
+                eyeX = curEyeX,
+                eyeY = curEyeY,
+                eyeZ = curEyeZ,
+                activePointLimit = pointBudget,
+                tailR = tailR,
+                tailG = tailG,
+                tailB = tailB,
+                headR = headR,
+                headG = headG,
+                headB = headB,
+                maxAlpha = if (isLight) 0.88f else 0.92f,
+                headHalfWidth = 0.044f * widthZoom,
+                tailHalfWidth = 0.007f * widthZoom,
+                triArray = trailTriArray,
+                triVertStart = trailTriVerts,
+                maxTriVerts = MAX_TRAIL_TRI_VERTS,
+                lineArray = trailLineArray,
+                lineVertStart = trailLineVerts,
+                maxLineVerts = MAX_TRAIL_LINE_VERTS
+            )
+            trailTriVerts = leadTracer.lastTriVertCount
+            trailLineVerts = leadTracer.lastLineVertCount
+        }
+    }
+
+    private fun uploadTrailVbos() {
+        if (trailTriVerts > 0) {
+            trailTriBuf.clear()
+            trailTriBuf.put(trailTriArray, 0, trailTriVerts * FLOATS_PER_VERT)
+            trailTriBuf.position(0)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailTriId)
+            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, trailTriVerts * STRIDE_VERT, trailTriBuf)
+        }
+        if (trailLineVerts > 0) {
+            trailLineBuf.clear()
+            trailLineBuf.put(trailLineArray, 0, trailLineVerts * FLOATS_PER_VERT)
+            trailLineBuf.position(0)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailLineId)
+            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, trailLineVerts * STRIDE_VERT, trailLineBuf)
+        }
+    }
+
+    private fun drawTrailBatchesVisible(lineWidthPx: Float) {
+        bindPrimUniforms()
+
+        if (trailTriVerts > 0) {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailTriId)
+            GLES20.glEnableVertexAttribArray(aPrimPos)
+            GLES20.glVertexAttribPointer(aPrimPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
+            GLES20.glEnableVertexAttribArray(aPrimColor)
+            GLES20.glVertexAttribPointer(aPrimColor, 4, GLES20.GL_FLOAT, false, STRIDE_VERT, 12)
+            if (aPrimArc >= 0) {
+                GLES20.glEnableVertexAttribArray(aPrimArc)
+                GLES20.glVertexAttribPointer(aPrimArc, 1, GLES20.GL_FLOAT, false, STRIDE_VERT, 28)
+            }
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, trailTriVerts)
+        }
+
+        if (trailLineVerts > 0) {
+            GLES20.glLineWidth(lineWidthPx)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailLineId)
+            GLES20.glEnableVertexAttribArray(aPrimPos)
+            GLES20.glVertexAttribPointer(aPrimPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
+            GLES20.glEnableVertexAttribArray(aPrimColor)
+            GLES20.glVertexAttribPointer(aPrimColor, 4, GLES20.GL_FLOAT, false, STRIDE_VERT, 12)
+            if (aPrimArc >= 0) {
+                GLES20.glEnableVertexAttribArray(aPrimArc)
+                GLES20.glVertexAttribPointer(aPrimArc, 1, GLES20.GL_FLOAT, false, STRIDE_VERT, 28)
+            }
+            GLES20.glDrawArrays(GLES20.GL_LINES, 0, trailLineVerts)
+        }
+
+        GLES20.glDisableVertexAttribArray(aPrimPos)
+        GLES20.glDisableVertexAttribArray(aPrimColor)
+        if (aPrimArc >= 0) GLES20.glDisableVertexAttribArray(aPrimArc)
+    }
+
+    private fun drawTrailBatchesOccluded(lineWidthPx: Float) {
+        if (trailLineVerts <= 0) return
+        GLES20.glUseProgram(progOccluded)
+        GLES20.glUniformMatrix4fv(uOccMvp, 1, false, vpMatrix, 0)
+        GLES20.glUniform1f(uOccTime, shaderClockSec)
+        GLES20.glLineWidth(lineWidthPx)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailLineId)
+        GLES20.glEnableVertexAttribArray(aOccPos)
+        GLES20.glVertexAttribPointer(aOccPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
+        GLES20.glEnableVertexAttribArray(aOccColor)
+        GLES20.glVertexAttribPointer(aOccColor, 4, GLES20.GL_FLOAT, false, STRIDE_VERT, 12)
+        GLES20.glEnableVertexAttribArray(aOccArc)
+        GLES20.glVertexAttribPointer(aOccArc, 1, GLES20.GL_FLOAT, false, STRIDE_VERT, 28)
+        GLES20.glDrawArrays(GLES20.GL_LINES, 0, trailLineVerts)
+        GLES20.glDisableVertexAttribArray(aOccPos)
+        GLES20.glDisableVertexAttribArray(aOccColor)
+        GLES20.glDisableVertexAttribArray(aOccArc)
     }
 
     private fun buildProgram(vsSrc: String, fsSrc: String): Int {

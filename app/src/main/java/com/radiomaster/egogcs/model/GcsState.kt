@@ -552,6 +552,8 @@ class GcsSharedHub {
 
     @Volatile var showFlightTrail: Boolean = true
 
+    @Volatile var trailClearEpoch: Int = 0
+
     @Volatile var autoPatrol: Boolean = true
 
     @Volatile var pointColorMode: Int = 0

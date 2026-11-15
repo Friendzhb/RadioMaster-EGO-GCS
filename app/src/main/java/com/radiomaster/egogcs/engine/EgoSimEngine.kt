@@ -907,6 +907,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
             for (id in 1 until SwarmPalette.MAX_SWARM_DRONES) {
                 peerUnits[id].trailCount = 0
             }
+            hub.trailClearEpoch++
         }
     }
 

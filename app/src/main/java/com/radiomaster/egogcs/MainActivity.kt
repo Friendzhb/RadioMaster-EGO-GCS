@@ -219,6 +219,8 @@ class MainActivity : Activity() {
     private lateinit var popSwitchCtrl: TextView
     private lateinit var popSwitchTouchLock: TextView
     private lateinit var popSwitchNarrowAssist: TextView
+    private lateinit var popSwitchTrail: TextView
+    private lateinit var popSwitchCurtain: TextView
     private lateinit var btnClearMapInPopover: TextView
 
     private var rthConfirmPending = false
@@ -474,6 +476,7 @@ class MainActivity : Activity() {
             onClearMapAndTrail = {
                 simEngine.clearVoxelMap()
                 simEngine.clearTrail()
+                mapView.clearFlightTrails()
                 AnimHelper.showDjiToast(toastBanner, "已清空全局点云建图与历史飞行航迹", d)
             },
             onFactoryResetApplied = {
@@ -1306,6 +1309,8 @@ class MainActivity : Activity() {
             styleMiniChip(popSwitchCtrl, "控制点", hub.showCtrlPts)
             styleMiniChip(popSwitchTouchLock, "防误触锁", hub.hudTouchLocked)
             styleMiniChip(popSwitchNarrowAssist, "窄缝微仰", hub.autoNarrowGapPitchAssist)
+            styleMiniChip(popSwitchTrail, "飞行尾迹", hub.showFlightTrail)
+            styleMiniChip(popSwitchCurtain, "轨迹垂幕", hub.showTrajCurtain)
         }
     }
 
@@ -2392,6 +2397,30 @@ class MainActivity : Activity() {
         g3.addView(popSwitchNarrowAssist, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(4.5f) })
         card.addView(g3, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(4.5f) })
 
+        val g4 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        popSwitchTrail = createPopoverToggleChip {
+            hub.showFlightTrail = !hub.showFlightTrail
+            GcsSettingsModal.persistAllSettings(this, hub)
+            syncLayerPopoverControls()
+            AnimHelper.showDjiToast(
+                toastBanner,
+                if (hub.showFlightTrail) "已开启无人机渐隐飞行尾迹" else "已隐藏无人机飞行尾迹",
+                d
+            )
+        }.apply {
+            contentDescription = "飞行尾迹"
+        }
+        popSwitchCurtain = createPopoverToggleChip {
+            hub.showTrajCurtain = !hub.showTrajCurtain
+            GcsSettingsModal.persistAllSettings(this, hub)
+            syncLayerPopoverControls()
+        }.apply {
+            contentDescription = "轨迹垂幕"
+        }
+        g4.addView(popSwitchTrail, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        g4.addView(popSwitchCurtain, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(4.5f) })
+        card.addView(g4, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(4.5f) })
+
         val actRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val btnResetCam = createSmallIconBtn(Type.UNDO, "复位") {
             mapView.resetCameraSmooth()
@@ -2401,6 +2430,7 @@ class MainActivity : Activity() {
         }
         val btnClearTrail = createSmallIconBtn(Type.ERASER, "清轨迹") {
             simEngine.clearTrail()
+            mapView.clearFlightTrails()
             setLayerPopoverVisible(false)
             AnimHelper.showDjiToast(toastBanner, "已清空历史飞行航迹", d)
         }

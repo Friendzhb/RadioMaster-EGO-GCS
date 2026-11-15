@@ -192,8 +192,8 @@ class GcsSettingsModal(
             hub.showLocalBox = sp.getBoolean("showLocalBox", true)
             hub.showCtrlPts = sp.getBoolean("showCtrlPts", true)
             hub.showGroundGrid = true
-            hub.showTrajCurtain = true
-            hub.showFlightTrail = true
+            hub.showTrajCurtain = sp.getBoolean("showTrajCurtain", true)
+            hub.showFlightTrail = sp.getBoolean("showFlightTrail", true)
             hub.pointColorMode = sp.getInt("pointColorMode", 0).coerceIn(0, 2)
             hub.mapVoxelSize = sp.getFloat("mapVoxelSize", 0.12f).coerceIn(0.06f, 0.30f)
             hub.zSliceMax = sp.getFloat("zSliceMax", 3.0f).coerceIn(0.8f, 6.0f)
@@ -257,6 +257,8 @@ class GcsSettingsModal(
                 .putBoolean("showInflate", hub.showInflate)
                 .putBoolean("showLocalBox", hub.showLocalBox)
                 .putBoolean("showCtrlPts", hub.showCtrlPts)
+                .putBoolean("showTrajCurtain", hub.showTrajCurtain)
+                .putBoolean("showFlightTrail", hub.showFlightTrail)
                 .putInt("pointColorMode", hub.pointColorMode)
                 .putFloat("mapVoxelSize", hub.mapVoxelSize)
                 .putFloat("zSliceMax", hub.zSliceMax)
@@ -1546,6 +1548,8 @@ class GcsSettingsModal(
         hub.showInflate = true
         hub.showLocalBox = true
         hub.showCtrlPts = true
+        hub.showTrajCurtain = true
+        hub.showFlightTrail = true
         hub.pointColorMode = 0
         hub.mapVoxelSize = 0.12f
         hub.zSliceMax = 3.0f
