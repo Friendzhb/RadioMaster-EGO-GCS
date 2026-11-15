@@ -22,6 +22,7 @@ UDP 设置和机载桥接用法见 [ROS UDP 说明](docs/ROS_UDP.md)。
 设置 `ANDROID_HOME` 或在未跟踪的 `local.properties` 中填写 `sdk.dir`，然后执行：
 
 ```bash
+chmod +x gradlew
 ./gradlew spotlessApply
 ./gradlew spotlessCheck :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 ```
