@@ -122,4 +122,23 @@ class PointUploadTest {
             producer.join()
         }
     }
+
+    @Test fun fastLioVoxelMapInitializesSentinelsAndDeduplicatesCleanly() {
+        val map = FastLioVoxelMap()
+        assertEquals(0, map.pointCount)
+        assertEquals("0.0 x 0.0 x 0.0 m", map.formatBoundsSpanSummary())
+
+        // Insert 3 points where 2 fall into the same 0.12m voxel cell (including origin 0,0,0)
+        val scan = floatArrayOf(
+            0.0f, 0.0f, 0.0f, 0.5f,
+            0.02f, 0.02f, 0.01f, 0.8f,
+            1.25f, -2.40f, 0.85f, 0.9f
+        )
+        map.insertScan(scan, 3)
+        assertEquals(2, map.pointCount)
+
+        map.clear(0.15f)
+        assertEquals(0, map.pointCount)
+        assertEquals(0.15f, map.activeVoxelSize, 0.0001f)
+    }
 }

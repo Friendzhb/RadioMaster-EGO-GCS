@@ -28,10 +28,37 @@ class RosConnectionManager(
 ) {
     @Volatile var topics: TopicConfig = TopicConfig()
 
+    /**
+     * 当底层 TCPROS 或 rosbridge 连续退避重连未命中（例如路由器重连后机载电脑 DHCP IP 变更或桥接协议切换）时，
+     * 自动上抛给寻机协调器启动局域网指数退避扫描。
+     */
+    @Volatile var onRequestDiscoveryRecovery: ((reason: DiscoveryRecoveryReason) -> Unit)? = null
+
+    /**
+     * 当底层传输层成功握手或自动自愈重连成功时回调机载主机地址，用于记忆高优先级候选 IP 并复位寻机退避。
+     */
+    @Volatile var onLinkConnected: ((remoteHost: String) -> Unit)? = null
+
     private val pendingParams = ConcurrentHashMap<String, Float>()
     private val flushScheduled = AtomicBoolean(false)
     private val debounceScheduler = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "RosParamDebouncer").apply { isDaemon = true }
+    }
+
+    init {
+        val escalationHandler: (Int) -> Unit = { failedAttempts ->
+            if (failedAttempts >= 2 && hub.isRosMode && !hub.rosConnected) {
+                onRequestDiscoveryRecovery?.invoke(DiscoveryRecoveryReason.BRIDGE_DISCONNECTED)
+            }
+        }
+        tcpRosTransport.onDisconnectEscalation = escalationHandler
+        rosBridgeTransport.onDisconnectEscalation = escalationHandler
+
+        val connectedHandler: (String) -> Unit = { host ->
+            onLinkConnected?.invoke(host)
+        }
+        tcpRosTransport.onLinkConnected = connectedHandler
+        rosBridgeTransport.onLinkConnected = connectedHandler
     }
 
     private fun activeTransport(): RosTransport =
@@ -49,6 +76,18 @@ class RosConnectionManager(
         } else {
             tcpRosTransport.disconnect(silent = true)
             rosBridgeTransport.connect(topics)
+        }
+    }
+
+    /**
+     * 当物理 Wi-Fi / 有线网口从瞬断中恢复时调用：若当前处于实机模式但尚未连上，立即跳过长退避窗口重连。
+     */
+    fun onPhysicalLanRestored() {
+        if (!hub.isRosMode || hub.rosConnected) return
+        if (topics.protocol == "tcpros") {
+            tcpRosTransport.triggerImmediateReconnectIfDisconnected()
+        } else {
+            rosBridgeTransport.triggerImmediateReconnectIfDisconnected()
         }
     }
 
@@ -133,6 +172,8 @@ class RosConnectionManager(
 
     fun shutdown() {
         disconnectAll(silent = true)
+        rosBridgeTransport.shutdown()
+        tcpRosTransport.shutdown()
         udpTelemetry.shutdown()
         debounceScheduler.shutdownNow()
     }

@@ -32,14 +32,19 @@ class FlightTelemetryRecorder {
 
     @Volatile var isRecording: Boolean = false
         private set
+
+    @Volatile var sqliteSampleSink: ((timestampEpochMs: Long, elapsedMs: Long, s: RenderSnapshot) -> Unit)? = null
+
     private var startElapsedMs: Long = 0L
+    private var startWallEpochMs: Long = 0L
     private var lastSampleMs: Long = 0L
 
-    fun startRecording(nowElapsedMs: Long) {
+    fun startRecording(nowElapsedMs: Long, nowWallEpochMs: Long = System.currentTimeMillis()) {
         synchronized(lock) {
             head = 0
             sampleCount = 0
             startElapsedMs = nowElapsedMs
+            startWallEpochMs = nowWallEpochMs
             lastSampleMs = 0L
             isRecording = true
         }
@@ -62,6 +67,8 @@ class FlightTelemetryRecorder {
         if (nowElapsedMs - lastSampleMs < 48L) return
         lastSampleMs = nowElapsedMs
 
+        val relElapsedMs: Long
+        val wallTsMs: Long
         synchronized(lock) {
             val slot = if (sampleCount < MAX_FRAMES) {
                 val idx = (head + sampleCount) % MAX_FRAMES
@@ -80,9 +87,11 @@ class FlightTelemetryRecorder {
                 ((hub.tiltCoordMode and 0x03) shl 8)
             metaFlags[slot] = packedMeta
 
+            relElapsedMs = (nowElapsedMs - startElapsedMs).coerceAtLeast(0L)
+            wallTsMs = startWallEpochMs + relElapsedMs
             val b = slot * COLS_PER_FRAME
             val rad2deg = 57.29578f
-            ring[b] = ((nowElapsedMs - startElapsedMs).coerceAtLeast(0L)) * 0.001f
+            ring[b] = relElapsedMs * 0.001f
             ring[b + 1] = s.uavX
             ring[b + 2] = s.uavY
             ring[b + 3] = s.uavZ
@@ -106,6 +115,7 @@ class FlightTelemetryRecorder {
             ring[b + 21] = s.batVolt
             ring[b + 22] = s.batCurrentAmps
         }
+        sqliteSampleSink?.invoke(wallTsMs, relElapsedMs, s)
     }
 
     fun exportToCsv(outFile: File): Int {

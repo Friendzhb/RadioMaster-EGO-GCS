@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.google.devtools.ksp")
 }
 
 val otaStoreFile = providers.environmentVariable("EGO_SIGNING_STORE_FILE").orNull
@@ -34,15 +35,66 @@ val hasOtaSigning = resolvedOtaKeystore?.isFile == true &&
 val aiStudioDebugKeystore = rootProject.file("debug.keystore")
 val hasAiStudioDebugKeystore = aiStudioDebugKeystore.isFile
 
-// 对齐构建时间戳粒度（OTA 正式发版按分钟、常规 CI/开发构建按小时分桶），防止每次毫秒变化击穿 Gradle buildCache
+val ghRunId = providers.environmentVariable("GITHUB_RUN_ID").orNull?.trim()
+val ghRunNumber = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.trim()
+val ghRunAttempt = providers.environmentVariable("GITHUB_RUN_ATTEMPT").orNull?.trim()
+val ghShaEnv = providers.environmentVariable("GITHUB_SHA").orNull?.trim()
+
+fun resolveLocalGitShaShort(rootDir: File): String {
+    return runCatching {
+        val gitDir = File(rootDir, ".git")
+        val headFile = File(gitDir, "HEAD")
+        if (!headFile.isFile) return@runCatching ""
+        val headText = headFile.readText().trim()
+        val rawSha = if (headText.startsWith("ref:")) {
+            val refPath = headText.removePrefix("ref:").trim()
+            val looseRef = File(gitDir, refPath)
+            if (looseRef.isFile) {
+                looseRef.readText().trim()
+            } else {
+                val packedRefs = File(gitDir, "packed-refs")
+                if (packedRefs.isFile) {
+                    packedRefs.useLines { lines ->
+                        lines.firstOrNull { line ->
+                            !line.startsWith("#") && !line.startsWith("^") && line.endsWith(" $refPath")
+                        }?.substringBefore(' ')?.trim().orEmpty()
+                    }
+                } else {
+                    ""
+                }
+            }
+        } else {
+            headText
+        }
+        rawSha.lowercase(Locale.US).take(12)
+    }.getOrDefault("")
+}
+
+val resolvedGitSha = ghShaEnv
+    ?.takeIf { it.isNotBlank() }
+    ?.lowercase(Locale.US)
+    ?.take(12)
+    ?: resolveLocalGitShaShort(rootProject.projectDir)
+
+// 对齐构建时间戳粒度（CI 精确到秒、本地/常规构建按分钟分桶），确保每次新版构建版本号严格递增且兼顾构建缓存
 val explicitEpochSec = providers.environmentVariable("SOURCE_DATE_EPOCH").orNull?.toLongOrNull()
 val rawEpochMs = explicitEpochSec?.times(1000L) ?: System.currentTimeMillis()
-val cacheBucketMs = if (hasOtaSigning) 60_000L else 3_600_000L
+val cacheBucketMs = if (!ghRunId.isNullOrBlank()) 1_000L else 60_000L
 val buildEpochMs = (rawEpochMs / cacheBucketMs) * cacheBucketMs
-val autoVersionCode = (((buildEpochMs / 1000L) - 1_700_000_000L).toInt() + 17).coerceAtLeast(317)
+val ghAttemptOffset = ((ghRunAttempt?.toIntOrNull() ?: 1) - 1).coerceIn(0, 9)
+val autoVersionCode = (((buildEpochMs / 1000L) - 1_700_000_000L).toInt() + 17 + ghAttemptOffset).coerceAtLeast(318)
 val buildUtcStamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply {
     timeZone = TimeZone.getTimeZone("UTC")
 }.format(Date(buildEpochMs)) + " UTC"
+val buildCompactUtc = SimpleDateFormat("MMddHHmm", Locale.US).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+}.format(Date(buildEpochMs))
+val autoVersionName = if (!ghRunNumber.isNullOrBlank()) {
+    val attemptNum = ghRunAttempt?.toIntOrNull() ?: 1
+    if (attemptNum > 1) "3.13.$ghRunNumber.$attemptNum" else "3.13.$ghRunNumber"
+} else {
+    "3.13.0-$buildCompactUtc"
+}
 
 // 依赖解析与远端元数据本地缓存优化：避免 GitHub Actions 每次构建重复轮询校验远端 Maven 元数据导致超时
 configurations.configureEach {
@@ -62,9 +114,10 @@ android {
         targetSdk = 34
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = autoVersionCode
-        versionName = "3.12.0"
+        versionName = autoVersionName
         resValue("string", "ego_build_stamp", buildUtcStamp)
         resValue("string", "ego_build_epoch_ms", buildEpochMs.toString())
+        resValue("string", "ego_git_sha", resolvedGitSha)
     }
 
     signingConfigs {
@@ -177,4 +230,10 @@ dependencies {
     implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")
     // OkHttp 原生异步网络栈：支持 rosbridge WebSocket 与 GitHub Releases 302 重定向流式 OTA 下载
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Room 本地 SQLite 关系型黑匣子数据库与协程异步批量落库 (飞行任务遥测记录、战后分析与 3D 轨迹回放)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
 }

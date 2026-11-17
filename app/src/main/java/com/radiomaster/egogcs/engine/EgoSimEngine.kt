@@ -147,6 +147,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
 
     val voxelMap = FastLioVoxelMap()
     val telemetryRecorder = FlightTelemetryRecorder()
+    val playbackController = FlightPlaybackController()
 
     @Volatile var onRosWaypointAdvanced: ((gx: Float, gy: Float, gz: Float, curX: Float, curY: Float) -> Unit)? = null
 
@@ -306,7 +307,7 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
         executor = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "EgoFastLioWorker").apply {
                 isDaemon = true
-                priority = Thread.NORM_PRIORITY + 1
+                priority = Thread.NORM_PRIORITY
             }
         }.also { exec ->
             exec.scheduleAtFixedRate({ safeTick() }, 0, 20, TimeUnit.MILLISECONDS)
@@ -2218,27 +2219,32 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
                     if (!hub.isRosMode) replanLocked(true)
                 }
 
-                if (!hub.isRosMode) {
-                    stepDemoPhysicsLocked(dt)
-                    stepSwarmWingmenDemoLocked(dt)
-                    demoLidarAcc += dt
-                    if (demoLidarAcc >= 0.066f) {
-                        demoLidarAcc = 0f
-                        simScanCount = generateDemo3DLidarScanLocked()
-                        lastCloudScanPts = simScanCount
-                    }
+                val replaying = playbackController.isActive
+                if (replaying) {
+                    publishReplaySnapshotLocked(dt)
                 } else {
-                    val nowMs = nowElapsedMs()
-                    if (nowMs - lastHzTickMs >= 1000L) {
-                        rosOdomHz = rosOdomCounter
-                        rosCloudHz = rosCloudCounter
-                        rosOdomCounter = 0
-                        rosCloudCounter = 0
-                        lastHzTickMs = nowMs
+                    if (!hub.isRosMode) {
+                        stepDemoPhysicsLocked(dt)
+                        stepSwarmWingmenDemoLocked(dt)
+                        demoLidarAcc += dt
+                        if (demoLidarAcc >= 0.066f) {
+                            demoLidarAcc = 0f
+                            simScanCount = generateDemo3DLidarScanLocked()
+                            lastCloudScanPts = simScanCount
+                        }
+                    } else {
+                        val nowMs = nowElapsedMs()
+                        if (nowMs - lastHzTickMs >= 1000L) {
+                            rosOdomHz = rosOdomCounter
+                            rosCloudHz = rosCloudCounter
+                            rosOdomCounter = 0
+                            rosCloudCounter = 0
+                            lastHzTickMs = nowMs
+                        }
                     }
+                    stepHsiFilterAndRadarLocked(dt)
+                    publishSnapshotLocked()
                 }
-                stepHsiFilterAndRadarLocked(dt)
-                publishSnapshotLocked()
             }
 
             if (simScanCount > 0) {
@@ -3297,6 +3303,154 @@ class EgoSimEngine(private val hub: GcsSharedHub) {
 
         hub.snapshots.publish(frame)
         telemetryRecorder.sampleIfDue(nowElapsed, hub, frame)
+    }
+
+    private fun publishReplaySnapshotLocked(dt: Float) {
+        val frame = snapshotBuilder
+        val zMax = hub.zSliceMax
+        val showInf = hub.showInflate
+
+        if (!playbackController.applyReplayToSnapshot(
+                dtSec = dt,
+                hub = hub,
+                frame = frame,
+                evaluateClearance = { x, y, z -> evaluatePointClearanceLocked(x, y, z) },
+                queryColumnTopZ = { x, y -> queryColumnTopZLocked(x, y) }
+            )
+        ) {
+            publishSnapshotLocked()
+            return
+        }
+
+        if (!hub.isRosMode && hub.showCore) {
+            val obCnt = min(obstacles.size, 24)
+            for (i in 0 until obCnt) {
+                val ob = obstacles[i]
+                val b = i * 6
+                frame.obsPrimitives[b] = ob.cx
+                frame.obsPrimitives[b + 1] = ob.cy
+                frame.obsPrimitives[b + 2] = ob.rx
+                frame.obsPrimitives[b + 3] = ob.ry
+                frame.obsPrimitives[b + 4] = min(ob.h, zMax)
+                frame.obsPrimitives[b + 5] = if (ob.isCircle) 1f else 0f
+            }
+            frame.obsPrimitiveCount = obCnt
+        } else {
+            frame.obsPrimitiveCount = 0
+        }
+
+        var outVoxCnt = 0
+        val outVoxels = frame.voxels
+        val refX = frame.uavX
+        val refY = frame.uavY
+        val refZ = frame.uavZ
+        if (!hub.isRosMode && showInf) {
+            for (i in 0 until cachedGridVoxelCount) {
+                if (outVoxCnt >= MAX_INFLATE_VOXELS) break
+                val b = i * 4
+                val vz = cachedGridVoxels[b + 2]
+                if (vz > zMax) continue
+                val vx = cachedGridVoxels[b]
+                val vy = cachedGridVoxels[b + 1]
+                var halfS = cachedGridVoxels[b + 3]
+                if (halfS < 5.0f && i + 1 < cachedGridVoxelCount) {
+                    val nb = (i + 1) * 4
+                    if (cachedGridVoxels[nb] == vx && cachedGridVoxels[nb + 1] == vy && cachedGridVoxels[nb + 2] > zMax) {
+                        halfS += 10.0f
+                    }
+                }
+                val inLocal = abs(wxDelta(vx, refX)) <= 4.1f && abs(wxDelta(vy, refY)) <= 4.1f
+                val dst = outVoxCnt * 4
+                outVoxels[dst] = vx
+                outVoxels[dst + 1] = vy
+                outVoxels[dst + 2] = vz
+                outVoxels[dst + 3] = if (inLocal) halfS else -halfS
+                outVoxCnt++
+            }
+        } else if (hub.isRosMode && showInf && rosVoxelCount > 0) {
+            val halfS = rosEstimatedVoxelHalf
+            val stepThresh = halfS * 3.2f
+            for (i in 0 until rosVoxelCount) {
+                if (outVoxCnt >= MAX_INFLATE_VOXELS) break
+                val base = i * 3
+                val vz = rosVoxelsBuf[base + 2]
+                if (vz > zMax) continue
+                val vx = rosVoxelsBuf[base]
+                val vy = rosVoxelsBuf[base + 1]
+                val isTopCap = if (i + 1 < rosVoxelCount) {
+                    val nb = (i + 1) * 3
+                    val nextVz = rosVoxelsBuf[nb + 2]
+                    nextVz > zMax ||
+                        abs(rosVoxelsBuf[nb] - vx) > 0.04f ||
+                        abs(rosVoxelsBuf[nb + 1] - vy) > 0.04f ||
+                        (nextVz - vz) > stepThresh ||
+                        nextVz < vz
+                } else {
+                    true
+                }
+                val packedHalf = if (isTopCap) (halfS + 10.0f) else halfS
+                val inLocal = abs(vx - refX) <= 4.5f && abs(vy - refY) <= 4.5f
+                val dst = outVoxCnt * 4
+                outVoxels[dst] = vx
+                outVoxels[dst + 1] = vy
+                outVoxels[dst + 2] = vz
+                outVoxels[dst + 3] = if (inLocal) packedHalf else -packedHalf
+                outVoxCnt++
+            }
+        }
+        frame.voxelCount = outVoxCnt
+        frame.txBatPct = hub.txBatPct
+        frame.txBatVolt = hub.txBatVolt
+        frame.txCurrentAmps = hub.txCurrentAmps
+        frame.odomHz = 20
+        frame.cloudHz = if (hub.isRosMode) rosCloudHz else 15
+        frame.cloudScanPts = lastCloudScanPts
+        frame.mapPointCount = voxelMap.pointCount
+
+        val numBins = 60
+        val maxR = 8.2f
+        for (i in 0 until numBins) rawBins60[i] = 9.5f
+        if (!hub.isRosMode) {
+            for (b in 0 until numBins) {
+                val dx = RADAR_COS_60[b]
+                val dy = RADAR_SIN_60[b]
+                var t = 0.18f
+                var hitD = 9.5f
+                for (st in 0 until 8) {
+                    val wx = refX + dx * t
+                    val wy = refY + dy * t
+                    var minOb = 99f
+                    for (o in 0 until obstacles.size) {
+                        val ob = obstacles[o]
+                        if (ob.h < refZ - 0.55f) continue
+                        val d = signedDistToObs(wx, wy, ob)
+                        if (d < minOb) minOb = d
+                    }
+                    if (minOb <= 0.06f) {
+                        hitD = t
+                        break
+                    }
+                    t += max(0.16f, minOb * 0.88f)
+                    if (t > maxR) break
+                }
+                rawBins60[b] = hitD
+            }
+        } else {
+            accumulateRadarBinsFromFlatXyz(rosVoxelsBuf, rosVoxelCount, numBins, maxR, refX, refY, refZ)
+            accumulateRadarBinsFromFlatXyz(rosNearScanBuf, rosNearScanCount, numBins, maxR, refX, refY, refZ)
+        }
+        val kRad = 1f - exp(-dt * 14f)
+        for (j in 0 until numBins) {
+            val prev = rawBins60[(j + numBins - 1) % numBins]
+            val curr = rawBins60[j]
+            val next = rawBins60[(j + 1) % numBins]
+            val filtered = min(curr, (prev + curr + next) / 3f)
+            smoothBins60[j] += (filtered - smoothBins60[j]) * kRad
+        }
+        System.arraycopy(smoothBins60, 0, frame.radarSmooth60, 0, numBins)
+
+        voxelMap.updateFocusAnchor(refX, refY)
+        hub.snapshots.publish(frame)
     }
 
     private fun wxDelta(a: Float, b: Float): Float = a - b

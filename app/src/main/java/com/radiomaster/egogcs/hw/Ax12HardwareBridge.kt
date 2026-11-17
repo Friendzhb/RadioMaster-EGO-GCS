@@ -31,6 +31,7 @@ class Ax12HardwareBridge(
     private val engine: EgoSimEngine
 ) {
 
+    private val thermalMonitor = Ax12ThermalMonitor(context, hub)
     private var powerTimer: ScheduledExecutorService? = null
 
     @Volatile private var udpRunning = false
@@ -38,11 +39,13 @@ class Ax12HardwareBridge(
     private var udpThread: Thread? = null
 
     fun start() {
+        thermalMonitor.start()
         startLocalPowerMonitor()
         startMavlinkBackpackUdpListener()
     }
 
     fun stop() {
+        thermalMonitor.stop()
         udpRunning = false
         try {
             udpSocket?.close()
@@ -55,7 +58,7 @@ class Ax12HardwareBridge(
     }
 
     /**
-     * 通道 1：通过 Android 原生 BatteryManager 读取 AX12 遥控器本机双 21700 锂电电压、电量与实时工作电流
+     * 通道 1：通过 Android 原生 BatteryManager 读取 AX12 遥控器本机双 21700 锂电电压、电量、实时工作电流及机身热耦合温度
      */
     private fun startLocalPowerMonitor() {
         if (powerTimer != null) return
@@ -85,6 +88,10 @@ class Ax12HardwareBridge(
                 if (mv > 2500) {
                     val volts = mv / 1000f
                     hub.txBatVolt = if (volts in 3.0f..4.45f) volts * 2f else volts
+                }
+                val tempTenths = sticky.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+                if (tempTenths in 50..850) {
+                    hub.txChassisTempCelsius = tempTenths * 0.1f
                 }
             }
 

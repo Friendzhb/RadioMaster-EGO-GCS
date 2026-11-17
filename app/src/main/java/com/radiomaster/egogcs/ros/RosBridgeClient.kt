@@ -10,7 +10,10 @@ import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -25,23 +28,55 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 
-class RosBridgeClient(
+class RosBridgeClient internal constructor(
     private val hub: GcsSharedHub,
     private val engine: EgoSimEngine,
+    internal val reconnectBackoff: ExponentialBackoffPolicy,
     private val onStateToast: (String) -> Unit
 ) : RosTransport {
 
+    constructor(
+        hub: GcsSharedHub,
+        engine: EgoSimEngine,
+        onStateToast: (String) -> Unit
+    ) : this(
+        hub = hub,
+        engine = engine,
+        reconnectBackoff = ExponentialBackoffPolicy(
+            baseDelayMs = 1_500L,
+            maxDelayMs = 24_000L,
+            multiplier = 2.0,
+            jitterRatio = 0.15
+        ),
+        onStateToast = onStateToast
+    )
+
     override val protocolId: String = "rosbridge"
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(5, TimeUnit.SECONDS)
-        .build()
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(5, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val sessionEpoch = AtomicInteger(0)
+    private val reconnectLock = Any()
+    private var pendingReconnectFuture: ScheduledFuture<*>? = null
+    private val reconnectScheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "RosBridgeReconnect").apply { isDaemon = true }
+    }
+
+    @Volatile private var maintainSession = false
 
     @Volatile private var ws: WebSocket? = null
 
     @Volatile var topics = TopicConfig()
+
+    @Volatile var onDisconnectEscalation: ((failedAttempts: Int) -> Unit)? = null
+
+    @Volatile var onLinkConnected: ((remoteHost: String) -> Unit)? = null
 
     // 供 RosTopicInspector 在 rosbridge 模式下获取话题列表及监听任意指定话题
     @Volatile var watchedTopicName: String? = null
@@ -81,16 +116,47 @@ class RosBridgeClient(
     }
 
     override fun connect(cfg: TopicConfig) {
+        reconnectBackoff.reset()
+        openSession(cfg.copy(), isAutoRetry = false)
+    }
+
+    private fun cancelScheduledReconnect() {
+        synchronized(reconnectLock) {
+            pendingReconnectFuture?.cancel(false)
+            pendingReconnectFuture = null
+        }
+    }
+
+    private fun closeActiveSocketOnly() {
+        swarmOdomTopicToId.clear()
+        swarmOptTopicToId.clear()
+        swarmTiltTopicToId.clear()
+        try {
+            ws?.cancel()
+        } catch (_: Throwable) {}
+        ws = null
+    }
+
+    private fun openSession(cfg: TopicConfig, isAutoRetry: Boolean) {
         topics = cfg.copy()
-        disconnect(silent = true)
+        cancelScheduledReconnect()
+        val myEpoch = sessionEpoch.incrementAndGet()
+        closeActiveSocketOnly()
+        maintainSession = true
 
         hub.isRosMode = true
         hub.connectionLevel = 1
-        hub.connectionLabel = "正在连接机载电脑..."
+        hub.connectionLabel = if (isAutoRetry && reconnectBackoff.attemptCount > 0) {
+            "WS 断链重连中 (#${reconnectBackoff.attemptCount})..."
+        } else {
+            "正在连接机载电脑..."
+        }
 
         val req = try {
             Request.Builder().url(cfg.wsUrl.trim()).build()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
+            maintainSession = false
+            hub.rosConnected = false
             hub.connectionLevel = 2
             hub.connectionLabel = "WS 地址无效"
             onStateToast("WebSocket 地址格式有误")
@@ -111,46 +177,105 @@ class RosBridgeClient(
             req,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    if (sessionEpoch.get() != myEpoch || !maintainSession) {
+                        runCatching { webSocket.cancel() }
+                        return
+                    }
+                    val wasRecovery = isAutoRetry || reconnectBackoff.attemptCount > 0
+                    reconnectBackoff.reset()
                     hub.rosConnected = true
                     hub.connectionLevel = 0
                     hub.connectionLabel = "WS · ${hub.formatRosModeSuffix()}"
                     subscribeAll(webSocket, topics)
-                    onStateToast("已连接机载 rosbridge: ${cfg.wsUrl}")
+                    watchedTopicName?.let { startWatchingTopic(it) }
+                    onLinkConnected?.invoke(wsHost)
+                    onStateToast(
+                        if (wasRecovery) {
+                            "已自动恢复机载 rosbridge: ${cfg.wsUrl}"
+                        } else {
+                            "已连接机载 rosbridge: ${cfg.wsUrl}"
+                        }
+                    )
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (sessionEpoch.get() != myEpoch) return
                     parseRosPacket(text)
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    hub.rosConnected = false
-                    if (hub.isRosMode) {
-                        hub.connectionLevel = 2
-                        hub.connectionLabel = "未连接机载电脑"
-                    }
-                    onStateToast("ROS1 连接失败: ${t.localizedMessage ?: "网络不可达"}")
+                    if (sessionEpoch.get() != myEpoch) return
+                    handleSessionDropped(myEpoch, t.localizedMessage ?: "网络不可达")
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    hub.rosConnected = false
-                    if (hub.isRosMode) {
-                        hub.connectionLevel = 2
-                        hub.connectionLabel = "ROS1 已断开"
-                    }
+                    if (sessionEpoch.get() != myEpoch) return
+                    handleSessionDropped(myEpoch, reason.ifBlank { "桥接连接已关闭" })
                 }
             }
         )
     }
 
-    override fun disconnect(silent: Boolean) {
-        watchedTopicName = null
-        swarmOdomTopicToId.clear()
-        swarmOptTopicToId.clear()
-        swarmTiltTopicToId.clear()
+    private fun handleSessionDropped(expectedEpoch: Int, reason: String) {
+        if (sessionEpoch.get() != expectedEpoch) return
+        hub.rosConnected = false
+        if (!maintainSession || !hub.isRosMode) {
+            if (hub.isRosMode) {
+                hub.connectionLevel = 2
+                hub.connectionLabel = "ROS1 已断开"
+            }
+            return
+        }
+
+        val delayMs = reconnectBackoff.nextDelayMs()
+        if (delayMs < 0L) {
+            hub.connectionLevel = 2
+            hub.connectionLabel = "未连接机载电脑"
+            return
+        }
+        val attempt = reconnectBackoff.attemptCount
+        val secLabel = ExponentialBackoffPolicy.formatSecondsShort(delayMs)
+        hub.connectionLevel = 1
+        hub.connectionLabel = "WS 重连等待 ($secLabel · #$attempt)"
+        if (attempt == 1) {
+            onStateToast("ROS1 桥接中断 ($reason) · 正在自动指数退避重连")
+        }
+        onDisconnectEscalation?.invoke(attempt)
+
         try {
-            ws?.cancel()
-        } catch (_: Throwable) {}
-        ws = null
+            val fut = reconnectScheduler.schedule({
+                if (sessionEpoch.get() != expectedEpoch || !maintainSession || !hub.isRosMode || hub.rosConnected) {
+                    return@schedule
+                }
+                hub.rosReconnectCount += 1
+                openSession(topics.copy(), isAutoRetry = true)
+            }, delayMs, TimeUnit.MILLISECONDS)
+            synchronized(reconnectLock) {
+                if (sessionEpoch.get() == expectedEpoch && maintainSession) {
+                    pendingReconnectFuture?.cancel(false)
+                    pendingReconnectFuture = fut
+                } else {
+                    fut.cancel(false)
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun triggerImmediateReconnectIfDisconnected() {
+        if (!maintainSession || !hub.isRosMode || hub.rosConnected) return
+        reconnectBackoff.reset()
+        hub.rosReconnectCount += 1
+        openSession(topics.copy(), isAutoRetry = true)
+    }
+
+    override fun disconnect(silent: Boolean) {
+        maintainSession = false
+        sessionEpoch.incrementAndGet()
+        cancelScheduledReconnect()
+        reconnectBackoff.reset()
+        watchedTopicName = null
+        closeActiveSocketOnly()
         hub.rosConnected = false
         if (!silent) {
             if (hub.isRosMode) {
@@ -161,6 +286,11 @@ class RosBridgeClient(
                 hub.connectionLabel = "正常飞行 (DEMO)"
             }
         }
+    }
+
+    fun shutdown() {
+        disconnect(silent = true)
+        reconnectScheduler.shutdownNow()
     }
 
     fun requestTopicsViaRosApi(): Boolean {

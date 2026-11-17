@@ -2,10 +2,14 @@ package com.radiomaster.egogcs.ros
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -47,10 +51,101 @@ object LanNetworkBinder {
     @Volatile
     private var appContext: Context? = null
 
+    private val monitorLock = Any()
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var registeredCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastObservedLanSignature: String = ""
+
+    @Volatile
+    private var lanRestoredListener: ((lanSignature: String) -> Unit)? = null
+
+    private val evaluateLanChangeRunnable = Runnable {
+        val listener = lanRestoredListener ?: return@Runnable
+        val newSig = currentLanSignature()
+        val shouldNotify: Boolean
+        synchronized(monitorLock) {
+            val prevSig = lastObservedLanSignature
+            lastObservedLanSignature = newSig
+            shouldNotify = newSig.isNotEmpty() && newSig != prevSig
+        }
+        if (shouldNotify) {
+            listener.invoke(newSig)
+        }
+    }
+
     private val IPV4_LITERAL_REGEX = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$")
 
     fun init(context: Context) {
         appContext = context.applicationContext
+    }
+
+    fun currentLanSignature(): String {
+        val active = discoverActiveLanInterfaces()
+        if (active.isEmpty()) return ""
+        return active.joinToString("|") { "${it.interfaceName}:${it.localIp}/${it.prefixLength}" }
+    }
+
+    /**
+     * 监听物理 Wi-Fi / 有线网口 / USB 网络恢复与网段切换事件：
+     * 当飞手遥控器或平板从短暂断网恢复拿到 IPv4 地址、或切换至机载热点时，立即清零退避计时器并触发重连/寻机。
+     */
+    fun registerLanLinkObserver(onLanRestored: (lanSignature: String) -> Unit) {
+        val ctx = appContext ?: return
+        unregisterLanLinkObserver()
+        lanRestoredListener = onLanRestored
+        synchronized(monitorLock) {
+            lastObservedLanSignature = currentLanSignature()
+        }
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            val reqBuilder = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                reqBuilder.addTransportType(NetworkCapabilities.TRANSPORT_USB)
+            }
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    scheduleLanEvaluation(450L)
+                }
+
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                    scheduleLanEvaluation(320L)
+                }
+
+                override fun onLost(network: Network) {
+                    scheduleLanEvaluation(250L)
+                }
+            }
+            cm.registerNetworkCallback(reqBuilder.build(), cb)
+            synchronized(monitorLock) {
+                registeredCallback = cb
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun unregisterLanLinkObserver() {
+        lanRestoredListener = null
+        mainHandler.removeCallbacks(evaluateLanChangeRunnable)
+        val ctx = appContext
+        val cb: ConnectivityManager.NetworkCallback?
+        synchronized(monitorLock) {
+            cb = registeredCallback
+            registeredCallback = null
+        }
+        if (ctx != null && cb != null) {
+            try {
+                val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                cm?.unregisterNetworkCallback(cb)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun scheduleLanEvaluation(delayMs: Long) {
+        mainHandler.removeCallbacks(evaluateLanChangeRunnable)
+        mainHandler.postDelayed(evaluateLanChangeRunnable, delayMs)
     }
 
     /**

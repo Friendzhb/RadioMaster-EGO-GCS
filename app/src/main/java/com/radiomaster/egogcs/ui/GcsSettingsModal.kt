@@ -1,9 +1,11 @@
 package com.radiomaster.egogcs.ui
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
@@ -59,7 +61,8 @@ class GcsSettingsModal(
     private val onFactoryResetApplied: () -> Unit,
     private val onShowToast: (String) -> Unit,
     private val onTiltConfigChanged: () -> Unit = {},
-    private val onVisibilityChanged: (Boolean) -> Unit = {}
+    private val onVisibilityChanged: (Boolean) -> Unit = {},
+    private val onAutoConnectChanged: (Boolean) -> Unit = {}
 ) {
 
     private val readSnapshot = RenderSnapshot()
@@ -85,6 +88,25 @@ class GcsSettingsModal(
 
     private val d = context.resources.displayMetrics.density
     private val uiHandler = Handler(Looper.getMainLooper())
+    private val installedVersionLabel: String by lazy {
+        runCatching {
+            val pm = context.packageManager
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(context.packageName, 0)
+            }
+            val vName = info.versionName ?: "3.13.0"
+            val vCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                info.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                info.versionCode.toLong()
+            }
+            "v$vName (#$vCode)"
+        }.getOrDefault("v3.13.0")
+    }
 
     lateinit var scrimRoot: FrameLayout
         private set
@@ -147,6 +169,7 @@ class GcsSettingsModal(
     private val perfModeSegBtns = mutableListOf<TextView>()
     private val animStyleSegBtns = mutableListOf<TextView>()
     private val voxelResBtns = mutableListOf<TextView>()
+    private lateinit var swThermalThrottle: ToggleSyncHandle
     private lateinit var swXray: ToggleSyncHandle
     private lateinit var swHaptics: ToggleSyncHandle
     private lateinit var tvSysDiagSummary: TextView
@@ -175,6 +198,7 @@ class GcsSettingsModal(
             val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             hub.themeId = sp.getInt("themeId", GcsTheme.THEME_AERO_CARBON).coerceIn(0, 3)
             hub.perfMode = sp.getInt("perfMode", 0).coerceIn(0, 2)
+            hub.thermalAutoThrottleEnabled = sp.getBoolean("thermalAutoThrottleEnabled", true)
             hub.animStyle = sp.getInt("animStyle", GcsMotionSpec.PROFILE_STANDARD).coerceIn(0, 2)
             hub.cameraDampingScale = AnimHelper.syncMotionContext(hub.animStyle, hub.perfMode)
 
@@ -239,12 +263,14 @@ class GcsSettingsModal(
             hub.otaCustomUrl = sp.getString("otaCustomUrl", OtaUpdateManager.OFFICIAL_GITHUB_APK_URL)
                 ?.takeIf { it.isNotBlank() } ?: OtaUpdateManager.OFFICIAL_GITHUB_APK_URL
             hub.otaAutoCheckOnStart = sp.getBoolean("otaAutoCheckOnStart", true)
+            hub.autoLogMissionsToDb = sp.getBoolean("autoLogMissionsToDb", true)
         }
 
         fun persistAllSettings(context: Context, hub: GcsSharedHub) {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
                 .putInt("themeId", hub.themeId)
                 .putInt("perfMode", hub.perfMode)
+                .putBoolean("thermalAutoThrottleEnabled", hub.thermalAutoThrottleEnabled)
                 .putInt("animStyle", hub.animStyle)
                 .putFloat("obstaclesInflation", hub.obstaclesInflation)
                 .putFloat("maxVel", hub.maxVel)
@@ -288,6 +314,7 @@ class GcsSettingsModal(
                 .putInt("otaChannelModeV2", hub.otaChannelMode)
                 .putString("otaCustomUrl", hub.otaCustomUrl)
                 .putBoolean("otaAutoCheckOnStart", hub.otaAutoCheckOnStart)
+                .putBoolean("autoLogMissionsToDb", hub.autoLogMissionsToDb)
                 .apply()
         }
     }
@@ -580,9 +607,18 @@ class GcsSettingsModal(
         syncPerfModeButtons()
         syncAnimStyleButtons()
         syncVoxelResButtons()
+        if (::swThermalThrottle.isInitialized) {
+            swThermalThrottle.syncFromState(hub.thermalAutoThrottleEnabled)
+        }
         swXray.syncFromState(hub.xrayOcclusionEnabled)
         swHaptics.syncFromState(hub.hapticFeedbackEnabled)
         refreshSystemDiagnostics()
+    }
+
+    fun refreshLiveDiagnosticsIfOpen() {
+        if (isOpen && activeCategory == CAT_GENERAL) {
+            refreshSystemDiagnostics()
+        }
     }
 
     /**
@@ -1053,12 +1089,13 @@ class GcsSettingsModal(
         swAutoConn = addSwitchRow(
             linkCard,
             Type.SEARCH,
-            "启动自动扫描并连接无人机",
-            "自动探测同一局域网 11311 / 9090 机载节点并完成话题配对",
+            "自动寻机与断链自愈重连",
+            "自动探测 11311 / 9090 机载节点，并在 Wi-Fi 或桥接瞬断时按指数退避自动重连",
             hub.autoConnectDiscovered
         ) { v ->
             hub.autoConnectDiscovered = v
             persistAllSettings(context, hub)
+            onAutoConnectChanged(v)
         }
         swMavlinkUdp = addSwitchRow(
             linkCard,
@@ -1347,7 +1384,21 @@ class GcsSettingsModal(
             perfModeSegBtns.add(b)
             perfSeg.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
-        dispCard.addView(perfSeg, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(7f) })
+        dispCard.addView(perfSeg, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(5f) })
+
+        swThermalThrottle = addSwitchRow(
+            dispCard,
+            Type.GAUGE_MID,
+            "CPU 温控动态帧率节流",
+            "按 AX12 热负载在 60 / 45 / 30 / 20 / 15 FPS 间动态调节，抑制热降频掉帧",
+            hub.thermalAutoThrottleEnabled,
+            showDivider = false
+        ) { v ->
+            hub.thermalAutoThrottleEnabled = v
+            persistAllSettings(context, hub)
+            refreshSystemDiagnostics()
+            onShowToast(if (v) "已开启 AX12 CPU 温控动态帧率节流" else "已关闭自动温控节流 (仅保留过热熔断保护)")
+        }
 
         dispCard.addView(subFieldLabel("全局交互动效档位 (省电 30帧自动协同极简瞬态)"))
         val animSeg = segmentedTrack()
@@ -1523,11 +1574,13 @@ class GcsSettingsModal(
         }
         val txt = String.format(
             Locale.US,
-            "应用版本 : 智航 v3.12.0  |  %d FPS (%.2f ms)  |  内存 %d/%d MB\n" +
+            "应用版本 : 智航 %s  |  %d FPS (%.2f ms)  |  内存 %d/%d MB\n" +
+                "温控节流 : %s  |  源 %s\n" +
                 "模式与栈 : %s%s  |  推力裕度 %d%%\n" +
                 "体素点云 : 膨胀 %d blks  |  点云 %d pts  |  分辨率 %dx%d\n" +
                 "双路电源 : 飞机 %.2fV (%.1fA, %d%%)  |  遥控本机 %.2fV (%d%%)",
-            hub.renderFps, hub.frameRenderMs, usedMb, maxMb,
+            installedVersionLabel, hub.renderFps, hub.frameRenderMs, usedMb, maxMb,
+            hub.formatThermalStatusSummary(), hub.thermalSourceTag,
             modeTxt, linkRateInfo, s.tiltThrustMarginPct,
             s.voxelCount, s.mapPointCount, dm.widthPixels, dm.heightPixels,
             s.batVolt, s.batCurrentAmps, s.batPct, s.txBatVolt, s.txBatPct
@@ -1553,6 +1606,7 @@ class GcsSettingsModal(
 
         hub.themeId = GcsTheme.THEME_AERO_CARBON
         hub.perfMode = 0
+        hub.thermalAutoThrottleEnabled = true
         hub.animStyle = GcsMotionSpec.PROFILE_STANDARD
         hub.cameraDampingScale = AnimHelper.syncMotionContext(hub.animStyle, hub.perfMode)
         hub.obstaclesInflation = 0.30f

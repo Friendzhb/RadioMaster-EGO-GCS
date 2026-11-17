@@ -14,7 +14,10 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -47,7 +50,20 @@ data class DiscoveredDrone(
  * 4. **全兼容 XML-RPC 协议栈与机载 Linux 在线诊断**：同时兼容 Python `roscore` `<string>` 与 C++ `xmlrpcpp` 省略 `<string>` 的响应，
  *    并在机载电脑刚开机尚未启动 `roscore` 时通过 OpenSSH 横幅识别在线 Ubuntu/Jetson 主机，彻底告别“盲猜 IP”。
  */
-class LanDroneScanner {
+class LanDroneScanner(
+    internal val standardBackoffPolicy: ExponentialBackoffPolicy = ExponentialBackoffPolicy(
+        baseDelayMs = 2_000L,
+        maxDelayMs = 30_000L,
+        multiplier = 2.0,
+        jitterRatio = 0.15
+    ),
+    internal val bootingHostBackoffPolicy: ExponentialBackoffPolicy = ExponentialBackoffPolicy(
+        baseDelayMs = 1_500L,
+        maxDelayMs = 12_000L,
+        multiplier = 1.8,
+        jitterRatio = 0.12
+    )
+) {
 
     private sealed class PortProbeResult {
         data class Open(val rttMs: Int) : PortProbeResult()
@@ -56,6 +72,26 @@ class LanDroneScanner {
     }
 
     private val scanGen = AtomicInteger(0)
+    private val retryGen = AtomicInteger(0)
+    private val retryLock = Any()
+    private val shuttingDown = AtomicBoolean(false)
+
+    private val retryScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "LanDiscoveryBackoff").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var pendingRetryFuture: ScheduledFuture<*>? = null
+
+    @Volatile
+    var lastScheduledDelayMs: Long = 0L
+        private set
+
+    @Volatile
+    var currentBackoffAttempt: Int = 0
+        private set
+
+    private val knownCandidateIps: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     @Volatile
     private var activeGen: Int = 0
@@ -66,19 +102,73 @@ class LanDroneScanner {
     val isScanning: Boolean
         get() = activeGen != 0
 
-    fun cancelScan() {
+    val isBackoffScheduled: Boolean
+        get() = synchronized(retryLock) {
+            val fut = pendingRetryFuture
+            fut != null && !fut.isDone && !fut.isCancelled
+        }
+
+    fun rememberCandidateHost(rawHostOrUri: String?) {
+        val host = extractEndpointHost(rawHostOrUri) ?: return
+        if (LanNetworkBinder.isUsableLanIpv4(host) || host == "127.0.0.1") {
+            knownCandidateIps.add(host)
+        }
+    }
+
+    fun cancelScheduledBackoff() {
+        retryGen.incrementAndGet()
+        synchronized(retryLock) {
+            pendingRetryFuture?.cancel(false)
+            pendingRetryFuture = null
+        }
+    }
+
+    fun resetBackoff() {
+        cancelScheduledBackoff()
+        standardBackoffPolicy.reset()
+        bootingHostBackoffPolicy.reset()
+        currentBackoffAttempt = 0
+        lastScheduledDelayMs = 0L
+    }
+
+    fun cancelScan(cancelAutoRetry: Boolean = true) {
+        if (cancelAutoRetry) {
+            cancelScheduledBackoff()
+        }
         scanGen.incrementAndGet()
         activeGen = 0
         scanMasterThread?.interrupt()
     }
 
+    fun shutdown() {
+        shuttingDown.set(true)
+        resetBackoff()
+        cancelScan(cancelAutoRetry = true)
+        retryScheduler.shutdownNow()
+    }
+
     fun startScan(
         baseConfig: TopicConfig,
         manualHintRaw: String? = null,
+        backgroundRecoveryPass: Boolean = false,
+        restrictToHintsOnly: Boolean = false,
+        shouldScheduleAutoRetry: () -> Boolean = { false },
+        supplyLatestConfig: () -> TopicConfig = { baseConfig },
+        supplyLatestHints: () -> String? = { manualHintRaw },
+        onBackoffScheduled: (attempt: Int, delayMs: Long, reason: DiscoveryRecoveryReason) -> Unit = { _, _, _ -> },
         onProgress: (percent: Int, hint: String) -> Unit,
         onDroneFound: (DiscoveredDrone) -> Unit,
         onComplete: (List<DiscoveredDrone>, String) -> Unit
     ) {
+        if (shuttingDown.get()) return
+        cancelScheduledBackoff()
+        if (!backgroundRecoveryPass) {
+            standardBackoffPolicy.reset()
+            bootingHostBackoffPolicy.reset()
+            currentBackoffAttempt = 0
+            lastScheduledDelayMs = 0L
+        }
+
         val myGen = scanGen.incrementAndGet()
         activeGen = myGen
         scanMasterThread?.interrupt()
@@ -88,7 +178,7 @@ class LanDroneScanner {
             val orderedFound = Collections.synchronizedList(mutableListOf<DiscoveredDrone>())
             var subnetSummary = "局域网"
             try {
-                val lanInterfaces = LanNetworkBinder.discoverActiveLanInterfaces()
+                val lanInterfaces = if (restrictToHintsOnly) emptyList() else LanNetworkBinder.discoverActiveLanInterfaces()
                 val localIps = HashSet<String>()
                 val gatewayIps = LinkedHashSet<String>()
                 val prefixes = LinkedHashSet<String>()
@@ -127,7 +217,7 @@ class LanDroneScanner {
                     }
                 }
 
-                val arpPeers = LanNetworkBinder.readKnownArpNeighborIps()
+                val arpPeers = if (restrictToHintsOnly) emptySet() else LanNetworkBinder.readKnownArpNeighborIps()
                 for (arpIp in arpPeers) {
                     val dot = arpIp.lastIndexOf('.')
                     if (dot > 0 && prefixes.size < 4) {
@@ -136,27 +226,29 @@ class LanDroneScanner {
                 }
 
                 val hasActiveLanLink = lanInterfaces.isNotEmpty()
-                if (prefixes.isEmpty()) {
+                if (prefixes.isEmpty() && !restrictToHintsOnly) {
                     // 未检测到常规局域网接口时，兜底覆盖 Ubuntu 热点 / 手机热点 / 数字图传网口 / 常用路由默认网段
-                    prefixes.add("10.42.0.")
+                    prefixes.add("10.42.0.1".substring(0, 8))
                     prefixes.add("192.168.4.")
                     prefixes.add("192.168.43.")
                     prefixes.add("192.168.144.")
                     prefixes.add("192.168.1.")
                 }
 
-                val activePrefixes = if (hasActiveLanLink) {
-                    prefixes.take(4)
-                } else {
-                    prefixes.take(2)
+                val activePrefixes = when {
+                    restrictToHintsOnly -> emptyList()
+                    hasActiveLanLink -> prefixes.take(4)
+                    else -> prefixes.take(2)
                 }
 
-                subnetSummary = if (hasActiveLanLink) {
-                    val primary = lanInterfaces.first()
-                    val extra = if (activePrefixes.size > 1) " 等${activePrefixes.size}个网段" else ""
-                    "${primary.interfaceName} ${primary.localIp}/${primary.prefixLength}$extra"
-                } else {
-                    "默认机载热点网段 (${activePrefixes.joinToString(", ") { "${it}0/24" }})"
+                subnetSummary = when {
+                    restrictToHintsOnly -> "指定目标节点"
+                    hasActiveLanLink -> {
+                        val primary = lanInterfaces.first()
+                        val extra = if (activePrefixes.size > 1) " 等${activePrefixes.size}个网段" else ""
+                        "${primary.interfaceName} ${primary.localIp}/${primary.prefixLength}$extra"
+                    }
+                    else -> "默认机载热点网段 (${activePrefixes.joinToString(", ") { "${it}0/24" }})"
                 }
 
                 val customMasterPort = extractEndpointPort(baseConfig.masterUri)
@@ -174,45 +266,68 @@ class LanDroneScanner {
                     add(9090)
                 }
 
-                // 第一波：高优先级秒级直探队列 (历史 IP + 网关 + 机载热点固定 IP + ARP 已知邻居 + 常见机载静态尾号)
+                // 阶段 0：断链快速重捕获目标 (历史命中无人机 IP + 用户提示 IP + ARP 邻居)
+                val rapidTargets = LinkedHashSet<String>()
                 val priorityTargets = LinkedHashSet<String>()
                 val confirmedPeers = ConcurrentHashMap.newKeySet<String>()
                 confirmedPeers.addAll(arpPeers)
+                confirmedPeers.addAll(knownCandidateIps)
 
+                for (knownIp in knownCandidateIps) {
+                    if (knownIp !in localIps && (restrictToHintsOnly || knownIp != "127.0.0.1")) {
+                        rapidTargets.add(knownIp)
+                        priorityTargets.add(knownIp)
+                    }
+                }
                 for (h in hintHosts) {
-                    if (h != "127.0.0.1" && !h.equals("localhost", ignoreCase = true) && h !in localIps) {
+                    val allowLoopback = restrictToHintsOnly
+                    if ((allowLoopback || (h != "127.0.0.1" && !h.equals("localhost", ignoreCase = true))) && h !in localIps) {
+                        rapidTargets.add(h)
                         priorityTargets.add(h)
                     }
                 }
-                for (gw in gatewayIps) {
-                    if (gw !in localIps) priorityTargets.add(gw)
-                }
-                for (arpIp in arpPeers) {
-                    if (arpIp !in localIps) priorityTargets.add(arpIp)
-                }
-                // 常见机载热点 / 图传固定地址
-                for (wellKnown in arrayOf("10.42.0.1", "192.168.4.1", "192.168.144.10", "192.168.144.20", "192.168.42.129")) {
-                    if (wellKnown !in localIps) priorityTargets.add(wellKnown)
-                }
+                if (!restrictToHintsOnly) {
+                    for (gw in gatewayIps) {
+                        if (gw !in localIps) {
+                            rapidTargets.add(gw)
+                            priorityTargets.add(gw)
+                        }
+                    }
+                    for (arpIp in arpPeers) {
+                        if (arpIp !in localIps) {
+                            rapidTargets.add(arpIp)
+                            priorityTargets.add(arpIp)
+                        }
+                    }
+                    // 常见机载热点 / 图传固定地址
+                    for (wellKnown in arrayOf("10.42.0.1", "192.168.4.1", "192.168.144.10", "192.168.144.20", "192.168.42.129")) {
+                        if (wellKnown !in localIps) {
+                            rapidTargets.add(wellKnown)
+                            priorityTargets.add(wellKnown)
+                        }
+                    }
 
-                val hotSuffixes = intArrayOf(
-                    1, 2, 10, 11, 20, 30, 42, 50, 60, 80, 88, 99,
-                    100, 101, 102, 103, 104, 105, 108, 110, 120, 128, 150, 168, 188, 200, 250, 254
-                )
-                for (pfx in activePrefixes) {
-                    for (s in hotSuffixes) {
-                        val ip = "$pfx$s"
-                        if (ip !in localIps) priorityTargets.add(ip)
+                    val hotSuffixes = intArrayOf(
+                        1, 2, 10, 11, 20, 30, 42, 50, 60, 80, 88, 99,
+                        100, 101, 102, 103, 104, 105, 108, 110, 120, 128, 150, 168, 188, 200, 250, 254
+                    )
+                    for (pfx in activePrefixes) {
+                        for (s in hotSuffixes) {
+                            val ip = "$pfx$s"
+                            if (ip !in localIps) priorityTargets.add(ip)
+                        }
                     }
                 }
 
                 // 第二波：活动网段全量 1..254 覆盖队列
                 val fullSweepTargets = LinkedHashSet<String>()
-                for (pfx in activePrefixes) {
-                    for (hostId in 1..254) {
-                        val ip = "$pfx$hostId"
-                        if (ip !in localIps && ip !in priorityTargets) {
-                            fullSweepTargets.add(ip)
+                if (!restrictToHintsOnly) {
+                    for (pfx in activePrefixes) {
+                        for (hostId in 1..254) {
+                            val ip = "$pfx$hostId"
+                            if (ip !in localIps && ip !in priorityTargets) {
+                                fullSweepTargets.add(ip)
+                            }
                         }
                     }
                 }
@@ -222,11 +337,13 @@ class LanDroneScanner {
                 val submittedIps = ConcurrentHashMap.newKeySet<String>()
 
                 if (scanGen.get() == myGen) {
-                    onProgress(3, "正在探测 $subnetSummary (优先热区 + mDNS 广播)...")
+                    val modeTag = if (backgroundRecoveryPass) "后台自愈重探" else "正在探测"
+                    onProgress(3, "$modeTag $subnetSummary (优先热区 + mDNS 广播)...")
                 }
 
                 fun reportHit(hit: DiscoveredDrone) {
                     if (scanGen.get() != myGen) return
+                    rememberCandidateHost(hit.ip)
                     val prev = foundByIp.putIfAbsent(hit.ip, hit)
                     if (prev == null) {
                         orderedFound.add(hit)
@@ -241,89 +358,137 @@ class LanDroneScanner {
                     }
                 }
 
-                val pool = Executors.newFixedThreadPool(28) { r ->
+                val workerCount = when {
+                    restrictToHintsOnly -> rapidTargets.size.coerceIn(1, 6)
+                    backgroundRecoveryPass -> 16
+                    else -> 28
+                }
+                val pool = Executors.newFixedThreadPool(workerCount) { r ->
                     Thread(r, "LanRosProbe").apply { isDaemon = true }
                 }
 
                 try {
-                    // 并行启动 mDNS 局域网零配置发现 (穿透 /16 大网段与动态 DHCP 分配)
-                    val mdnsLatch = CountDownLatch(1)
-                    pool.execute {
-                        try {
-                            if (scanGen.get() == myGen) {
-                                val mdnsIps = discoverMdnsPeers(localIps, timeoutMs = 420)
-                                for (mIp in mdnsIps) {
-                                    if (scanGen.get() != myGen) break
-                                    if (mIp in localIps) continue
-                                    confirmedPeers.add(mIp)
-                                    // 若 mDNS 发现了跨网段或尚未探测的新 IP，立即插队直探
-                                    if (submittedIps.add(mIp)) {
-                                        val hit = probeSingleHost(
-                                            ip = mIp,
-                                            baseCfg = baseConfig,
-                                            masterPorts = masterPorts,
-                                            wsPorts = wsPorts,
-                                            isPriority = true,
-                                            isConfirmedPeer = true,
-                                            isRouterGateway = mIp in gatewayIps && mIp != "10.42.0.1" && mIp != "192.168.4.1"
-                                        )
-                                        if (hit != null) reportHit(hit)
+                    // 后台自愈模式下先对历史已知节点 + ARP 邻居执行极速重捕获：若原 IP 无人机已恢复则毫秒级返回，免扫整网段
+                    var shortCircuitAfterRapid = false
+                    if (backgroundRecoveryPass && rapidTargets.isNotEmpty()) {
+                        val rapidLatch = CountDownLatch(rapidTargets.size)
+                        for (ip in rapidTargets) {
+                            pool.execute {
+                                try {
+                                    if (scanGen.get() != myGen) return@execute
+                                    if (!submittedIps.add(ip)) return@execute
+                                    val resolvedIp = resolveHostnameIfNeeded(ip, allowLoopback = restrictToHintsOnly) ?: return@execute
+                                    if (resolvedIp in localIps) return@execute
+                                    if (resolvedIp != ip && !submittedIps.add(resolvedIp)) return@execute
+                                    val hit = probeSingleHost(
+                                        ip = resolvedIp,
+                                        baseCfg = baseConfig,
+                                        masterPorts = masterPorts,
+                                        wsPorts = wsPorts,
+                                        isPriority = true,
+                                        isConfirmedPeer = resolvedIp in confirmedPeers,
+                                        isRouterGateway = resolvedIp in gatewayIps &&
+                                            resolvedIp != "10.42.0.1" &&
+                                            resolvedIp != "192.168.4.1"
+                                    )
+                                    if (hit != null) reportHit(hit)
+                                } catch (_: Throwable) {
+                                } finally {
+                                    finishedCount.incrementAndGet()
+                                    rapidLatch.countDown()
+                                }
+                            }
+                        }
+                        rapidLatch.await(3500L, TimeUnit.MILLISECONDS)
+                        shortCircuitAfterRapid = synchronized(orderedFound) { orderedFound.any { it.rosReady } }
+                    }
+
+                    if (!shortCircuitAfterRapid) {
+                        // 并行启动 mDNS 局域网零配置发现 (穿透 /16 大网段与动态 DHCP 分配)
+                        val mdnsLatch = CountDownLatch(if (restrictToHintsOnly) 0 else 1)
+                        if (!restrictToHintsOnly) {
+                            pool.execute {
+                                try {
+                                    if (scanGen.get() == myGen) {
+                                        val mdnsIps = discoverMdnsPeers(localIps, timeoutMs = 420)
+                                        for (mIp in mdnsIps) {
+                                            if (scanGen.get() != myGen) break
+                                            if (mIp in localIps) continue
+                                            confirmedPeers.add(mIp)
+                                            // 若 mDNS 发现了跨网段或尚未探测的新 IP，立即插队直探
+                                            if (submittedIps.add(mIp)) {
+                                                val hit = probeSingleHost(
+                                                    ip = mIp,
+                                                    baseCfg = baseConfig,
+                                                    masterPorts = masterPorts,
+                                                    wsPorts = wsPorts,
+                                                    isPriority = true,
+                                                    isConfirmedPeer = true,
+                                                    isRouterGateway = mIp in gatewayIps && mIp != "10.42.0.1" && mIp != "192.168.4.1"
+                                                )
+                                                if (hit != null) reportHit(hit)
+                                            }
+                                        }
                                     }
+                                } catch (_: Throwable) {
+                                } finally {
+                                    mdnsLatch.countDown()
                                 }
                             }
-                        } catch (_: Throwable) {
-                        } finally {
-                            mdnsLatch.countDown()
                         }
-                    }
 
-                    // 先派发第一波高优先级目标，再无缝衔接全子网扫描
-                    val allOrderedTargets = ArrayList<Pair<String, Boolean>>(priorityTargets.size + fullSweepTargets.size)
-                    for (ip in priorityTargets) allOrderedTargets.add(ip to true)
-                    for (ip in fullSweepTargets) allOrderedTargets.add(ip to false)
+                        // 先派发第一波高优先级目标，再无缝衔接全子网扫描
+                        val remainingTargets = ArrayList<Pair<String, Boolean>>(priorityTargets.size + fullSweepTargets.size)
+                        for (ip in priorityTargets) {
+                            if (ip !in submittedIps) remainingTargets.add(ip to true)
+                        }
+                        for (ip in fullSweepTargets) {
+                            if (ip !in submittedIps) remainingTargets.add(ip to false)
+                        }
 
-                    val sweepLatch = CountDownLatch(allOrderedTargets.size)
-                    for ((ip, isPrio) in allOrderedTargets) {
-                        pool.execute {
-                            try {
-                                if (scanGen.get() != myGen) return@execute
-                                if (!submittedIps.add(ip)) return@execute
-                                val resolvedIp = resolveHostnameIfNeeded(ip) ?: return@execute
-                                if (resolvedIp in localIps) return@execute
-                                if (resolvedIp != ip && !submittedIps.add(resolvedIp)) return@execute
+                        val sweepLatch = CountDownLatch(remainingTargets.size)
+                        for ((ip, isPrio) in remainingTargets) {
+                            pool.execute {
+                                try {
+                                    if (scanGen.get() != myGen) return@execute
+                                    if (!submittedIps.add(ip)) return@execute
+                                    val resolvedIp = resolveHostnameIfNeeded(ip, allowLoopback = restrictToHintsOnly) ?: return@execute
+                                    if (resolvedIp in localIps) return@execute
+                                    if (resolvedIp != ip && !submittedIps.add(resolvedIp)) return@execute
 
-                                val hit = probeSingleHost(
-                                    ip = resolvedIp,
-                                    baseCfg = baseConfig,
-                                    masterPorts = masterPorts,
-                                    wsPorts = wsPorts,
-                                    isPriority = isPrio,
-                                    isConfirmedPeer = resolvedIp in confirmedPeers,
-                                    isRouterGateway = resolvedIp in gatewayIps &&
-                                        resolvedIp != "10.42.0.1" &&
-                                        resolvedIp != "192.168.4.1"
-                                )
-                                if (hit != null) {
-                                    reportHit(hit)
+                                    val hit = probeSingleHost(
+                                        ip = resolvedIp,
+                                        baseCfg = baseConfig,
+                                        masterPorts = masterPorts,
+                                        wsPorts = wsPorts,
+                                        isPriority = isPrio,
+                                        isConfirmedPeer = resolvedIp in confirmedPeers,
+                                        isRouterGateway = resolvedIp in gatewayIps &&
+                                            resolvedIp != "10.42.0.1" &&
+                                            resolvedIp != "192.168.4.1"
+                                    )
+                                    if (hit != null) {
+                                        reportHit(hit)
+                                    }
+                                } catch (_: Throwable) {
+                                } finally {
+                                    val done = finishedCount.incrementAndGet()
+                                    if (scanGen.get() == myGen && (done % 16 == 0 || done >= totalPlanned)) {
+                                        val pct = ((done * 100) / totalPlanned).coerceIn(5, 99)
+                                        val foundCnt = orderedFound.size
+                                        val suffix = if (foundCnt > 0) " · 已发现 $foundCnt 台" else ""
+                                        onProgress(pct, "正在扫描 $subnetSummary ($pct%$suffix)")
+                                    }
+                                    sweepLatch.countDown()
                                 }
-                            } catch (_: Throwable) {
-                            } finally {
-                                val done = finishedCount.incrementAndGet()
-                                if (scanGen.get() == myGen && (done % 16 == 0 || done == totalPlanned)) {
-                                    val pct = ((done * 100) / totalPlanned).coerceIn(5, 99)
-                                    val foundCnt = orderedFound.size
-                                    val suffix = if (foundCnt > 0) " · 已发现 $foundCnt 台" else ""
-                                    onProgress(pct, "正在扫描 $subnetSummary ($pct%$suffix)")
-                                }
-                                sweepLatch.countDown()
                             }
                         }
-                    }
 
-                    mdnsLatch.await(1200, TimeUnit.MILLISECONDS)
-                    // 根据扫描规模动态留足等待上限，防止双子网/四子网未扫完被提前截断
-                    val maxWaitSec = (8L + (allOrderedTargets.size / 32L)).coerceIn(10L, 26L)
-                    sweepLatch.await(maxWaitSec, TimeUnit.SECONDS)
+                        mdnsLatch.await(1200, TimeUnit.MILLISECONDS)
+                        // 根据扫描规模动态留足等待上限，防止双子网/四子网未扫完被提前截断
+                        val maxWaitSec = (8L + (remainingTargets.size / 32L)).coerceIn(6L, 26L)
+                        sweepLatch.await(maxWaitSec, TimeUnit.SECONDS)
+                    }
                 } finally {
                     pool.shutdownNow()
                 }
@@ -340,11 +505,93 @@ class LanDroneScanner {
                         )
                     )
                     onComplete(sorted, subnetSummary)
+
+                    val foundReadyDrone = sorted.any { it.rosReady }
+                    if (foundReadyDrone) {
+                        resetBackoff()
+                    } else if (!shuttingDown.get() && shouldScheduleAutoRetry()) {
+                        scheduleNextBackoffPass(
+                            sawBootingHost = sorted.isNotEmpty(),
+                            restrictToHintsOnly = restrictToHintsOnly,
+                            shouldScheduleAutoRetry = shouldScheduleAutoRetry,
+                            supplyLatestConfig = supplyLatestConfig,
+                            supplyLatestHints = supplyLatestHints,
+                            onBackoffScheduled = onBackoffScheduled,
+                            onProgress = onProgress,
+                            onDroneFound = onDroneFound,
+                            onComplete = onComplete
+                        )
+                    }
                 }
             }
         }, "LanDroneScanMaster").apply {
             isDaemon = true
             start()
+        }
+    }
+
+    private fun scheduleNextBackoffPass(
+        sawBootingHost: Boolean,
+        restrictToHintsOnly: Boolean,
+        shouldScheduleAutoRetry: () -> Boolean,
+        supplyLatestConfig: () -> TopicConfig,
+        supplyLatestHints: () -> String?,
+        onBackoffScheduled: (attempt: Int, delayMs: Long, reason: DiscoveryRecoveryReason) -> Unit,
+        onProgress: (percent: Int, hint: String) -> Unit,
+        onDroneFound: (DiscoveredDrone) -> Unit,
+        onComplete: (List<DiscoveredDrone>, String) -> Unit
+    ) {
+        if (shuttingDown.get()) return
+        val policy = if (sawBootingHost) {
+            standardBackoffPolicy.reset()
+            bootingHostBackoffPolicy
+        } else {
+            bootingHostBackoffPolicy.reset()
+            standardBackoffPolicy
+        }
+        val delayMs = policy.nextDelayMs()
+        if (delayMs < 0L) return
+        val attempt = policy.attemptCount
+        val reason = if (sawBootingHost) {
+            DiscoveryRecoveryReason.HOST_BOOTING_ROSCORE
+        } else {
+            DiscoveryRecoveryReason.EMPTY_SCAN_BACKOFF
+        }
+        currentBackoffAttempt = attempt
+        lastScheduledDelayMs = delayMs
+        val myRetryToken = retryGen.incrementAndGet()
+
+        onBackoffScheduled(attempt, delayMs, reason)
+
+        try {
+            val fut = retryScheduler.schedule({
+                if (shuttingDown.get() || retryGen.get() != myRetryToken) return@schedule
+                synchronized(retryLock) {
+                    pendingRetryFuture = null
+                }
+                if (!shouldScheduleAutoRetry()) return@schedule
+                startScan(
+                    baseConfig = supplyLatestConfig(),
+                    manualHintRaw = supplyLatestHints(),
+                    backgroundRecoveryPass = true,
+                    restrictToHintsOnly = restrictToHintsOnly,
+                    shouldScheduleAutoRetry = shouldScheduleAutoRetry,
+                    supplyLatestConfig = supplyLatestConfig,
+                    supplyLatestHints = supplyLatestHints,
+                    onBackoffScheduled = onBackoffScheduled,
+                    onProgress = onProgress,
+                    onDroneFound = onDroneFound,
+                    onComplete = onComplete
+                )
+            }, delayMs, TimeUnit.MILLISECONDS)
+            synchronized(retryLock) {
+                if (retryGen.get() == myRetryToken && !shuttingDown.get()) {
+                    pendingRetryFuture = fut
+                } else {
+                    fut.cancel(false)
+                }
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -832,11 +1079,11 @@ class LanDroneScanner {
         return -1
     }
 
-    private fun resolveHostnameIfNeeded(hostOrIp: String): String? {
+    private fun resolveHostnameIfNeeded(hostOrIp: String, allowLoopback: Boolean = false): String? {
         if (LanNetworkBinder.ipv4ToUnsignedInt(hostOrIp) != null) return hostOrIp
         return try {
             val addrs = InetAddress.getAllByName(hostOrIp)
-            addrs.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }?.hostAddress
+            addrs.firstOrNull { it is Inet4Address && (allowLoopback || !it.isLoopbackAddress) }?.hostAddress
         } catch (_: Throwable) {
             null
         }

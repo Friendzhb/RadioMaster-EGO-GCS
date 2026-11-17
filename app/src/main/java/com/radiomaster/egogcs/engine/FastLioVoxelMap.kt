@@ -35,9 +35,9 @@ class FastLioVoxelMap {
     val uploadedPointsLastFrame: Int get() = uploadCursor.uploadedPoints
     val uploadedPagesLastFrame: Int get() = uploadCursor.uploadedPages
 
-    private val tableKeys = LongArray(HASH_CAP) { EMPTY_KEY }
-    private val tableSlots = IntArray(HASH_CAP) { -1 }
-    private val slotToKey = LongArray(MAX_POINTS) { EMPTY_KEY }
+    private val tableKeys = LongArray(HASH_CAP).apply { fill(EMPTY_KEY) }
+    private val tableSlots = IntArray(HASH_CAP).apply { fill(-1) }
+    private val slotToKey = LongArray(MAX_POINTS).apply { fill(EMPTY_KEY) }
 
     private val vertexShadow = pointStore.vertices
 

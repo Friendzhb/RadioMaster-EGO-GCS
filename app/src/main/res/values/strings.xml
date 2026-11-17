@@ -2,4 +2,15 @@
 <resources>
     <string name="app_name">智航</string>
     <string name="app_full_name">智航 · 激光倾转集群地面站</string>
+    <string name="flight_db_section_title">SQLite 飞行任务黑匣子 · 战后分析与 3D 回放</string>
+    <string name="flight_db_btn_start_record">开始落库记录</string>
+    <string name="flight_db_btn_stop_record">停止并保存</string>
+    <string name="flight_db_btn_export_csv">导出 CSV</string>
+    <string name="flight_db_auto_log_label">航线启动自动落库</string>
+    <string name="flight_db_empty_hint">暂无本地 SQLite 飞行记录 · 点击「开始落库记录」或执行编排航线自动采集 20Hz 全维遥测</string>
+    <string name="flight_replay_play_pause_desc">播放或暂停飞行回放</string>
+    <string name="flight_replay_seek_desc">拖动时间轴回放飞行轨迹</string>
+    <string name="flight_replay_speed_desc">切换飞行回放倍速</string>
+    <string name="flight_replay_analysis_desc">查看本架次战后分析报告</string>
+    <string name="flight_replay_exit_desc">退出飞行回放恢复实时状态</string>
 </resources>

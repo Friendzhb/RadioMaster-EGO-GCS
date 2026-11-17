@@ -115,7 +115,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             }
             val dt = if (lastFrameNs == 0L) 1f / 60f else ((frameTimeNanos - lastFrameNs) * 1e-9f).coerceIn(0f, 0.05f)
             lastFrameNs = frameTimeNanos
-            val targetFps = if (hub.perfMode == 2) 30 else 60
+            val targetFps = hub.effectiveHudTargetFps()
             if (framePacer.due(frameTimeNanos, targetFps)) {
                 stepFrame(dt)
             }
@@ -395,7 +395,7 @@ class UavAttitudeHudView(context: Context, private val hub: GcsSharedHub) : Fram
             pushGlPoseFromSnapshot(s)
         }
 
-        val needCanvasRedraw = attChanged || (!modelTexture.modelReady && (spinning || stoppedEdge) && hub.perfMode != 2)
+        val needCanvasRedraw = attChanged || (!modelTexture.modelReady && (spinning || stoppedEdge) && hub.perfMode != 2 && hub.thermalThrottleLevel < 2)
         if (needCanvasRedraw) {
             lastRoll = s.smoothRoll
             lastPitch = s.smoothPitch

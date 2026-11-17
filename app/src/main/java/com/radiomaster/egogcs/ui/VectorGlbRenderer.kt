@@ -1,6 +1,7 @@
 package com.radiomaster.egogcs.ui
 
 import android.content.Context
+import android.content.res.AssetManager
 import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.GLES20
@@ -11,6 +12,7 @@ import java.io.FileNotFoundException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.max
@@ -36,6 +38,8 @@ internal class VectorGlbRenderer(context: Context) {
     @Volatile private var tiltModel: VectorUavMeshBuilder.PreparedModel? = null
 
     @Volatile private var quadModel: VectorUavMeshBuilder.PreparedModel? = null
+    private var tiltUploaded = false
+    private var quadUploaded = false
     private var boundEglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var program = 0
     private var tiltVertexBuffer = 0
@@ -66,8 +70,11 @@ internal class VectorGlbRenderer(context: Context) {
     private val mvp = FloatArray(16)
 
     val ready: Boolean
-        get() = tiltModel != null && quadModel != null &&
-            program != 0 && tiltVertexBuffer != 0 && quadVertexBuffer != 0 && materialTextureId != 0
+        get() = program != 0 && materialTextureId != 0 &&
+            (
+                (tiltUploaded && tiltModel != null && tiltVertexBuffer != 0) ||
+                    (quadUploaded && quadModel != null && quadVertexBuffer != 0)
+                )
 
     /**
      * Checks whether all compiled shaders, VBOs, and 3D UAV surface textures are already resident in [ctx].
@@ -77,15 +84,14 @@ internal class VectorGlbRenderer(context: Context) {
      */
     fun isContextResident(ctx: EGLContext = EGL14.eglGetCurrentContext()): Boolean {
         if (ctx == EGL14.EGL_NO_CONTEXT || ctx != boundEglContext) return false
-        if (tiltModel == null || quadModel == null) return false
-        if (program == 0 || tiltVertexBuffer == 0 || quadVertexBuffer == 0 || materialTextureId == 0) return false
+        if (!ready || tiltVertexBuffer == 0 || quadVertexBuffer == 0) return false
         return GLES20.glIsTexture(materialTextureId) &&
             GLES20.glIsProgram(program) &&
             GLES20.glIsBuffer(tiltVertexBuffer) &&
             GLES20.glIsBuffer(quadVertexBuffer)
     }
 
-    fun create() {
+    fun create(preferTiltRig: Boolean = true) {
         val currentCtx = EGL14.eglGetCurrentContext()
         if (isContextResident(currentCtx)) {
             return
@@ -101,10 +107,10 @@ internal class VectorGlbRenderer(context: Context) {
         }
         tiltModel = null
         quadModel = null
+        tiltUploaded = false
+        quadUploaded = false
         boundEglContext = EGL14.EGL_NO_CONTEXT
         try {
-            val preparedTilt = loadTiltModel()
-            val preparedQuad = loadQuadModel()
             program = createProgram()
             aPosition = GLES20.glGetAttribLocation(program, "aPosition")
             aNormal = GLES20.glGetAttribLocation(program, "aNormal")
@@ -125,23 +131,35 @@ internal class VectorGlbRenderer(context: Context) {
             tiltVertexBuffer = ids[0]
             quadVertexBuffer = ids[1]
             check(tiltVertexBuffer != 0 && quadVertexBuffer != 0) { "Could not allocate UAV GL buffers" }
+            // Materialize both buffer objects immediately so glIsBuffer() is valid even before secondary rig upload
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, tiltVertexBuffer)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadVertexBuffer)
 
-            uploadStaticModelVbo(tiltVertexBuffer, preparedTilt)
-            uploadStaticModelVbo(quadVertexBuffer, preparedQuad)
+            if (preferTiltRig) {
+                val preparedTilt = loadTiltModelStatic(assets)
+                uploadStaticModelVbo(tiltVertexBuffer, preparedTilt)
+                tiltModel = preparedTilt
+                tiltUploaded = true
+            } else {
+                val preparedQuad = loadQuadModelStatic()
+                uploadStaticModelVbo(quadVertexBuffer, preparedQuad)
+                quadModel = preparedQuad
+                quadUploaded = true
+            }
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
 
             materialTextureId = uploadMaterialDetailTexture()
             check(materialTextureId != 0) { "Could not upload UAV material detail texture" }
             textureUploadCount++
 
-            tiltModel = preparedTilt
-            quadModel = preparedQuad
             boundEglContext = currentCtx
         } catch (e: Exception) {
             Log.e("VectorGlbRenderer", "Could not initialize 3D research UAV renderer", e)
             deleteCurrentGlObjects()
             tiltModel = null
             quadModel = null
+            tiltUploaded = false
+            quadUploaded = false
             boundEglContext = EGL14.EGL_NO_CONTEXT
         }
     }
@@ -158,6 +176,8 @@ internal class VectorGlbRenderer(context: Context) {
         }
         tiltModel = null
         quadModel = null
+        tiltUploaded = false
+        quadUploaded = false
         boundEglContext = EGL14.EGL_NO_CONTEXT
     }
 
@@ -223,39 +243,35 @@ internal class VectorGlbRenderer(context: Context) {
         check(error == GLES20.GL_NO_ERROR) { "UAV GL buffer upload failed: $error" }
     }
 
-    private fun loadTiltModel(): VectorUavMeshBuilder.PreparedModel {
-        cachedTiltModel?.let { return it }
-        synchronized(MODEL_CACHE_LOCK) {
-            cachedTiltModel?.let { return it }
-            val built = try {
-                assets.openFd("vector_uav.glb").use { descriptor ->
-                    FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
-                        val mapped = channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.length)
-                        val parsed = VectorGlbAsset.parse(mapped)
-                        val binary = mapped.duplicate()
-                        binary.position(parsed.binaryOffset)
-                        binary.limit(parsed.binaryOffset + parsed.binaryLength)
-                        VectorUavMeshBuilder.prepareFromGlb(parsed, binary.slice())
-                    }
-                }
-            } catch (_: FileNotFoundException) {
-                VectorUavMeshBuilder.buildProceduralTiltUav()
-            } catch (e: Exception) {
-                Log.w("VectorGlbRenderer", "Falling back to built-in 3D CAD tilt-rotor UAV rig", e)
-                VectorUavMeshBuilder.buildProceduralTiltUav()
-            }
-            cachedTiltModel = built
-            return built
+    private fun ensureTiltModelUploaded(): VectorUavMeshBuilder.PreparedModel? {
+        if (tiltUploaded && tiltModel != null) return tiltModel
+        if (tiltVertexBuffer == 0) return null
+        return try {
+            val prepared = loadTiltModelStatic(assets)
+            uploadStaticModelVbo(tiltVertexBuffer, prepared)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+            tiltModel = prepared
+            tiltUploaded = true
+            prepared
+        } catch (e: Exception) {
+            Log.e("VectorGlbRenderer", "Could not upload tilt UAV rig VBO", e)
+            null
         }
     }
 
-    private fun loadQuadModel(): VectorUavMeshBuilder.PreparedModel {
-        cachedQuadModel?.let { return it }
-        synchronized(MODEL_CACHE_LOCK) {
-            cachedQuadModel?.let { return it }
-            val built = VectorUavMeshBuilder.buildProceduralStandardQuad()
-            cachedQuadModel = built
-            return built
+    private fun ensureQuadModelUploaded(): VectorUavMeshBuilder.PreparedModel? {
+        if (quadUploaded && quadModel != null) return quadModel
+        if (quadVertexBuffer == 0) return null
+        return try {
+            val prepared = loadQuadModelStatic()
+            uploadStaticModelVbo(quadVertexBuffer, prepared)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+            quadModel = prepared
+            quadUploaded = true
+            prepared
+        } catch (e: Exception) {
+            Log.e("VectorGlbRenderer", "Could not upload standard quad UAV rig VBO", e)
+            null
         }
     }
 
@@ -331,14 +347,15 @@ internal class VectorGlbRenderer(context: Context) {
         rotorPhases: FloatArray? = null,
         rotorBlur: FloatArray? = null
     ) {
-        val loaded = (if (isTiltRig) tiltModel else quadModel) ?: return
-        val activeVbo = if (isTiltRig) tiltVertexBuffer else quadVertexBuffer
-        if (!ready || activeVbo == 0 || !x.isFinite() || !y.isFinite() || !z.isFinite() ||
+        if (!ready || !x.isFinite() || !y.isFinite() || !z.isFinite() ||
             !roll.isFinite() || !pitch.isFinite() || !yaw.isFinite() ||
             !frontTilt.isFinite() || !rearTilt.isFinite()
         ) {
             return
         }
+        val loaded = (if (isTiltRig) ensureTiltModelUploaded() else ensureQuadModelUploaded()) ?: return
+        val activeVbo = if (isTiltRig) tiltVertexBuffer else quadVertexBuffer
+        if (activeVbo == 0) return
 
         Matrix.setIdentityM(body, 0)
         Matrix.translateM(body, 0, x, y, z)
@@ -748,14 +765,85 @@ internal class VectorGlbRenderer(context: Context) {
     companion object {
         internal const val DETAIL_TEX_SIZE = 64
         private const val RAD_TO_DEG = 57.2957795f
-        private val MODEL_CACHE_LOCK = Any()
+        private val TILT_MODEL_LOCK = Any()
+        private val QUAD_MODEL_LOCK = Any()
         private val DETAIL_TEX_LOCK = Any()
+        private val prewarmStarted = AtomicBoolean(false)
 
         @Volatile private var cachedTiltModel: VectorUavMeshBuilder.PreparedModel? = null
 
         @Volatile private var cachedQuadModel: VectorUavMeshBuilder.PreparedModel? = null
 
         @Volatile private var cachedDetailPixels: ByteBuffer? = null
+
+        /**
+         * Pre-synthesizes CPU-side procedural UAV meshes and material detail texture in parallel
+         * with Activity UI inflation so `GLSurfaceView.onSurfaceCreated()` hits warm RAM caches.
+         */
+        internal fun prewarmCpuCachesAsync(context: Context, preferTiltFirst: Boolean = true) {
+            if (cachedTiltModel != null && cachedQuadModel != null && cachedDetailPixels != null) return
+            if (!prewarmStarted.compareAndSet(false, true)) return
+            val appAssets = context.applicationContext.assets
+            Thread(
+                {
+                    try {
+                        loadMaterialDetailPixels()
+                        if (preferTiltFirst) {
+                            loadTiltModelStatic(appAssets)
+                            loadQuadModelStatic()
+                        } else {
+                            loadQuadModelStatic()
+                            loadTiltModelStatic(appAssets)
+                        }
+                    } catch (t: Throwable) {
+                        Log.w("VectorGlbRenderer", "Background UAV mesh prewarm skipped", t)
+                    } finally {
+                        prewarmStarted.set(false)
+                    }
+                },
+                "EgoUavMeshPrewarm"
+            ).apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY
+                start()
+            }
+        }
+
+        private fun loadTiltModelStatic(assets: AssetManager): VectorUavMeshBuilder.PreparedModel {
+            cachedTiltModel?.let { return it }
+            synchronized(TILT_MODEL_LOCK) {
+                cachedTiltModel?.let { return it }
+                val built = try {
+                    assets.openFd("vector_uav.glb").use { descriptor ->
+                        FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
+                            val mapped = channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.length)
+                            val parsed = VectorGlbAsset.parse(mapped)
+                            val binary = mapped.duplicate()
+                            binary.position(parsed.binaryOffset)
+                            binary.limit(parsed.binaryOffset + parsed.binaryLength)
+                            VectorUavMeshBuilder.prepareFromGlb(parsed, binary.slice())
+                        }
+                    }
+                } catch (_: FileNotFoundException) {
+                    VectorUavMeshBuilder.buildProceduralTiltUav()
+                } catch (e: Exception) {
+                    Log.w("VectorGlbRenderer", "Falling back to built-in 3D CAD tilt-rotor UAV rig", e)
+                    VectorUavMeshBuilder.buildProceduralTiltUav()
+                }
+                cachedTiltModel = built
+                return built
+            }
+        }
+
+        private fun loadQuadModelStatic(): VectorUavMeshBuilder.PreparedModel {
+            cachedQuadModel?.let { return it }
+            synchronized(QUAD_MODEL_LOCK) {
+                cachedQuadModel?.let { return it }
+                val built = VectorUavMeshBuilder.buildProceduralStandardQuad()
+                cachedQuadModel = built
+                return built
+            }
+        }
 
         /**
          * Synthesizes and caches a seamless 64x64 RGBA8 procedural material detail texture:

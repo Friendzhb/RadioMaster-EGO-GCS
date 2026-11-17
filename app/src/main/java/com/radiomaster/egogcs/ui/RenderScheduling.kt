@@ -23,8 +23,13 @@ class FramePacer {
             nextNs = nowNs + period
             return true
         }
-        if (nowNs < nextNs) return false
-        nextNs += ((nowNs - nextNs) / period + 1L) * period
+        val jitterToleranceNs = minOf(1_500_000L, period / 8L)
+        if (nowNs + jitterToleranceNs < nextNs) return false
+        if (nowNs < nextNs) {
+            nextNs += period
+        } else {
+            nextNs += ((nowNs - nextNs) / period + 1L) * period
+        }
         return true
     }
 }

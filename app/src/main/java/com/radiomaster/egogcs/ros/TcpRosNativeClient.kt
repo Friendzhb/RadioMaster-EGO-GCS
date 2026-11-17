@@ -16,6 +16,9 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -23,11 +26,28 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
-class TcpRosNativeClient(
+class TcpRosNativeClient internal constructor(
     private val hub: GcsSharedHub,
     private val engine: EgoSimEngine,
+    internal val reconnectBackoff: ExponentialBackoffPolicy,
     private val onStateToast: (String) -> Unit
 ) : RosTransport {
+
+    constructor(
+        hub: GcsSharedHub,
+        engine: EgoSimEngine,
+        onStateToast: (String) -> Unit
+    ) : this(
+        hub = hub,
+        engine = engine,
+        reconnectBackoff = ExponentialBackoffPolicy(
+            baseDelayMs = 1_500L,
+            maxDelayMs = 24_000L,
+            multiplier = 2.0,
+            jitterRatio = 0.15
+        ),
+        onStateToast = onStateToast
+    )
 
     override val protocolId: String = "tcpros"
 
@@ -60,8 +80,18 @@ class TcpRosNativeClient(
     }
 
     @Volatile private var active = false
+    private val sessionEpoch = AtomicInteger(0)
+    private val reconnectLock = Any()
+    private var pendingReconnectFuture: ScheduledFuture<*>? = null
+    private val reconnectScheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "TcpRosReconnect").apply { isDaemon = true }
+    }
 
     @Volatile var topics = TopicConfig()
+
+    @Volatile var onDisconnectEscalation: ((failedAttempts: Int) -> Unit)? = null
+
+    @Volatile var onLinkConnected: ((remoteHost: String) -> Unit)? = null
 
     // 已建立实时数据流的核心话题登记表与零额外带宽旁路帧监听钩子 (供 RosTopicInspector 秒级直读)
     private val liveConnectedTopics = ConcurrentHashMap<String, Boolean>()
@@ -99,13 +129,56 @@ class TcpRosNativeClient(
         pattern.trim().replace("{id}", droneId.toString())
 
     override fun connect(cfg: TopicConfig) {
+        reconnectBackoff.reset()
+        connectInternal(cfg.copy(), isAutoRetry = false)
+    }
+
+    private fun cancelScheduledReconnect() {
+        synchronized(reconnectLock) {
+            pendingReconnectFuture?.cancel(false)
+            pendingReconnectFuture = null
+        }
+    }
+
+    private fun releaseSessionSockets() {
+        hub.rosRxKbps = 0f
+        liveConnectedTopics.clear()
+        startedSubKeys.clear()
+        registeredPubKeys.clear()
+        droneIndexToHostIp.clear()
+        hub.rosConnected = false
+        for (s in openSockets) {
+            try {
+                s.close()
+            } catch (_: Throwable) {}
+        }
+        openSockets.clear()
+        goalSubscribers.clear()
+        try {
+            slaveRpcServer?.close()
+        } catch (_: Throwable) {}
+        try {
+            pubTcpServer?.close()
+        } catch (_: Throwable) {}
+        slaveRpcServer = null
+        pubTcpServer = null
+    }
+
+    private fun connectInternal(cfg: TopicConfig, isAutoRetry: Boolean) {
         topics = cfg.copy()
-        disconnect(silent = true)
+        cancelScheduledReconnect()
+        active = false
+        val myEpoch = sessionEpoch.incrementAndGet()
+        releaseSessionSockets()
         active = true
 
         hub.isRosMode = true
         hub.connectionLevel = 1
-        hub.connectionLabel = "正在直连 roscore..."
+        hub.connectionLabel = if (isAutoRetry && reconnectBackoff.attemptCount > 0) {
+            "TCPROS 重连中 (#${reconnectBackoff.attemptCount})..."
+        } else {
+            "正在直连 roscore..."
+        }
 
         ioPool.execute {
             try {
@@ -117,6 +190,7 @@ class TcpRosNativeClient(
                 }
                 val masterHost = extractHostSimple(primaryMasterUri) ?: throw IllegalArgumentException("Master IP 无效")
                 val localIp = detectLocalWifiIp(masterHost)
+                if (!active || sessionEpoch.get() != myEpoch) return@execute
                 activeLocalIp = localIp
                 activeMasterUri = primaryMasterUri
                 activeMasterHost = masterHost
@@ -131,15 +205,20 @@ class TcpRosNativeClient(
                 if (!pingXml.contains("<int>1</int>") && !pingXml.contains("<i4>1</i4>")) {
                     throw IllegalStateException("roscore 未就绪")
                 }
+                if (!active || sessionEpoch.get() != myEpoch) return@execute
 
+                val wasRecovery = isAutoRetry || reconnectBackoff.attemptCount > 0
+                reconnectBackoff.reset()
                 hub.rosConnected = true
                 hub.connectionLevel = 0
                 hub.connectionLabel = "TCPROS · ${hub.formatRosModeSuffix()}"
+                onLinkConnected?.invoke(masterHost)
                 onStateToast(
-                    if (hub.swarmModeEnabled && cfg.swarmTopology == 1 && peerIps.size > 1) {
-                        "已直连多机独立 roscore 集群 (${peerIps.size} 台)"
-                    } else {
-                        "已通过原生 TCPROS 直连 $primaryMasterUri"
+                    when {
+                        wasRecovery -> "已自动恢复原生 TCPROS 连接: $primaryMasterUri"
+                        hub.swarmModeEnabled && cfg.swarmTopology == 1 && peerIps.size > 1 ->
+                            "已直连多机独立 roscore 集群 (${peerIps.size} 台)"
+                        else -> "已通过原生 TCPROS 直连 $primaryMasterUri"
                     }
                 )
 
@@ -169,14 +248,13 @@ class TcpRosNativeClient(
                     startSwarmStreamsInternal(cfg, primaryMasterUri, masterHost, localIp)
                 }
                 // v3.3: 启动 Master 心跳看门狗与实时吞吐率统计协程，机载 roscore 重启后自动重连恢复
-                launchMasterWatchdogAndThroughputLoop(cfg)
+                launchMasterWatchdogAndThroughputLoop(myEpoch)
             } catch (e: Exception) {
-                if (active) {
-                    hub.rosConnected = false
-                    hub.connectionLevel = 2
-                    hub.connectionLabel = "重连等待 roscore..."
-                    onStateToast("TCPROS 首次握手未就绪 (${e.localizedMessage ?: "等待机载网络"}) · 后台自动重连中")
-                    scheduleExponentialMasterReconnect(cfg, attempt = 1)
+                if (active && sessionEpoch.get() == myEpoch && hub.isRosMode) {
+                    scheduleExponentialMasterReconnect(
+                        expectedEpoch = myEpoch,
+                        reason = e.localizedMessage ?: "等待机载网络"
+                    )
                 }
             }
         }
@@ -291,33 +369,63 @@ class TcpRosNativeClient(
             .distinct()
             .take(SwarmPalette.MAX_SWARM_DRONES)
 
-    private fun scheduleExponentialMasterReconnect(cfg: TopicConfig, attempt: Int) {
-        if (!active) return
-        val delayMs = (1500L * (1 shl attempt.coerceIn(0, 3))).coerceAtMost(8000L)
-        ioPool.execute {
-            try {
-                Thread.sleep(delayMs)
-            } catch (_: InterruptedException) {
-                return@execute
+    private fun scheduleExponentialMasterReconnect(expectedEpoch: Int, reason: String) {
+        if (!active || sessionEpoch.get() != expectedEpoch || !hub.isRosMode) return
+        hub.rosConnected = false
+        val delayMs = reconnectBackoff.nextDelayMs()
+        if (delayMs < 0L) {
+            hub.connectionLevel = 2
+            hub.connectionLabel = "未连接 roscore"
+            return
+        }
+        val attempt = reconnectBackoff.attemptCount
+        val secLabel = ExponentialBackoffPolicy.formatSecondsShort(delayMs)
+        hub.connectionLevel = 1
+        hub.connectionLabel = "roscore 重连等待 ($secLabel · #$attempt)"
+        if (attempt == 1) {
+            onStateToast("TCPROS 链路等待机载响应 ($reason) · 后台自动指数退避重连")
+        }
+        onDisconnectEscalation?.invoke(attempt)
+
+        try {
+            val fut = reconnectScheduler.schedule({
+                if (!active || sessionEpoch.get() != expectedEpoch || hub.rosConnected || !hub.isRosMode) {
+                    return@schedule
+                }
+                hub.rosReconnectCount += 1
+                connectInternal(topics.copy(), isAutoRetry = true)
+            }, delayMs, TimeUnit.MILLISECONDS)
+            synchronized(reconnectLock) {
+                if (active && sessionEpoch.get() == expectedEpoch) {
+                    pendingReconnectFuture?.cancel(false)
+                    pendingReconnectFuture = fut
+                } else {
+                    fut.cancel(false)
+                }
             }
-            if (!active || hub.rosConnected || !hub.isRosMode) return@execute
-            hub.rosReconnectCount += 1
-            connect(cfg)
+        } catch (_: Throwable) {
         }
     }
 
-    private fun launchMasterWatchdogAndThroughputLoop(cfg: TopicConfig) {
+    fun triggerImmediateReconnectIfDisconnected() {
+        if (!active || !hub.isRosMode || hub.rosConnected) return
+        reconnectBackoff.reset()
+        hub.rosReconnectCount += 1
+        connectInternal(topics.copy(), isAutoRetry = true)
+    }
+
+    private fun launchMasterWatchdogAndThroughputLoop(expectedEpoch: Int) {
         ioPool.execute {
             var consecutiveMasterFails = 0
             lastRateCalcMs = System.currentTimeMillis()
             rxWindowBytes.set(0L)
-            while (active) {
+            while (active && sessionEpoch.get() == expectedEpoch) {
                 try {
                     Thread.sleep(2000L)
                 } catch (_: InterruptedException) {
                     break
                 }
-                if (!active) break
+                if (!active || sessionEpoch.get() != expectedEpoch) break
                 val now = System.currentTimeMillis()
                 val dtSec = ((now - lastRateCalcMs).coerceAtLeast(200L)) * 0.001f
                 val bytes = rxWindowBytes.getAndSet(0L)
@@ -333,11 +441,8 @@ class TcpRosNativeClient(
                     }.getOrDefault(false)
                     if (!ok) {
                         consecutiveMasterFails++
-                        if (consecutiveMasterFails >= 3 && active) {
-                            hub.rosConnected = false
-                            hub.connectionLevel = 1
-                            hub.connectionLabel = "链路重连中 (#${hub.rosReconnectCount + 1})"
-                            scheduleExponentialMasterReconnect(cfg, attempt = 1)
+                        if (consecutiveMasterFails >= 3 && active && sessionEpoch.get() == expectedEpoch) {
+                            scheduleExponentialMasterReconnect(expectedEpoch, "心跳超时")
                             break
                         }
                     } else {
@@ -355,28 +460,11 @@ class TcpRosNativeClient(
 
     override fun disconnect(silent: Boolean) {
         active = false
-        hub.rosRxKbps = 0f
-        liveConnectedTopics.clear()
-        startedSubKeys.clear()
-        registeredPubKeys.clear()
-        droneIndexToHostIp.clear()
+        sessionEpoch.incrementAndGet()
+        cancelScheduledReconnect()
+        reconnectBackoff.reset()
         watchedRawTopic = null
-        hub.rosConnected = false
-        for (s in openSockets) {
-            try {
-                s.close()
-            } catch (_: Throwable) {}
-        }
-        openSockets.clear()
-        goalSubscribers.clear()
-        try {
-            slaveRpcServer?.close()
-        } catch (_: Throwable) {}
-        try {
-            pubTcpServer?.close()
-        } catch (_: Throwable) {}
-        slaveRpcServer = null
-        pubTcpServer = null
+        releaseSessionSockets()
 
         if (!silent) {
             if (hub.isRosMode) {
@@ -387,6 +475,12 @@ class TcpRosNativeClient(
                 hub.connectionLabel = "正常飞行 (DEMO)"
             }
         }
+    }
+
+    fun shutdown() {
+        disconnect(silent = true)
+        reconnectScheduler.shutdownNow()
+        ioPool.shutdownNow()
     }
 
     override fun setParamAsync(paramName: String, value: Float) {
@@ -545,6 +639,7 @@ class TcpRosNativeClient(
     private fun subscribeTopicLoop(masterUri: String, masterHost: String, localIp: String, topic: String, kind: String, droneId: Int) {
         val initSize = if (kind == "fastlio_cloud" || kind == "inflate") 262_144 else 4096
         val scratch = StreamScratch(initSize)
+        var topicRetryDelayMs = 1_200L
 
         while (active) {
             try {
@@ -554,7 +649,9 @@ class TcpRosNativeClient(
                 val pubUris = extractHttpUris(regResp)
 
                 if (pubUris.isEmpty()) {
-                    Thread.sleep(1500L)
+                    val waitMs = topicRetryDelayMs
+                    topicRetryDelayMs = (topicRetryDelayMs * 2L).coerceAtMost(9_600L)
+                    Thread.sleep(waitMs)
                     continue
                 }
 
@@ -576,15 +673,26 @@ class TcpRosNativeClient(
                     }
                 }
                 if (endpoint == null) {
-                    Thread.sleep(1500L)
+                    val waitMs = topicRetryDelayMs
+                    topicRetryDelayMs = (topicRetryDelayMs * 2L).coerceAtMost(9_600L)
+                    Thread.sleep(waitMs)
                     continue
                 }
 
-                streamTcpRosTopic(endpoint.first, endpoint.second, topic, kind, droneId, scratch)
+                val connectedAtLeastHeader = streamTcpRosTopic(endpoint.first, endpoint.second, topic, kind, droneId, scratch)
+                if (connectedAtLeastHeader) {
+                    topicRetryDelayMs = 1_200L
+                } else {
+                    val waitMs = topicRetryDelayMs
+                    topicRetryDelayMs = (topicRetryDelayMs * 2L).coerceAtMost(9_600L)
+                    Thread.sleep(waitMs)
+                }
             } catch (_: Throwable) {
                 if (active) {
                     try {
-                        Thread.sleep(1500L)
+                        val waitMs = topicRetryDelayMs
+                        topicRetryDelayMs = (topicRetryDelayMs * 2L).coerceAtMost(9_600L)
+                        Thread.sleep(waitMs)
                     } catch (_: InterruptedException) {
                         break
                     }
@@ -593,7 +701,7 @@ class TcpRosNativeClient(
         }
     }
 
-    private fun streamTcpRosTopic(host: String, port: Int, topic: String, kind: String, droneId: Int, scratch: StreamScratch) {
+    private fun streamTcpRosTopic(host: String, port: Int, topic: String, kind: String, droneId: Int, scratch: StreamScratch): Boolean {
         val sock = LanNetworkBinder.createBoundSocket(host)
         openSockets.add(sock)
         try {
@@ -621,9 +729,9 @@ class TcpRosNativeClient(
             out.flush()
 
             val hdrLen = readFrameIntoScratch(inp, scratch, maxFrame = 262_144)
-            if (hdrLen <= 0) return
+            if (hdrLen <= 0) return false
             val hdrFields = decodeTcpRosHeader(scratch.frameBytes, hdrLen)
-            if (hdrFields["error"] != null) return
+            if (hdrFields["error"] != null) return false
             val msgType = hdrFields["type"] ?: ""
             val msgMd5 = hdrFields["md5sum"] ?: ""
             val pubCallerId = hdrFields["callerid"] ?: host
@@ -663,6 +771,7 @@ class TcpRosNativeClient(
                     "tilt", "tilt_act" -> decodeNativeTiltTelemetry(msgType, buf, frameLen, droneId, kind == "tilt_act")
                 }
             }
+            return true
         } finally {
             liveConnectedTopics.remove(topic)
             openSockets.remove(sock)

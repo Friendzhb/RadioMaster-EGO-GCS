@@ -13,6 +13,7 @@ import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.SurfaceHolder
 import com.radiomaster.egogcs.engine.FastLioVoxelMap
 import com.radiomaster.egogcs.model.GcsSharedHub
 import com.radiomaster.egogcs.model.RenderSnapshot
@@ -21,6 +22,7 @@ import com.radiomaster.egogcs.model.SwarmPalette
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.PI
@@ -73,6 +75,20 @@ class GlPointCloudMapView(
         private const val MAX_ACTOR_TRI_VERTS = 36_000
         private const val MAX_TRAIL_TRI_VERTS = 8_192
         private const val MAX_TRAIL_LINE_VERTS = 1_536
+
+        private const val SLOT_GROUND_LINE = 0
+        private const val SLOT_SOLID_TRI = 1
+        private const val SLOT_SOLID_EDGE = 2
+        private const val SLOT_GLASS_TRI = 3
+        private const val SLOT_GLASS_EDGE = 4
+        private const val SLOT_FX_TRI = 5
+        private const val SLOT_ACTOR_LINE = 6
+        private const val SLOT_ACTOR_TRI = 7
+        private const val SLOT_TRAIL_TRI = 8
+        private const val SLOT_TRAIL_LINE = 9
+        private const val STREAM_VBO_SLOT_COUNT = 10
+
+        private const val MIN_STREAM_VBO_BYTES = 16 * 1024
 
         // 8 floats per vertex (32 bytes): x, y, z, r, g, b, a, arcDist
         private const val FLOATS_PER_VERT = 8
@@ -595,44 +611,57 @@ class GlPointCloudMapView(
             position(0)
         }
 
-    private val groundLineArray = FloatArray(MAX_ENV_LINE_VERTS * FLOATS_PER_VERT)
+    // Lazily allocated on GLThread so MainActivity.onCreate() avoids 18.8 MB of MainThread heap/JNI pressure
+    private val groundLineArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_ENV_LINE_VERTS * FLOATS_PER_VERT) }
     private var groundLineVerts = 0
 
-    private val solidObsTriArray = FloatArray(MAX_ENV_TRI_VERTS * FLOATS_PER_VERT)
+    private val solidObsTriArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_ENV_TRI_VERTS * FLOATS_PER_VERT) }
     private var solidObsTriVerts = 0
-    private val solidObsEdgeArray = FloatArray(MAX_ENV_LINE_VERTS * FLOATS_PER_VERT)
+    private val solidObsEdgeArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_ENV_LINE_VERTS * FLOATS_PER_VERT) }
     private var solidObsEdgeVerts = 0
 
-    private val glassObsTriArray = FloatArray(MAX_GLASS_TRI_VERTS * FLOATS_PER_VERT)
+    private val glassObsTriArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_GLASS_TRI_VERTS * FLOATS_PER_VERT) }
     private var glassObsTriVerts = 0
-    private val glassObsEdgeArray = FloatArray(MAX_GLASS_LINE_VERTS * FLOATS_PER_VERT)
+    private val glassObsEdgeArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_GLASS_LINE_VERTS * FLOATS_PER_VERT) }
     private var glassObsEdgeVerts = 0
 
-    private val fxAlphaTriArray = FloatArray(MAX_FX_TRI_VERTS * FLOATS_PER_VERT)
+    private val fxAlphaTriArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_FX_TRI_VERTS * FLOATS_PER_VERT) }
     private var fxAlphaTriVerts = 0
 
-    private val actorLineArray = FloatArray(MAX_ACTOR_LINE_VERTS * FLOATS_PER_VERT)
+    private val actorLineArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_ACTOR_LINE_VERTS * FLOATS_PER_VERT) }
     private var actorLineVerts = 0
-    private val actorTriArray = FloatArray(MAX_ACTOR_TRI_VERTS * FLOATS_PER_VERT)
+    private val actorTriArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_ACTOR_TRI_VERTS * FLOATS_PER_VERT) }
     private var actorTriVerts = 0
 
-    private val trailTriArray = FloatArray(MAX_TRAIL_TRI_VERTS * FLOATS_PER_VERT)
+    private val trailTriArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_TRAIL_TRI_VERTS * FLOATS_PER_VERT) }
     private var trailTriVerts = 0
-    private val trailLineArray = FloatArray(MAX_TRAIL_LINE_VERTS * FLOATS_PER_VERT)
+    private val trailLineArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_TRAIL_LINE_VERTS * FLOATS_PER_VERT) }
     private var trailLineVerts = 0
 
-    private val envLineBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ENV_LINE_VERTS * STRIDE_VERT)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val envTriBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ENV_TRI_VERTS * STRIDE_VERT)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val actorLineBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ACTOR_LINE_VERTS * STRIDE_VERT)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val actorTriBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_ACTOR_TRI_VERTS * STRIDE_VERT)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val trailTriBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_TRAIL_TRI_VERTS * STRIDE_VERT)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val trailLineBuf: FloatBuffer = ByteBuffer.allocateDirect(MAX_TRAIL_LINE_VERTS * STRIDE_VERT)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val envLineBuf: FloatBuffer by lazy(LazyThreadSafetyMode.NONE) {
+        ByteBuffer.allocateDirect(MAX_ENV_LINE_VERTS * STRIDE_VERT)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    }
+    private val envTriBuf: FloatBuffer by lazy(LazyThreadSafetyMode.NONE) {
+        ByteBuffer.allocateDirect(MAX_ENV_TRI_VERTS * STRIDE_VERT)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    }
+    private val actorLineBuf: FloatBuffer by lazy(LazyThreadSafetyMode.NONE) {
+        ByteBuffer.allocateDirect(MAX_ACTOR_LINE_VERTS * STRIDE_VERT)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    }
+    private val actorTriBuf: FloatBuffer by lazy(LazyThreadSafetyMode.NONE) {
+        ByteBuffer.allocateDirect(MAX_ACTOR_TRI_VERTS * STRIDE_VERT)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    }
+    private val trailTriBuf: FloatBuffer by lazy(LazyThreadSafetyMode.NONE) {
+        ByteBuffer.allocateDirect(MAX_TRAIL_TRI_VERTS * STRIDE_VERT)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    }
+    private val trailLineBuf: FloatBuffer by lazy(LazyThreadSafetyMode.NONE) {
+        ByteBuffer.allocateDirect(MAX_TRAIL_LINE_VERTS * STRIDE_VERT)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    }
 
     // Shader Programs & Uniform/Attrib Handles
     private var progSky = 0
@@ -722,22 +751,31 @@ class GlPointCloudMapView(
     private var voxelCacheHit = false
     private var cachedGridVerts = 0
     private val cachedVoxelCounts = IntArray(4)
-    private val cachedVoxelShadows = FloatArray(MAX_FX_TRI_VERTS * FLOATS_PER_VERT)
+    private val cachedVoxelShadows by lazy(LazyThreadSafetyMode.NONE) { FloatArray(MAX_FX_TRI_VERTS * FLOATS_PER_VERT) }
     private var cachedVoxelShadowVerts = 0
     private var cachedDroneBlocked = false
     private var previousHadCore = false
     private var vboStaticGridId = 0
+    private val streamVboCapacities = IntArray(STREAM_VBO_SLOT_COUNT)
+    private var cloudVboAllocated = false
 
     private val glSnapshot = RenderSnapshot()
     private val uiSnapshot = RenderSnapshot()
 
     val renderMetrics = RenderMetrics()
+    internal val thermalGovernor = ThermalFrameGovernor()
     internal var geometryCachingEnabled = true
     private val renderPending = PendingRender()
     private val framePacer = FramePacer()
     private val hudPacer = FramePacer()
     private var loopRunning = false
     private var lastAnimationNs = 0L
+
+    @Volatile var onFirstGlFrameRendered: (() -> Unit)? = null
+    private val firstGlFrameNotified = AtomicBoolean(false)
+
+    @Volatile private var glThreadPaused: Boolean = false
+    private val pendingSurfaceSyncCallbacks = ArrayList<Runnable>(2)
 
     @Volatile var isGlSurfacePaused: Boolean = false
         private set
@@ -746,15 +784,16 @@ class GlPointCloudMapView(
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!loopRunning) return
+            val dynamicTargetFps = thermalGovernor.evaluate(frameTimeNanos, hub)
             if (!isGlSurfacePaused &&
-                framePacer.due(frameTimeNanos, if (hub.perfMode == 2) 30 else 60)
+                framePacer.due(frameTimeNanos, dynamicTargetFps)
             ) {
                 if (renderPending.request()) {
                     requestRender()
                 }
                 onMapVisualTick()
             }
-            if (hudPacer.due(frameTimeNanos, if (hub.perfMode == 2) 7 else 10)) {
+            if (hudPacer.due(frameTimeNanos, thermalGovernor.currentTargetHudHz)) {
                 onHudTick(hub.snapshots.readInto(uiSnapshot))
             }
             if (loopRunning) Choreographer.getInstance().postFrameCallback(this)
@@ -929,6 +968,7 @@ class GlPointCloudMapView(
         }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                thermalGovernor.notifyTouchInteraction(System.nanoTime())
                 multiTouchActive = false
                 gesturePannedOrScaled = false
                 scrollAccum2dPx = 0f
@@ -965,6 +1005,7 @@ class GlPointCloudMapView(
                 activeGroundDragWpIndex = -1
             }
             MotionEvent.ACTION_MOVE -> {
+                thermalGovernor.notifyTouchInteraction(System.nanoTime())
                 if (candidateDragWpIdx >= 0 && !multiTouchActive && event.pointerCount == 1) {
                     if (activelyDraggingWpIdx < 0) {
                         val moveDist = hypot(event.x - wpDownPxX, event.y - wpDownPxY)
@@ -1072,18 +1113,58 @@ class GlPointCloudMapView(
      * `Choreographer` tick active when obscured by full-screen overlays (such as the Full-Screen
      * Telemetry Dashboard or Settings Modal).
      */
+    private fun drainPendingSurfaceSyncCallbacks() {
+        val callbacks: List<Runnable>
+        synchronized(pendingSurfaceSyncCallbacks) {
+            if (pendingSurfaceSyncCallbacks.isEmpty()) return
+            callbacks = ArrayList(pendingSurfaceSyncCallbacks)
+            pendingSurfaceSyncCallbacks.clear()
+        }
+        for (cb in callbacks) {
+            cb.run()
+        }
+    }
+
+    override fun surfaceRedrawNeededAsync(holder: SurfaceHolder, finishDrawing: Runnable) {
+        renderPending.complete()
+        if (glThreadPaused || isGlSurfacePaused) {
+            finishDrawing.run()
+            return
+        }
+        val completed = AtomicBoolean(false)
+        lateinit var wrapped: Runnable
+        wrapped = Runnable {
+            synchronized(pendingSurfaceSyncCallbacks) {
+                pendingSurfaceSyncCallbacks.remove(wrapped)
+            }
+            if (completed.compareAndSet(false, true)) {
+                finishDrawing.run()
+            }
+        }
+        synchronized(pendingSurfaceSyncCallbacks) {
+            pendingSurfaceSyncCallbacks.add(wrapped)
+        }
+        if (glThreadPaused || isGlSurfacePaused) {
+            wrapped.run()
+            return
+        }
+        super.surfaceRedrawNeededAsync(holder, wrapped)
+    }
+
     fun setGlSurfacePaused(paused: Boolean) {
         if (isGlSurfacePaused == paused) return
         isGlSurfacePaused = paused
         if (paused) {
-            if (loopRunning) {
-                super.onPause()
-            }
+            glThreadPaused = true
+            super.onPause()
             renderPending.complete()
+            drainPendingSurfaceSyncCallbacks()
         } else {
             resetFrameClock = true
             framePacer.reset()
+            thermalGovernor.notifyRendererResumed()
             if (loopRunning) {
+                glThreadPaused = false
                 super.onResume()
                 if (renderPending.request()) {
                     requestRender()
@@ -1098,8 +1179,14 @@ class GlPointCloudMapView(
         resetFrameClock = true
         framePacer.reset()
         hudPacer.reset()
+        thermalGovernor.notifyRendererResumed()
         if (!isGlSurfacePaused) {
+            glThreadPaused = false
             super.onResume()
+        } else {
+            glThreadPaused = true
+            super.onPause()
+            drainPendingSurfaceSyncCallbacks()
         }
         Choreographer.getInstance().postFrameCallback(frameCallback)
     }
@@ -1109,9 +1196,11 @@ class GlPointCloudMapView(
         loopRunning = false
         Choreographer.getInstance().removeFrameCallback(frameCallback)
         if (!isGlSurfacePaused) {
+            glThreadPaused = true
             super.onPause()
         }
         renderPending.complete()
+        drainPendingSurfaceSyncCallbacks()
     }
 
     override fun onDetachedFromWindow() {
@@ -1394,9 +1483,67 @@ class GlPointCloudMapView(
         vboStaticGridId = 0
         vboTrailTriId = 0
         vboTrailLineId = 0
+        streamVboCapacities.fill(0)
+        cloudVboAllocated = false
+    }
+
+    private fun ensureGlScratchBuffersAllocated() {
+        groundLineArray
+        solidObsTriArray
+        solidObsEdgeArray
+        glassObsTriArray
+        glassObsEdgeArray
+        fxAlphaTriArray
+        actorLineArray
+        actorTriArray
+        trailTriArray
+        trailLineArray
+        cachedVoxelShadows
+        envLineBuf
+        envTriBuf
+        actorLineBuf
+        actorTriBuf
+        trailTriBuf
+        trailLineBuf
+    }
+
+    private fun ensureCloudVboAllocated() {
+        if (cloudVboAllocated || vboCloudId == 0) return
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboCloudId)
+        GLES20.glBufferData(
+            GLES20.GL_ARRAY_BUFFER,
+            FastLioVoxelMap.MAX_POINTS * FastLioVoxelMap.BYTES_PER_VERTEX,
+            null,
+            GLES20.GL_DYNAMIC_DRAW
+        )
+        voxelMap.notifyGlContextRecreated()
+        cloudVboAllocated = true
+    }
+
+    private fun uploadStreamVbo(
+        slot: Int,
+        vboId: Int,
+        byteCount: Int,
+        maxByteCap: Int,
+        data: FloatBuffer
+    ) {
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+        val curCap = streamVboCapacities[slot]
+        if (byteCount > curCap) {
+            var newCap = max(MIN_STREAM_VBO_BYTES, curCap * 2)
+            while (newCap < byteCount && newCap < maxByteCap) {
+                newCap = (newCap * 2).coerceAtMost(maxByteCap)
+            }
+            newCap = newCap.coerceAtLeast(byteCount).coerceAtMost(maxByteCap)
+            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, newCap, null, GLES20.GL_STREAM_DRAW)
+            streamVboCapacities[slot] = newCap
+        }
+        GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, byteCount, data)
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        renderPending.complete()
+        ensureGlScratchBuffersAllocated()
         GLES20.glClearColor(0.038f, 0.048f, 0.065f, 1.0f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthFunc(GLES20.GL_LEQUAL)
@@ -1411,6 +1558,8 @@ class GlPointCloudMapView(
             deleteCurrentMapGlObjects()
         }
         boundMapEglContext = EGL14.EGL_NO_CONTEXT
+        streamVboCapacities.fill(0)
+        cloudVboAllocated = false
 
         progSky = buildProgram(SKY_VS, SKY_FS)
         aSkyPos = GLES20.glGetAttribLocation(progSky, "aNdcPos")
@@ -1484,48 +1633,20 @@ class GlPointCloudMapView(
         vboStaticGridId = bufs[9]
         vboTrailTriId = bufs[10]
         vboTrailLineId = bufs[11]
+        // Materialize all 12 buffer objects immediately without zero-paging 16.3 MB of unused VRAM on cold start
+        for (id in bufs) {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, id)
+        }
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboStaticGridId)
         GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, 128 * STRIDE_VERT, null, GLES20.GL_STATIC_DRAW)
 
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboCloudId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, FastLioVoxelMap.MAX_POINTS * FastLioVoxelMap.BYTES_PER_VERTEX, null, GLES20.GL_DYNAMIC_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboGroundLineId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ENV_LINE_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboSolidTriId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ENV_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboSolidEdgeId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ENV_LINE_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboGlassTriId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_GLASS_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboGlassEdgeId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_GLASS_LINE_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboFxTriId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_FX_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboActorLineId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ACTOR_LINE_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboActorTriId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_ACTOR_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailTriId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_TRAIL_TRI_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailLineId)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, MAX_TRAIL_LINE_VERTS * STRIDE_VERT, null, GLES20.GL_STREAM_DRAW)
-
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
-        vectorGlb.create()
+        vectorGlb.create(preferTiltRig = hub.activeFocusIsTiltRig())
         voxelMap.notifyGlContextRecreated()
         gridKey.invalidate()
         voxelKey.invalidate()
         boundMapEglContext = currentCtx
+        thermalGovernor.notifyRendererResumed()
         resetFrameClock = true
     }
 
@@ -1533,6 +1654,7 @@ class GlPointCloudMapView(
         viewportW = max(1, width)
         viewportH = max(1, height)
         GLES20.glViewport(0, 0, viewportW, viewportH)
+        renderPending.complete()
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -1585,18 +1707,23 @@ class GlPointCloudMapView(
             GLES20.glDepthFunc(GLES20.GL_LEQUAL)
             GLES20.glDepthMask(false)
             GLES20.glEnable(GLES20.GL_BLEND)
-            flushEnvLines(vboStaticGridId, groundLineArray, cachedGridVerts, max(1f, 1.12f * density), upload = !gridCacheHit)
-            flushEnvLines(vboGroundLineId, groundLineArray, groundLineVerts - cachedGridVerts, max(1f, 1.12f * density), sourceOffset = cachedGridVerts)
+            flushEnvLines(-1, 128, vboStaticGridId, groundLineArray, cachedGridVerts, max(1f, 1.12f * density), upload = !gridCacheHit)
+            flushEnvLines(SLOT_GROUND_LINE, MAX_ENV_LINE_VERTS, vboGroundLineId, groundLineArray, groundLineVerts - cachedGridVerts, max(1f, 1.12f * density), sourceOffset = cachedGridVerts)
 
             // Pass 2: 100% 纯不透明实体膨胀体素与 4x4 Bayer 消隐点云 (关闭实体三角形混合，彻底杜绝地面网格穿透实体障碍)
             GLES20.glDepthMask(true)
             GLES20.glDisable(GLES20.GL_BLEND)
-            flushEnvTriangles(vboSolidTriId, solidObsTriArray, solidObsTriVerts, upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
+            flushEnvTriangles(SLOT_SOLID_TRI, MAX_ENV_TRI_VERTS, vboSolidTriId, solidObsTriArray, solidObsTriVerts, upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
 
             GLES20.glEnable(GLES20.GL_BLEND)
-            flushEnvLines(vboSolidEdgeId, solidObsEdgeArray, solidObsEdgeVerts, max(1f, 1.0f * density), upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
+            flushEnvLines(SLOT_SOLID_EDGE, MAX_ENV_LINE_VERTS, vboSolidEdgeId, solidObsEdgeArray, solidObsEdgeVerts, max(1f, 1.0f * density), upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
 
-            val cloudVerts = voxelMap.syncToGpuVbo(vboCloudId)
+            val cloudVerts = if (!cloudVboAllocated && voxelMap.pointCount <= 0) {
+                0
+            } else {
+                ensureCloudVboAllocated()
+                voxelMap.syncToGpuVbo(vboCloudId)
+            }
             val pMode = hub.perfMode
             val drawCloudCnt = if (pMode == 2) min(cloudVerts, 90_000) else cloudVerts
             if (hub.showFastLioMap && drawCloudCnt > 0) {
@@ -1652,7 +1779,7 @@ class GlPointCloudMapView(
                 if (glassObsEdgeVerts > 0) {
                     GLES20.glDepthFunc(GLES20.GL_LEQUAL)
                     GLES20.glDepthMask(false)
-                    flushEnvLines(vboGlassEdgeId, glassObsEdgeArray, glassObsEdgeVerts, max(1.0f, 1.15f * density), upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
+                    flushEnvLines(SLOT_GLASS_EDGE, MAX_GLASS_LINE_VERTS, vboGlassEdgeId, glassObsEdgeArray, glassObsEdgeVerts, max(1.0f, 1.15f * density), upload = !voxelCacheHit || snap.obsPrimitiveCount > 0)
                 }
             }
 
@@ -1668,7 +1795,7 @@ class GlPointCloudMapView(
             // Pass 6: 半透明高程垂幕、接地阴影与触控波纹
             GLES20.glDepthFunc(GLES20.GL_LEQUAL)
             GLES20.glDepthMask(false)
-            flushEnvTriangles(vboFxTriId, fxAlphaTriArray, fxAlphaTriVerts)
+            flushEnvTriangles(SLOT_FX_TRI, MAX_FX_TRI_VERTS, vboFxTriId, fxAlphaTriArray, fxAlphaTriVerts)
 
             GLES20.glDepthMask(true)
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
@@ -1676,14 +1803,19 @@ class GlPointCloudMapView(
             val workNs = System.nanoTime() - frameStartNs
             val workMs = workNs * 1e-6f
             hub.frameRenderMs += (workMs - hub.frameRenderMs) * 0.16f
+            thermalGovernor.recordFrameWork(workNs)
             renderMetrics.record(workNs, voxelMap.uploadedPointsLastFrame, voxelCacheHit)
         } finally {
             renderPending.complete()
+            if (firstGlFrameNotified.compareAndSet(false, true)) {
+                onFirstGlFrameRendered?.let { cb -> post(cb) }
+            }
         }
     }
 
     private fun drawCutawaySingleSkinVolume() {
-        if (!voxelCacheHit || glSnapshot.obsPrimitiveCount > 0) {
+        val uploadGlass = !voxelCacheHit || glSnapshot.obsPrimitiveCount > 0
+        if (uploadGlass) {
             envTriBuf.clear()
             envTriBuf.put(glassObsTriArray, 0, glassObsTriVerts * FLOATS_PER_VERT)
             envTriBuf.position(0)
@@ -1702,9 +1834,16 @@ class GlPointCloudMapView(
         GLES20.glUniform1f(uCutOuterR, curCutOuterR)
         GLES20.glUniform3f(uCutFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
 
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboGlassTriId)
-        if (!voxelCacheHit || glSnapshot.obsPrimitiveCount > 0) {
-            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, glassObsTriVerts * STRIDE_VERT, envTriBuf)
+        if (uploadGlass) {
+            uploadStreamVbo(
+                SLOT_GLASS_TRI,
+                vboGlassTriId,
+                glassObsTriVerts * STRIDE_VERT,
+                MAX_GLASS_TRI_VERTS * STRIDE_VERT,
+                envTriBuf
+            )
+        } else {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboGlassTriId)
         }
 
         GLES20.glEnableVertexAttribArray(aCutPos)
@@ -3445,7 +3584,16 @@ class GlPointCloudMapView(
         GLES20.glUniform3f(uPrimFogColor, curFogRgb[0], curFogRgb[1], curFogRgb[2])
     }
 
-    private fun flushEnvLines(vboId: Int, src: FloatArray, vertCount: Int, lineWidthPx: Float, upload: Boolean = true, sourceOffset: Int = 0) {
+    private fun flushEnvLines(
+        slot: Int,
+        maxVertCap: Int,
+        vboId: Int,
+        src: FloatArray,
+        vertCount: Int,
+        lineWidthPx: Float,
+        upload: Boolean = true,
+        sourceOffset: Int = 0
+    ) {
         if (vertCount <= 0) return
         if (upload) {
             envLineBuf.clear()
@@ -3456,8 +3604,16 @@ class GlPointCloudMapView(
         bindPrimUniforms()
         GLES20.glLineWidth(lineWidthPx)
 
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
-        if (upload) GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envLineBuf)
+        if (upload) {
+            if (slot >= 0) {
+                uploadStreamVbo(slot, vboId, vertCount * STRIDE_VERT, maxVertCap * STRIDE_VERT, envLineBuf)
+            } else {
+                GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+                GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envLineBuf)
+            }
+        } else {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+        }
 
         GLES20.glEnableVertexAttribArray(aPrimPos)
         GLES20.glVertexAttribPointer(aPrimPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
@@ -3475,7 +3631,14 @@ class GlPointCloudMapView(
         if (aPrimArc >= 0) GLES20.glDisableVertexAttribArray(aPrimArc)
     }
 
-    private fun flushEnvTriangles(vboId: Int, src: FloatArray, vertCount: Int, upload: Boolean = true) {
+    private fun flushEnvTriangles(
+        slot: Int,
+        maxVertCap: Int,
+        vboId: Int,
+        src: FloatArray,
+        vertCount: Int,
+        upload: Boolean = true
+    ) {
         if (vertCount <= 0) return
         if (upload) {
             envTriBuf.clear()
@@ -3485,8 +3648,11 @@ class GlPointCloudMapView(
 
         bindPrimUniforms()
 
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
-        if (upload) GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, vertCount * STRIDE_VERT, envTriBuf)
+        if (upload) {
+            uploadStreamVbo(slot, vboId, vertCount * STRIDE_VERT, maxVertCap * STRIDE_VERT, envTriBuf)
+        } else {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+        }
 
         GLES20.glEnableVertexAttribArray(aPrimPos)
         GLES20.glVertexAttribPointer(aPrimPos, 3, GLES20.GL_FLOAT, false, STRIDE_VERT, 0)
@@ -3509,15 +3675,25 @@ class GlPointCloudMapView(
             actorLineBuf.clear()
             actorLineBuf.put(actorLineArray, 0, actorLineVerts * FLOATS_PER_VERT)
             actorLineBuf.position(0)
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboActorLineId)
-            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, actorLineVerts * STRIDE_VERT, actorLineBuf)
+            uploadStreamVbo(
+                SLOT_ACTOR_LINE,
+                vboActorLineId,
+                actorLineVerts * STRIDE_VERT,
+                MAX_ACTOR_LINE_VERTS * STRIDE_VERT,
+                actorLineBuf
+            )
         }
         if (actorTriVerts > 0) {
             actorTriBuf.clear()
             actorTriBuf.put(actorTriArray, 0, actorTriVerts * FLOATS_PER_VERT)
             actorTriBuf.position(0)
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboActorTriId)
-            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, actorTriVerts * STRIDE_VERT, actorTriBuf)
+            uploadStreamVbo(
+                SLOT_ACTOR_TRI,
+                vboActorTriId,
+                actorTriVerts * STRIDE_VERT,
+                MAX_ACTOR_TRI_VERTS * STRIDE_VERT,
+                actorTriBuf
+            )
         }
     }
 
@@ -3721,15 +3897,25 @@ class GlPointCloudMapView(
             trailTriBuf.clear()
             trailTriBuf.put(trailTriArray, 0, trailTriVerts * FLOATS_PER_VERT)
             trailTriBuf.position(0)
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailTriId)
-            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, trailTriVerts * STRIDE_VERT, trailTriBuf)
+            uploadStreamVbo(
+                SLOT_TRAIL_TRI,
+                vboTrailTriId,
+                trailTriVerts * STRIDE_VERT,
+                MAX_TRAIL_TRI_VERTS * STRIDE_VERT,
+                trailTriBuf
+            )
         }
         if (trailLineVerts > 0) {
             trailLineBuf.clear()
             trailLineBuf.put(trailLineArray, 0, trailLineVerts * FLOATS_PER_VERT)
             trailLineBuf.position(0)
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboTrailLineId)
-            GLES20.glBufferSubData(GLES20.GL_ARRAY_BUFFER, 0, trailLineVerts * STRIDE_VERT, trailLineBuf)
+            uploadStreamVbo(
+                SLOT_TRAIL_LINE,
+                vboTrailLineId,
+                trailLineVerts * STRIDE_VERT,
+                MAX_TRAIL_LINE_VERTS * STRIDE_VERT,
+                trailLineBuf
+            )
         }
     }
 

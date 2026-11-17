@@ -575,7 +575,7 @@ internal class VectorHudTextureView(
                             updateModelReadyFlag(false, this)
                             continue
                         }
-                        renderer.create()
+                        renderer.create(preferTiltRig = synchronized(glLock) { cachedTiltRig })
                         if (!renderer.ready) {
                             Log.e("VectorHudTextureView", "The HUD 3D UAV model did not load")
                             destroyContextAndSurface()

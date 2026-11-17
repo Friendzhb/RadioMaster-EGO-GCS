@@ -522,6 +522,54 @@ class GcsSharedHub {
     // 硬件渲染性能模式: 0=均衡高帧(60FPS推荐), 1=极致画质(全量体素), 2=户外长续航省电(30FPS温控节流)
     @Volatile var perfMode: Int = 0
 
+    // AX12 CPU 温控动态帧率节流状态 (60 -> 45 -> 30 -> 20 -> 15 FPS 自适应闭环)
+    @Volatile var thermalAutoThrottleEnabled: Boolean = true
+
+    @Volatile var cpuTempCelsius: Float = Float.NaN
+
+    @Volatile var txChassisTempCelsius: Float = Float.NaN
+
+    @Volatile var osThermalStatus: Int = 0
+
+    @Volatile var thermalHeadroom: Float = Float.NaN
+
+    @Volatile var cpuFreqCapRatio: Float = 1.0f
+
+    @Volatile var thermalSourceTag: String = "IDLE"
+
+    // 0=NOMINAL(60fps), 1=WARM(45fps), 2=MODERATE(30fps), 3=SEVERE(20fps), 4=CRITICAL(15fps)
+    @Volatile var thermalThrottleLevel: Int = 0
+
+    @Volatile var targetRenderFps: Int = 60
+
+    fun effectiveHudTargetFps(): Int {
+        val ceiling = if (perfMode == 2) 30 else 60
+        val dynamicTarget = if (thermalAutoThrottleEnabled || thermalThrottleLevel >= 4) {
+            targetRenderFps.coerceIn(15, 60)
+        } else {
+            ceiling
+        }
+        return minOf(ceiling, dynamicTarget)
+    }
+
+    fun formatThermalStatusSummary(): String {
+        val tempPart = when {
+            cpuTempCelsius.isFinite() -> String.format(java.util.Locale.US, "CPU %.1f°C", cpuTempCelsius)
+            txChassisTempCelsius.isFinite() -> String.format(java.util.Locale.US, "本机 %.1f°C", txChassisTempCelsius)
+            osThermalStatus > 0 -> "OS热级#$osThermalStatus"
+            else -> "温感待命"
+        }
+        val levelLabel = when (thermalThrottleLevel) {
+            1 -> "轻度节流"
+            2 -> "中度降频"
+            3 -> "高温限帧"
+            4 -> "过热保护"
+            else -> if (perfMode == 2) "省电限帧" else "满帧运行"
+        }
+        val effTarget = effectiveHudTargetFps()
+        return "$tempPart · $levelLabel (${effTarget}fps)"
+    }
+
     @Volatile var themeId: Int = 0
 
     @Volatile var animStyle: Int = 0
@@ -732,6 +780,27 @@ class GcsSharedHub {
 
     @Volatile var udpLastCloudMs: Long = 0L
     fun hasFreshUdpOdometry(nowMs: Long): Boolean = udpLastOdomMs > 0L && nowMs - udpLastOdomMs in 0L until 500L
+
+    // 本地 SQLite 任务黑匣子与战后 3D 轨迹回放共享状态
+    @Volatile var autoLogMissionsToDb: Boolean = true
+
+    @Volatile var savedMissionCount: Int = 0
+
+    @Volatile var isReplayMode: Boolean = false
+
+    @Volatile var replayPlaying: Boolean = false
+
+    @Volatile var replaySpeed: Float = 1.0f
+
+    @Volatile var replayElapsedMs: Long = 0L
+
+    @Volatile var replayTotalMs: Long = 0L
+
+    @Volatile var replayWallTimestampMs: Long = 0L
+
+    @Volatile var replayMissionId: Long = 0L
+
+    @Volatile var replayMissionTitle: String = ""
 
     val snapshots = SnapshotExchange()
 }

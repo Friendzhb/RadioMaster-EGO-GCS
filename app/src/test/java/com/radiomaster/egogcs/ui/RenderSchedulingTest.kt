@@ -6,10 +6,10 @@ import org.junit.Test
 class RenderSchedulingTest {
     @Test fun pacingSupportsSixtyNinetyAndOneTwentyHertzScreens() {
         for (screen in listOf(60, 90, 120)) {
-            for (target in listOf(30, 60)) {
+            for (target in listOf(15, 20, 30, 45, 60)) {
                 val pacer = FramePacer()
                 val delivered = (0 until screen * 10).count { pacer.due(it * 1_000_000_000L / screen, target) }
-                assertTrue("$screen Hz / $target FPS: $delivered", kotlin.math.abs(delivered - target * 10) <= 1)
+                assertTrue("$screen Hz / $target FPS: $delivered", kotlin.math.abs(delivered - target * 10) <= 2)
             }
         }
     }

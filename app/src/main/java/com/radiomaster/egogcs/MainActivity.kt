@@ -32,6 +32,9 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.radiomaster.egogcs.db.FlightMissionDatabase
+import com.radiomaster.egogcs.db.FlightMissionEntity
+import com.radiomaster.egogcs.db.FlightMissionRepository
 import com.radiomaster.egogcs.engine.EgoSimEngine
 import com.radiomaster.egogcs.hw.Ax12HardwareBridge
 import com.radiomaster.egogcs.model.GcsSharedHub
@@ -41,6 +44,8 @@ import com.radiomaster.egogcs.model.TiltConfigSpec
 import com.radiomaster.egogcs.model.TopicConfig
 import com.radiomaster.egogcs.ota.OtaUpdateManager
 import com.radiomaster.egogcs.ros.DiscoveredDrone
+import com.radiomaster.egogcs.ros.DiscoveryRecoveryReason
+import com.radiomaster.egogcs.ros.ExponentialBackoffPolicy
 import com.radiomaster.egogcs.ros.LanDroneScanner
 import com.radiomaster.egogcs.ros.LanNetworkBinder
 import com.radiomaster.egogcs.ros.RosBridgeClient
@@ -56,6 +61,7 @@ import com.radiomaster.egogcs.ui.DjiCompassTapeView
 import com.radiomaster.egogcs.ui.DjiHsiRadarView
 import com.radiomaster.egogcs.ui.DroneVectorModel
 import com.radiomaster.egogcs.ui.FastHudFormatter
+import com.radiomaster.egogcs.ui.FlightReplayHudBar
 import com.radiomaster.egogcs.ui.GcsIcons
 import com.radiomaster.egogcs.ui.GcsIcons.Type
 import com.radiomaster.egogcs.ui.GcsMotionSpec
@@ -64,14 +70,21 @@ import com.radiomaster.egogcs.ui.GcsTheme
 import com.radiomaster.egogcs.ui.GcsTheme.Role
 import com.radiomaster.egogcs.ui.GlPointCloudMapView
 import com.radiomaster.egogcs.ui.MissionRouteVisualizer
+import com.radiomaster.egogcs.ui.PostFlightAnalysisSheet
 import com.radiomaster.egogcs.ui.TouchChainGuard
 import com.radiomaster.egogcs.ui.UavAttitudeHudView
+import com.radiomaster.egogcs.ui.VectorGlbRenderer
 import com.radiomaster.egogcs.ui.WaypointCalloutOverlayView
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -97,6 +110,11 @@ class MainActivity : Activity() {
     private lateinit var topicInspector: RosTopicInspector
     private lateinit var otaManager: OtaUpdateManager
     private lateinit var settingsModal: GcsSettingsModal
+    private lateinit var missionRepository: FlightMissionRepository
+    private lateinit var replayHudBar: FlightReplayHudBar
+    private lateinit var analysisSheet: PostFlightAnalysisSheet
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var cachedSavedMissions: List<FlightMissionEntity> = emptyList()
     private val lanScanner = LanDroneScanner()
     private val fileIoExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "PcdExportIO").apply { isDaemon = true }
@@ -135,6 +153,7 @@ class MainActivity : Activity() {
     private var lastOccludedHudState = false
     private var lastBatDangerLevel = -1
     private var lastClearanceWarnLevel = -1
+    private var lastThermalHudTone = -1
 
     // 顶栏精简控件
     private lateinit var tvModeBadge: TextView
@@ -336,6 +355,8 @@ class MainActivity : Activity() {
     private lateinit var tvMapBoundsCard: TextView
     private lateinit var tvRecorderStatusCard: TextView
     private lateinit var btnToggleFlightRec: TextView
+    private lateinit var btnToggleAutoDbLog: TextView
+    private lateinit var missionHistoryContainer: LinearLayout
     private lateinit var tvPosX: TextView
     private lateinit var tvPosY: TextView
     private lateinit var tvPosZ: TextView
@@ -357,6 +378,10 @@ class MainActivity : Activity() {
     private var d = 1f
     private var screenWidthDp = 640f
     private var screenHeightDp = 360f
+    private var initialMapGlFrameReady = false
+    private var backgroundRuntimeStarted = false
+    private var userPausedAutoDiscovery = false
+    private val initialGlFallbackRunnable = Runnable { onInitialMapFrameReady() }
 
     companion object {
         private const val TAB_CONN = 0
@@ -378,6 +403,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        VectorGlbRenderer.prewarmCpuCachesAsync(applicationContext, preferTiltFirst = true)
         val dm = resources.displayMetrics
         d = dm.density
         screenWidthDp = dm.widthPixels / d
@@ -395,7 +421,13 @@ class MainActivity : Activity() {
         accentAmber = roundedColor(Color.parseColor("#FFAB00"), dp(2f))
         accentRed = roundedColor(Color.parseColor("#FF3B30"), dp(2f))
 
+        missionRepository = FlightMissionRepository(
+            FlightMissionDatabase.getInstance(applicationContext).flightMissionDao()
+        )
         simEngine = EgoSimEngine(hub).apply {
+            telemetryRecorder.sqliteSampleSink = { wallTs, elapsedMs, snap ->
+                missionRepository.enqueueTelemetrySample(wallTs, elapsedMs, snap)
+            }
             onRosWaypointAdvanced = { gx, gy, gz, curX, curY ->
                 rosManager.publishGoal(gx, gy, gz, curX, curY)
                 runOnUiThread {
@@ -419,7 +451,24 @@ class MainActivity : Activity() {
         val tcpClient = TcpRosNativeClient(hub, simEngine) { msg ->
             runOnUiThread { AnimHelper.showDjiToast(toastBanner, msg, d) }
         }
-        rosManager = RosConnectionManager(hub, tcpClient, wsClient, RosUdpTelemetryClient(hub, simEngine))
+        rosManager = RosConnectionManager(hub, tcpClient, wsClient, RosUdpTelemetryClient(hub, simEngine)).apply {
+            onLinkConnected = { remoteHost ->
+                lanScanner.rememberCandidateHost(remoteHost)
+                lanScanner.resetBackoff()
+            }
+            onRequestDiscoveryRecovery = { _ ->
+                runOnUiThread {
+                    if (shouldMaintainBackgroundDiscovery() && !lanScanner.isScanning && !lanScanner.isBackoffScheduled) {
+                        startDiscoveryPass(
+                            silentIfEmpty = true,
+                            autoOpenConnTabOnEmpty = false,
+                            backgroundRecoveryPass = true,
+                            forceAutoConnectOnHit = true
+                        )
+                    }
+                }
+            }
+        }
         topicInspector = RosTopicInspector(hub, rosManager, tcpClient, wsClient)
 
         GcsSettingsModal.loadPersistedSettings(this, hub)
@@ -516,6 +565,21 @@ class MainActivity : Activity() {
                     AnimHelper.animateGearRotation(btnSettingsToggle, open)
                 }
                 syncOpenGlSurfaceLifecycle()
+            },
+            onAutoConnectChanged = { enabled ->
+                if (enabled) {
+                    userPausedAutoDiscovery = false
+                    if (!hub.rosConnected && !lanScanner.isScanning) {
+                        startDiscoveryPass(
+                            silentIfEmpty = true,
+                            autoOpenConnTabOnEmpty = false,
+                            backgroundRecoveryPass = false,
+                            forceAutoConnectOnHit = true
+                        )
+                    }
+                } else if (!hub.isRosMode) {
+                    lanScanner.cancelScheduledBackoff()
+                }
             }
         )
 
@@ -530,19 +594,79 @@ class MainActivity : Activity() {
         syncConnModeSectionsUi(showRosEditor = hub.isRosMode)
         syncModeSpecificControls(force = true)
         syncBottomHudAvoidance()
-        simEngine.start()
-        hwBridge.start()
+        observeSavedMissionsReactive()
 
-        if (hub.autoConnectDiscovered) {
-            triggerLanScan(silentIfEmpty = true, autoOpenConnTabOnEmpty = false)
-        }
         if (hub.otaAutoCheckOnStart) {
             uiHandler.postDelayed({
                 if (!isFinishing && ::otaManager.isInitialized) {
                     otaManager.checkForUpdate(silentOnUpToDate = true)
                 }
-            }, 2600L)
+            }, 3200L)
         }
+    }
+
+    private fun onInitialMapFrameReady() {
+        if (isFinishing || isDestroyed) return
+        uiHandler.removeCallbacks(initialGlFallbackRunnable)
+        val becameReady = !initialMapGlFrameReady
+        initialMapGlFrameReady = true
+        if (!backgroundRuntimeStarted) {
+            backgroundRuntimeStarted = true
+            if (::simEngine.isInitialized) {
+                simEngine.start()
+            }
+            if (::hwBridge.isInitialized) {
+                hwBridge.start()
+            }
+            LanNetworkBinder.registerLanLinkObserver { _ ->
+                runOnUiThread {
+                    if (isFinishing || isDestroyed || !activityResumed) return@runOnUiThread
+                    if (hub.isRosMode && !hub.rosConnected && !userPausedAutoDiscovery) {
+                        rosManager.onPhysicalLanRestored()
+                        lanScanner.resetBackoff()
+                        if (!lanScanner.isScanning) {
+                            startDiscoveryPass(
+                                silentIfEmpty = true,
+                                autoOpenConnTabOnEmpty = false,
+                                backgroundRecoveryPass = true,
+                                forceAutoConnectOnHit = true
+                            )
+                        }
+                    } else if (!hub.rosConnected && hub.autoConnectDiscovered && !userPausedAutoDiscovery) {
+                        lanScanner.resetBackoff()
+                        if (!lanScanner.isScanning) {
+                            startDiscoveryPass(
+                                silentIfEmpty = true,
+                                autoOpenConnTabOnEmpty = false,
+                                backgroundRecoveryPass = true,
+                                forceAutoConnectOnHit = false
+                            )
+                        }
+                    }
+                }
+            }
+            if (hub.autoConnectDiscovered) {
+                uiHandler.postDelayed({
+                    if (!isFinishing && !isDestroyed && hub.autoConnectDiscovered && !userPausedAutoDiscovery) {
+                        startDiscoveryPass(
+                            silentIfEmpty = true,
+                            autoOpenConnTabOnEmpty = false,
+                            backgroundRecoveryPass = false,
+                            forceAutoConnectOnHit = false
+                        )
+                    }
+                }, 650L)
+            }
+        }
+        if (becameReady) {
+            syncOpenGlSurfaceLifecycle()
+        }
+    }
+
+    private fun shouldMaintainBackgroundDiscovery(): Boolean {
+        if (isFinishing || isDestroyed || !activityResumed) return false
+        if (hub.rosConnected || userPausedAutoDiscovery) return false
+        return hub.isRosMode || hub.autoConnectDiscovered
     }
 
     override fun onResume() {
@@ -555,6 +679,21 @@ class MainActivity : Activity() {
             attitudeHudView.preserveEGLContextOnPause = true
         }
         syncOpenGlSurfaceLifecycle()
+        if (!initialMapGlFrameReady) {
+            uiHandler.removeCallbacks(initialGlFallbackRunnable)
+            uiHandler.postDelayed(initialGlFallbackRunnable, 280L)
+        } else if (shouldMaintainBackgroundDiscovery() && !lanScanner.isScanning && !lanScanner.isBackoffScheduled) {
+            uiHandler.postDelayed({
+                if (shouldMaintainBackgroundDiscovery() && !lanScanner.isScanning && !lanScanner.isBackoffScheduled) {
+                    startDiscoveryPass(
+                        silentIfEmpty = true,
+                        autoOpenConnTabOnEmpty = false,
+                        backgroundRecoveryPass = true,
+                        forceAutoConnectOnHit = hub.isRosMode
+                    )
+                }
+            }, 500L)
+        }
         if (::otaManager.isInitialized) {
             otaManager.onHostResume()
         }
@@ -562,6 +701,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         activityResumed = false
+        lanScanner.cancelScheduledBackoff()
         topicInspector.stopActiveSession()
         isDetailCurrentlyStreaming = false
         syncDetailStreamButtonUi()
@@ -575,18 +715,24 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         activityResumed = false
         uiHandler.removeCallbacksAndMessages(null)
+        LanNetworkBinder.unregisterLanLinkObserver()
         if (::otaManager.isInitialized) {
             otaManager.shutdown()
         }
         topicInspector.shutdown()
-        lanScanner.cancelScan()
+        lanScanner.shutdown()
         hwBridge.stop()
         if (::attitudeHudView.isInitialized) {
             attitudeHudView.releaseGlResources()
         }
         mapView.stopLoop()
         rosManager.shutdown()
+        if (simEngine.telemetryRecorder.isRecording) {
+            simEngine.telemetryRecorder.stopRecording()
+            missionRepository.stopActiveMissionSession(simEngine.serializeStagedWaypointsCsv())
+        }
         simEngine.stop()
+        uiScope.cancel()
         fileIoExecutor.shutdownNow()
         super.onDestroy()
     }
@@ -598,7 +744,8 @@ class MainActivity : Activity() {
 
     @Suppress("DEPRECATION")
     private fun applyImmersiveFullscreen() {
-        window.decorView.systemUiVisibility = (
+        val decor = window.decorView
+        val flags = (
             View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
@@ -606,6 +753,9 @@ class MainActivity : Activity() {
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_FULLSCREEN
             )
+        if ((decor.systemUiVisibility and flags) != flags) {
+            decor.systemUiVisibility = flags
+        }
     }
 
     private fun hideSoftKeyboard() {
@@ -657,6 +807,10 @@ class MainActivity : Activity() {
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
+        if (::analysisSheet.isInitialized && analysisSheet.isOpen) {
+            analysisSheet.setVisible(false)
+            return
+        }
         if (::settingsModal.isInitialized && settingsModal.isOpen) {
             setSettingsModalOpen(false)
             return
@@ -671,6 +825,10 @@ class MainActivity : Activity() {
                 return
             }
             setDrawerOpenState(false)
+            return
+        }
+        if (hub.isReplayMode) {
+            exitMissionReplay()
             return
         }
         if (simEngine.hasActivePreviewPin()) {
@@ -748,6 +906,7 @@ class MainActivity : Activity() {
         syncTelemetryFullscreenToggleVisual()
         setWideTerminalMode(drawerWideMode, applyImmediately = false)
         syncFlightRecorderUi()
+        renderSavedMissionHistoryCards()
         refreshWaypointOrchestratorList()
         if (cachedTopicEntries.isNotEmpty()) renderFilteredTopicRows()
 
@@ -828,7 +987,8 @@ class MainActivity : Activity() {
         mapView.preserveEGLContextOnPause = true
         attitudeHudView.preserveEGLContextOnPause = true
 
-        val modalOpen = ::settingsModal.isInitialized && settingsModal.isOpen
+        val modalOpen = (::settingsModal.isInitialized && settingsModal.isOpen) ||
+            (::analysisSheet.isInitialized && analysisSheet.isOpen)
         val fullScreenTelemetryActive = drawerOpen && activeTabIndex == TAB_STATUS && telemetryFullscreenMode
         val mapObscured = fullScreenTelemetryActive || modalOpen
         mapView.setGlSurfacePaused(mapObscured)
@@ -836,9 +996,8 @@ class MainActivity : Activity() {
             waypointCalloutOverlay.visibility = if (mapObscured) View.GONE else View.VISIBLE
         }
 
-        if (!activityResumed) return
         val hideAttitudeForPopover = layerPopoverOpen && screenHeightDp < 395f
-        val hudObscured = drawerOpen || modalOpen || hideAttitudeForPopover
+        val hudObscured = !activityResumed || !initialMapGlFrameReady || drawerOpen || modalOpen || hideAttitudeForPopover
         if (hudObscured) {
             attitudeHudView.onPause()
         } else {
@@ -917,7 +1076,11 @@ class MainActivity : Activity() {
         val drawerLeftEdge = totalW - safeCutoutRightPx - currentDrawerWidthPx() - dp(12f)
         val bottomClusterRightApprox = safeCutoutLeftPx + dp(278f)
 
-        val hideTelemetryForDock = (!drawerOpen && dockLogicalActive && screenWidthDp < 795f)
+        val replayBarVisible = ::replayHudBar.isInitialized && hub.isReplayMode && !drawerOpen
+        if (::replayHudBar.isInitialized) {
+            replayHudBar.rootView.visibility = if (replayBarVisible) View.VISIBLE else View.GONE
+        }
+        val hideTelemetryForDock = (!drawerOpen && (dockLogicalActive || replayBarVisible) && screenWidthDp < 795f)
         val hideTelemetryForDrawer = (drawerOpen && drawerLeftEdge < bottomClusterRightApprox + dp(10f))
         val shouldHideTelemetry = hideTelemetryForDock || hideTelemetryForDrawer
 
@@ -1458,8 +1621,8 @@ class MainActivity : Activity() {
         val hasPin = latestPin != null || simEngine.hasActivePreviewPin()
         val (routeCnt, isStaged, arcLen) = simEngine.routeStatusSummary()
 
-        // 侧边抽屉展开期间不在地图底部重复叠加悬浮指令坞，避免与抽屉或左仪表发生挤压
-        if (drawerOpen) {
+        // 侧边抽屉展开或处于 3D 轨迹回放期间不在地图底部叠加选点指令坞，避免与抽屉或回放控制条重叠
+        if (drawerOpen || hub.isReplayMode) {
             dockLogicalActive = false
             AnimHelper.animateCommandDock(commandDock, show = false, density = d)
             syncBottomHudAvoidance()
@@ -1746,6 +1909,10 @@ class MainActivity : Activity() {
             onHudTick = { snap -> updateHudReadouts(snap) },
             onInterceptDrawerClose = {
                 when {
+                    ::analysisSheet.isInitialized && analysisSheet.isOpen -> {
+                        analysisSheet.setVisible(false)
+                        true
+                    }
                     ::settingsModal.isInitialized && settingsModal.isOpen -> {
                         setSettingsModalOpen(false)
                         true
@@ -1762,7 +1929,9 @@ class MainActivity : Activity() {
                 }
             },
             onSingleTapPreviewPin = { wx, wy ->
-                if (hub.hudTouchLocked) {
+                if (hub.isReplayMode) {
+                    AnimHelper.showDjiToast(toastBanner, "当前处于 3D 轨迹回放模式 · 点击底部「退出」可恢复实时指点", d)
+                } else if (hub.hudTouchLocked) {
                     AnimHelper.animateRejectShake(btnLayerPopupToggle, d)
                     AnimHelper.showDjiToast(toastBanner, "地图防误触已锁定 · 可在右侧「图层」浮窗解锁", d)
                 } else {
@@ -1793,7 +1962,9 @@ class MainActivity : Activity() {
                 }
             },
             onLongPressQuickFly = { wx, wy ->
-                if (hub.hudTouchLocked) {
+                if (hub.isReplayMode) {
+                    AnimHelper.showDjiToast(toastBanner, "当前处于 3D 轨迹回放模式 · 长按直飞已暂停", d)
+                } else if (hub.hudTouchLocked) {
                     AnimHelper.animateRejectShake(btnLayerPopupToggle, d)
                     AnimHelper.showDjiToast(toastBanner, "地图防误触已锁定 · 长按直飞已安全拦截", d)
                 } else {
@@ -1875,7 +2046,9 @@ class MainActivity : Activity() {
                     waypointCalloutOverlay.onMapFrame()
                 }
             }
-        )
+        ).apply {
+            onFirstGlFrameRendered = { onInitialMapFrameReady() }
+        }
         TouchChainGuard.markPassThroughSurface(mapView)
         cockpitRoot.addView(mapView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 
@@ -2386,11 +2559,43 @@ class MainActivity : Activity() {
             }
         )
 
-        // 5. 底部中央上下文选点/航线指令坞
+        // 5. 底部中央上下文选点/航线指令坞与 3D 战后轨迹回放控制条
         commandDock = buildContextualCommandDock()
         commandDock.visibility = View.GONE
         cockpitRoot.addView(
             commandDock,
+            FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                bottomMargin = dp(8f)
+            }
+        )
+
+        replayHudBar = FlightReplayHudBar(
+            context = this,
+            hub = hub,
+            onTogglePlayPause = {
+                simEngine.playbackController.togglePlayPause(hub)
+                replayHudBar.syncOnHudTick()
+            },
+            onSeekProgress = { prog ->
+                simEngine.playbackController.seekToProgress(prog, hub)
+                mapView.clearFlightTrails()
+                replayHudBar.syncOnHudTick()
+            },
+            onCycleSpeed = {
+                val spd = simEngine.playbackController.cycleSpeed(hub)
+                replayHudBar.syncOnHudTick()
+                AnimHelper.showDjiToast(toastBanner, String.format(Locale.US, "回放倍速已切换为 %.1fx", spd), d)
+            },
+            onOpenCurrentAnalysis = {
+                val mid = hub.replayMissionId
+                if (mid > 0L) openMissionAnalysisModal(mid)
+            },
+            onExitReplay = {
+                exitMissionReplay()
+            }
+        )
+        cockpitRoot.addView(
+            replayHudBar.buildView(),
             FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
                 bottomMargin = dp(8f)
             }
@@ -2525,9 +2730,18 @@ class MainActivity : Activity() {
             }
         )
 
-        // 10. 居中模态设置中心 (置于最顶层，遮罩覆盖全屏)
+        // 10. 居中模态设置中心与战后遥测分析报告面板 (置于最顶层，遮罩覆盖全屏)
         val modalRoot = settingsModal.buildModalView()
         cockpitRoot.addView(modalRoot, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+
+        analysisSheet = PostFlightAnalysisSheet(
+            context = this,
+            hub = hub,
+            onStartReplay = { missionId -> startMissionReplay(missionId) },
+            onExportCsv = { missionId -> exportMissionFromSqliteCsv(missionId) },
+            onVisibilityChanged = { _ -> syncOpenGlSurfaceLifecycle() }
+        )
+        cockpitRoot.addView(analysisSheet.buildView(), FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         TouchChainGuard.disableMotionSplittingHierarchy(cockpitRoot)
 
         // 11. 异形屏/挖孔屏安全区自适应（RadioMaster AX12 无挖孔屏保持紧凑 8~10dp 边距零浪费）
@@ -3015,9 +3229,20 @@ class MainActivity : Activity() {
     }
 
     private fun startCommittedRouteExecution(sourceView: View) {
+        if (hub.isReplayMode) {
+            exitMissionReplay(silent = true)
+        }
+        val routeCsvSnapshot = simEngine.serializeStagedWaypointsCsv()
         val committed = simEngine.commitStagedRoute()
         if (committed != null) {
             val (firstGoal, totalPts) = committed
+            if (hub.autoLogMissionsToDb && !simEngine.telemetryRecorder.isRecording) {
+                startFlightRecordingWithSqlite(
+                    customTag = if (hub.isRosMode) "ROS1航线(${totalPts}站)" else "编排航线(${totalPts}站)",
+                    waypointsOverrideCsv = routeCsvSnapshot,
+                    showToast = false
+                )
+            }
             AnimHelper.triggerHaptic(sourceView, HapticFeedbackConstants.LONG_PRESS)
             mapView.recenterLockDrone()
             syncCameraControlLabels()
@@ -3032,7 +3257,8 @@ class MainActivity : Activity() {
                 2 -> "往返巡航"
                 else -> "单次推进"
             }
-            AnimHelper.showDjiToast(toastBanner, "航线已启动：共 $totalPts 站 ($modeLabel)", d)
+            val dbSuffix = if (simEngine.telemetryRecorder.isRecording) " · SQLite落库中" else ""
+            AnimHelper.showDjiToast(toastBanner, "航线已启动：共 $totalPts 站 ($modeLabel$dbSuffix)", d)
         }
     }
 
@@ -3158,6 +3384,8 @@ class MainActivity : Activity() {
             setOnClickListener {
                 AnimHelper.triggerHaptic(it)
                 if (hub.isRosMode) {
+                    userPausedAutoDiscovery = true
+                    lanScanner.cancelScan(cancelAutoRetry = true)
                     topicInspector.stopActiveSession()
                     rosManager.switchToDemoMode()
                     simEngine.clearVoxelMap()
@@ -3422,8 +3650,11 @@ class MainActivity : Activity() {
         }
         AnimHelper.attachSpringTouch(btnConn)
         val btnDisc = createSmallIconBtn(null, "断开") {
+            userPausedAutoDiscovery = true
+            lanScanner.cancelScan(cancelAutoRetry = true)
             topicInspector.stopActiveSession()
             rosManager.disconnectAll(silent = false)
+            GcsIcons.bind(btnDrawerScan, Type.SEARCH, "扫描局域网飞机", d, iconDp = 12f)
             AnimHelper.showDjiToast(toastBanner, "已断开机载 ROS1 连接", d)
         }
         actRow.addView(btnConn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -4720,28 +4951,63 @@ class MainActivity : Activity() {
         lioCard.addView(btnExportInDrawer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(5.5f) })
         col.addView(lioCard, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8f) })
 
-        val recCard = sectionCard("科研黑匣子 20Hz 同步遥测记录 (导出论文 CSV)")
-        tvRecorderStatusCard = monoLabel("待机 · 已缓存 0 帧", "#B8C0CC", 10.4f, Role.TEXT_SECONDARY)
-        recCard.addView(fullMetricRow("记录器状态", tvRecorderStatusCard))
+        val recCard = sectionCard(getString(R.string.flight_db_section_title))
+        tvRecorderStatusCard = monoLabel("待机 · 本地库已存 0 架次", "#B8C0CC", 10.2f, Role.TEXT_SECONDARY)
+        recCard.addView(fullMetricRow("SQLite 黑匣子", tvRecorderStatusCard))
+
+        btnToggleAutoDbLog = createSmallIconBtn(Type.CHECK, getString(R.string.flight_db_auto_log_label)) {
+            hub.autoLogMissionsToDb = !hub.autoLogMissionsToDb
+            GcsSettingsModal.persistAllSettings(this, hub)
+            syncFlightRecorderUi()
+            AnimHelper.showDjiToast(
+                toastBanner,
+                if (hub.autoLogMissionsToDb) "已开启「航线启动自动 SQLite 落库」" else "已关闭航线启动自动落库（仍可手动开始记录）",
+                d
+            )
+        }.apply {
+            tag = "flight_db_auto_log_toggle"
+            contentDescription = getString(R.string.flight_db_auto_log_label)
+        }
+        recCard.addView(btnToggleAutoDbLog, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(5f) })
+
         val recBtnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        btnToggleFlightRec = createSmallIconBtn(Type.PLAY, "开始记录") {
-            val rec = simEngine.telemetryRecorder
-            if (rec.isRecording) {
-                rec.stopRecording()
-                syncFlightRecorderUi()
-                AnimHelper.showDjiToast(toastBanner, "已暂停遥测记录 (共 ${rec.sampleCount} 帧 · 可点击右侧导出 CSV)", d)
+        btnToggleFlightRec = createSmallIconBtn(Type.PLAY, getString(R.string.flight_db_btn_start_record)) {
+            if (simEngine.telemetryRecorder.isRecording) {
+                stopFlightRecordingAndFinalizeSqlite(showToast = true)
             } else {
-                rec.startRecording(android.os.SystemClock.elapsedRealtime())
-                syncFlightRecorderUi()
-                AnimHelper.showDjiToast(toastBanner, "已开启 20Hz 科研遥测黑匣子同步记录", d)
+                if (hub.isReplayMode) {
+                    exitMissionReplay(silent = true)
+                }
+                startFlightRecordingWithSqlite(showToast = true)
             }
+        }.apply {
+            tag = "flight_db_toggle_record_btn"
+            contentDescription = getString(R.string.flight_db_btn_start_record)
         }
-        val btnExportCsv = createSmallIconBtn(Type.DOWNLOAD, "导出 CSV") {
+        val btnExportCsv = createSmallIconBtn(Type.DOWNLOAD, getString(R.string.flight_db_btn_export_csv)) {
             exportFlightTelemetryCsv()
+        }.apply {
+            tag = "flight_db_export_latest_csv_btn"
+            contentDescription = getString(R.string.flight_db_btn_export_csv)
         }
-        recBtnRow.addView(btnToggleFlightRec, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        recBtnRow.addView(btnExportCsv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { leftMargin = dp(5f) })
+        recBtnRow.addView(btnToggleFlightRec, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.15f))
+        recBtnRow.addView(btnExportCsv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 0.85f).apply { leftMargin = dp(5f) })
         recCard.addView(recBtnRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(5.5f) })
+
+        val histHeader = TextView(this).apply {
+            text = "已落库任务架次 (点击「3D回放」同步驱动地图与姿态仪表)"
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.4f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(7f), 0, dp(3f))
+            GcsTheme.markRole(this, Role.TEXT_MUTED)
+        }
+        recCard.addView(histHeader)
+
+        missionHistoryContainer = LinearLayout(this).apply {
+            tag = "flight_db_mission_list_container"
+            orientation = LinearLayout.VERTICAL
+        }
+        recCard.addView(missionHistoryContainer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         col.addView(recCard, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8f) })
 
         val otaShortcutCard = sectionCard("软件版本与 GitHub 直链在线更新")
@@ -4758,32 +5024,78 @@ class MainActivity : Activity() {
 
     // ==================== 局域网寻机与连接管理 ====================
 
+    private fun collectLiveDiscoveryHints(): String = buildString {
+        if (::inpMasterUri.isInitialized) append(inpMasterUri.text).append(' ')
+        if (::inpWsUrl.isInitialized) append(inpWsUrl.text).append(' ')
+        if (::inpSwarmPeerIps.isInitialized) append(inpSwarmPeerIps.text)
+    }.trim()
+
     private fun triggerLanScan(silentIfEmpty: Boolean, autoOpenConnTabOnEmpty: Boolean) {
         if (lanScanner.isScanning) {
-            lanScanner.cancelScan()
+            userPausedAutoDiscovery = true
+            lanScanner.cancelScan(cancelAutoRetry = true)
             GcsIcons.bind(btnDrawerScan, Type.SEARCH, "扫描局域网飞机", d, iconDp = 12f)
-            setTextIfChanged(tvScanStatus, "扫描已停止")
+            setTextIfChanged(tvScanStatus, "扫描已停止 (自动重扫已暂停)")
             return
         }
+        userPausedAutoDiscovery = false
+        startDiscoveryPass(
+            silentIfEmpty = silentIfEmpty,
+            autoOpenConnTabOnEmpty = autoOpenConnTabOnEmpty,
+            backgroundRecoveryPass = false,
+            forceAutoConnectOnHit = false
+        )
+    }
 
-        discoveredDrones.clear()
-        discoveredListContainer.removeAllViews()
+    private fun startDiscoveryPass(
+        silentIfEmpty: Boolean,
+        autoOpenConnTabOnEmpty: Boolean,
+        backgroundRecoveryPass: Boolean,
+        forceAutoConnectOnHit: Boolean
+    ) {
+        if (!backgroundRecoveryPass) {
+            discoveredDrones.clear()
+            discoveredListContainer.removeAllViews()
+        }
         GcsIcons.bind(btnDrawerScan, Type.STOP_SQUARE, "扫描中 (点此停止)", d, iconDp = 11f)
-        setTextIfChanged(tvScanStatus, "正在并发探测局域网 ROS1 机载电脑...")
-        if (!silentIfEmpty) {
+        setTextIfChanged(
+            tvScanStatus,
+            if (backgroundRecoveryPass) {
+                "正在后台指数退避重探机载 ROS1 节点..."
+            } else {
+                "正在并发探测局域网 ROS1 机载电脑..."
+            }
+        )
+        if (!silentIfEmpty && !backgroundRecoveryPass) {
             AnimHelper.showDjiToast(toastBanner, "正在搜索局域网 ROS1 无人机...", d)
         }
 
         var autoConnectedThisRun = false
-        val liveInputHints = buildString {
-            if (::inpMasterUri.isInitialized) append(inpMasterUri.text).append(' ')
-            if (::inpWsUrl.isInitialized) append(inpWsUrl.text).append(' ')
-            if (::inpSwarmPeerIps.isInitialized) append(inpSwarmPeerIps.text)
-        }.trim()
+        val allowAutoConnect = forceAutoConnectOnHit || hub.autoConnectDiscovered || hub.isRosMode
 
         lanScanner.startScan(
             baseConfig = rosManager.topics.copy(),
-            manualHintRaw = liveInputHints,
+            manualHintRaw = collectLiveDiscoveryHints(),
+            backgroundRecoveryPass = backgroundRecoveryPass,
+            shouldScheduleAutoRetry = { shouldMaintainBackgroundDiscovery() },
+            supplyLatestConfig = { rosManager.topics.copy() },
+            supplyLatestHints = { collectLiveDiscoveryHints() },
+            onBackoffScheduled = { attempt, delayMs, reason ->
+                runOnUiThread {
+                    val waitSec = ExponentialBackoffPolicy.formatSecondsShort(delayMs)
+                    val msg = when (reason) {
+                        DiscoveryRecoveryReason.HOST_BOOTING_ROSCORE ->
+                            "已发现机载主机 · $waitSec 后自动重探 roscore (#$attempt)"
+                        else ->
+                            "等待机载链路就绪 · $waitSec 后指数退避自动重扫 (#$attempt)"
+                    }
+                    setTextIfChanged(tvScanStatus, msg)
+                    if (hub.isRosMode && !hub.rosConnected) {
+                        hub.connectionLevel = 1
+                        hub.connectionLabel = "寻机自愈中 ($waitSec · #$attempt)"
+                    }
+                }
+            },
             onProgress = { _, hint ->
                 runOnUiThread { setTextIfChanged(tvScanStatus, hint) }
             },
@@ -4801,7 +5113,7 @@ class MainActivity : Activity() {
                         addDiscoveredDroneRow(drone)
                     }
 
-                    if (drone.rosReady && hub.autoConnectDiscovered && !hub.rosConnected && !autoConnectedThisRun) {
+                    if (drone.rosReady && allowAutoConnect && !hub.rosConnected && !autoConnectedThisRun) {
                         autoConnectedThisRun = true
                         applyDiscoveredDroneAndConnect(drone, fromAuto = true)
                     }
@@ -4812,15 +5124,19 @@ class MainActivity : Activity() {
                     GcsIcons.bind(btnDrawerScan, Type.SEARCH, "重新扫描飞机", d, iconDp = 12f)
                     val rosReadyCount = allFound.count { it.rosReady }
                     if (allFound.isEmpty()) {
-                        setTextIfChanged(tvScanStatus, "在 $subnet 未发现机载 ROS1 (11311/9090) 或在线机载主机")
+                        if (!shouldMaintainBackgroundDiscovery()) {
+                            setTextIfChanged(tvScanStatus, "在 $subnet 未发现机载 ROS1 (11311/9090) 或在线机载主机")
+                        }
                         if (!silentIfEmpty) {
-                            AnimHelper.showDjiToast(toastBanner, "未搜到无人机，请检查机载 Wi-Fi/网口连接或手动输入 IP", d)
+                            AnimHelper.showDjiToast(toastBanner, "未搜到无人机，后台将继续按指数退避自动重扫", d)
                             if (autoOpenConnTabOnEmpty) toggleOrJumpDrawerTab(TAB_CONN)
                         }
                     } else if (rosReadyCount == 0) {
-                        setTextIfChanged(tvScanStatus, "扫描完成 ($subnet)：发现 ${allFound.size} 台在线机载主机，待启动 roscore/9090")
+                        if (!shouldMaintainBackgroundDiscovery()) {
+                            setTextIfChanged(tvScanStatus, "扫描完成 ($subnet)：发现 ${allFound.size} 台在线机载主机，待启动 roscore/9090")
+                        }
                         if (!silentIfEmpty) {
-                            AnimHelper.showDjiToast(toastBanner, "已搜到机载主机 ${allFound.first().ip}，请启动 roscore 后连接", d)
+                            AnimHelper.showDjiToast(toastBanner, "已搜到机载主机 ${allFound.first().ip}，等待 roscore 启动后将自动重连", d)
                             if (autoOpenConnTabOnEmpty) toggleOrJumpDrawerTab(TAB_CONN)
                         }
                     } else {
@@ -4940,6 +5256,9 @@ class MainActivity : Activity() {
     }
 
     private fun applyDiscoveredDroneAndConnect(drone: DiscoveredDrone, fromAuto: Boolean) {
+        userPausedAutoDiscovery = false
+        lanScanner.rememberCandidateHost(drone.ip)
+        lanScanner.resetBackoff()
         val sc = drone.suggestedConfig
         rosManager.topics.protocol = sc.protocol
         syncProtoInputsVisibility()
@@ -4966,6 +5285,9 @@ class MainActivity : Activity() {
     }
 
     private fun connectWithConfig(cfg: TopicConfig) {
+        userPausedAutoDiscovery = false
+        lanScanner.rememberCandidateHost(if (cfg.protocol == "tcpros") cfg.masterUri else cfg.wsUrl)
+        lanScanner.cancelScheduledBackoff()
         topicInspector.stopActiveSession()
         cachedTopicEntries = emptyList()
         simEngine.resetRosSessionState()
@@ -4975,6 +5297,173 @@ class MainActivity : Activity() {
         syncModeSpecificControls(force = true)
         refreshCommandDockUi()
         refreshWaypointOrchestratorList()
+    }
+
+    private fun observeSavedMissionsReactive() {
+        uiScope.launch {
+            missionRepository.missionsFlow.collect { list ->
+                cachedSavedMissions = list
+                hub.savedMissionCount = list.size
+                renderSavedMissionHistoryCards()
+            }
+        }
+    }
+
+    private fun renderSavedMissionHistoryCards() {
+        if (!::missionHistoryContainer.isInitialized) return
+        FlightReplayHudBar.populateDrawerMissionList(
+            context = this,
+            container = missionHistoryContainer,
+            missions = cachedSavedMissions,
+            activeReplayMissionId = hub.replayMissionId,
+            hub = hub,
+            density = d,
+            onReplay = { m -> startMissionReplay(m.id) },
+            onAnalyze = { m -> openMissionAnalysisModal(m.id) },
+            onExportCsv = { m -> exportMissionFromSqliteCsv(m.id) },
+            onDelete = { m ->
+                if (hub.isReplayMode && hub.replayMissionId == m.id) {
+                    exitMissionReplay(silent = true)
+                }
+                uiScope.launch {
+                    missionRepository.deleteMission(m.id)
+                    AnimHelper.showDjiToast(toastBanner, "已从本地 SQLite 删除「${m.title}」", d)
+                }
+            }
+        )
+    }
+
+    private fun startFlightRecordingWithSqlite(
+        customTag: String? = null,
+        waypointsOverrideCsv: String? = null,
+        showToast: Boolean = true
+    ) {
+        val nowWall = System.currentTimeMillis()
+        val nowEl = android.os.SystemClock.elapsedRealtime()
+        val snap = hub.snapshots.readInto(readSnapshot)
+        val wpCsv = waypointsOverrideCsv ?: simEngine.serializeStagedWaypointsCsv()
+        missionRepository.startNewMissionSession(
+            hub = hub,
+            currentSnap = snap,
+            waypointsCsv = wpCsv,
+            customTag = customTag,
+            nowWallMs = nowWall
+        )
+        simEngine.telemetryRecorder.startRecording(nowElapsedMs = nowEl, nowWallEpochMs = nowWall)
+        syncFlightRecorderUi()
+        if (showToast) {
+            AnimHelper.showDjiToast(toastBanner, "已开启 20Hz 飞行任务 SQLite 实时落库记录", d)
+        }
+    }
+
+    private fun stopFlightRecordingAndFinalizeSqlite(showToast: Boolean) {
+        val rec = simEngine.telemetryRecorder
+        val captured = rec.sampleCount
+        rec.stopRecording()
+        val wpCsv = simEngine.serializeStagedWaypointsCsv()
+        missionRepository.stopActiveMissionSession(
+            waypointsCsv = wpCsv,
+            onStopped = { savedEntity ->
+                runOnUiThread {
+                    syncFlightRecorderUi()
+                    if (showToast) {
+                        if (savedEntity != null) {
+                            AnimHelper.showDjiToast(
+                                toastBanner,
+                                String.format(
+                                    Locale.US,
+                                    "任务已落库：%s (%d帧 · %.1fm · 可3D回放/分析)",
+                                    savedEntity.title,
+                                    savedEntity.sampleCount,
+                                    savedEntity.distanceMeters
+                                ),
+                                d
+                            )
+                        } else {
+                            AnimHelper.showDjiToast(toastBanner, "已停止记录 (采样帧数 $captured)", d)
+                        }
+                    }
+                }
+            }
+        )
+        syncFlightRecorderUi()
+    }
+
+    private fun startMissionReplay(missionId: Long) {
+        if (simEngine.telemetryRecorder.isRecording) {
+            stopFlightRecordingAndFinalizeSqlite(showToast = false)
+        }
+        uiScope.launch {
+            val loaded = missionRepository.loadMissionWithTelemetry(missionId)
+            if (loaded == null || loaded.second.isEmpty()) {
+                AnimHelper.showDjiToast(toastBanner, "该任务架次暂无可回放的时序遥测点", d)
+                return@launch
+            }
+            val (mission, pts) = loaded
+            val ok = simEngine.playbackController.loadMission(mission, pts, hub)
+            if (ok) {
+                setDrawerOpenState(false)
+                DroneVectorModel.activeRig = DroneVectorModel.rigFor(pts.first().activeIsTiltRig)
+                mapView.clearFlightTrails()
+                mapView.recenterLockDrone()
+                syncCameraControlLabels()
+                refreshCommandDockUi()
+                replayHudBar.syncOnHudTick()
+                syncBottomHudAvoidance()
+                renderSavedMissionHistoryCards()
+                AnimHelper.showDjiToast(
+                    toastBanner,
+                    "进入 3D 轨迹回放：${mission.title} (${pts.size} 帧)",
+                    d
+                )
+            }
+        }
+    }
+
+    private fun exitMissionReplay(silent: Boolean = false) {
+        if (!hub.isReplayMode && !simEngine.playbackController.isActive) return
+        simEngine.playbackController.stopReplay(hub)
+        DroneVectorModel.activeRig = DroneVectorModel.rigFor(hub.activeFocusIsTiltRig())
+        mapView.clearFlightTrails()
+        replayHudBar.syncOnHudTick()
+        refreshCommandDockUi()
+        syncBottomHudAvoidance()
+        renderSavedMissionHistoryCards()
+        if (!silent) {
+            AnimHelper.showDjiToast(toastBanner, "已退出 3D 轨迹回放，恢复实时飞控状态", d)
+        }
+    }
+
+    private fun openMissionAnalysisModal(missionId: Long) {
+        uiScope.launch {
+            val report = missionRepository.analyzeMission(missionId, hub.warnClearanceMeters)
+            if (report == null) {
+                AnimHelper.showDjiToast(toastBanner, "未找到该架次的 SQLite 遥测数据", d)
+                return@launch
+            }
+            if (drawerOpen) setDrawerOpenState(false)
+            if (layerPopoverOpen) setLayerPopoverVisible(false)
+            if (::settingsModal.isInitialized && settingsModal.isOpen) setSettingsModalOpen(false)
+            analysisSheet.showReport(report)
+        }
+    }
+
+    private fun exportMissionFromSqliteCsv(missionId: Long) {
+        uiScope.launch {
+            try {
+                val baseDir = getExternalFilesDir("telemetry_logs") ?: File(filesDir, "telemetry_logs")
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val outFile = File(baseDir, "ego_sqlite_mission_${missionId}_$stamp.csv")
+                val rows = missionRepository.exportMissionToCsv(missionId, outFile)
+                if (rows <= 0) {
+                    AnimHelper.showDjiToast(toastBanner, "该架次无遥测点可导出", d)
+                } else {
+                    AnimHelper.showDjiToast(toastBanner, "已从 SQLite 导出 $rows 行至 telemetry_logs/${outFile.name}", d)
+                }
+            } catch (e: Exception) {
+                AnimHelper.showDjiToast(toastBanner, "CSV 导出失败: ${e.localizedMessage ?: "IO异常"}", d)
+            }
+        }
     }
 
     private fun syncFlightRecorderUi() {
@@ -4990,13 +5479,34 @@ class MainActivity : Activity() {
         GcsIcons.bind(
             btnToggleFlightRec,
             if (active) Type.STOP_SQUARE else Type.PLAY,
-            if (active) "停止录制" else "开始记录",
+            if (active) getString(R.string.flight_db_btn_stop_record) else getString(R.string.flight_db_btn_start_record),
             d,
             iconDp = 11f
         )
+        if (::btnToggleAutoDbLog.isInitialized) {
+            val autoOn = hub.autoLogMissionsToDb
+            btnToggleAutoDbLog.setTextColor(if (autoOn) pal.accentBright else pal.textMuted)
+            btnToggleAutoDbLog.background = if (autoOn) {
+                pillBg(pal.accentSoftFill, pal.accent, radiusDp = 5.5f)
+            } else {
+                pillBg(pal.wellFill, pal.cardStroke, radiusDp = 5.5f)
+            }
+            GcsIcons.bind(
+                btnToggleAutoDbLog,
+                if (autoOn) Type.CHECK else Type.STATUS_RING,
+                if (autoOn) "航线启动自动落库：已开启" else "航线启动自动落库：已关闭",
+                d,
+                iconDp = 10.5f
+            )
+        }
     }
 
     private fun exportFlightTelemetryCsv() {
+        val latestMission = cachedSavedMissions.firstOrNull()
+        if (!simEngine.telemetryRecorder.isRecording && simEngine.telemetryRecorder.sampleCount <= 0 && latestMission != null) {
+            exportMissionFromSqliteCsv(latestMission.id)
+            return
+        }
         fileIoExecutor.execute {
             try {
                 val baseDir = getExternalFilesDir("telemetry_logs") ?: File(filesDir, "telemetry_logs")
@@ -5005,7 +5515,7 @@ class MainActivity : Activity() {
                 val rows = simEngine.telemetryRecorder.exportToCsv(outFile)
                 runOnUiThread {
                     if (rows <= 0) {
-                        AnimHelper.showDjiToast(toastBanner, "当前无缓存遥测帧，请先点击「开始记录」", d)
+                        AnimHelper.showDjiToast(toastBanner, "当前无缓存遥测帧，请先点击「开始落库记录」", d)
                     } else {
                         AnimHelper.showDjiToast(toastBanner, "已导出 $rows 行科研遥测至 telemetry_logs/${outFile.name}", d)
                     }
@@ -5065,6 +5575,10 @@ class MainActivity : Activity() {
             lastArmedBadgeStyled = -1
             lastClearanceWarnLevel = -1
             lastBatDangerLevel = -1
+            lastThermalHudTone = -1
+        }
+        if (::settingsModal.isInitialized && settingsModal.isOpen) {
+            settingsModal.refreshLiveDiagnosticsIfOpen()
         }
 
         val spd = sqrt(s.vx * s.vx + s.vy * s.vy + s.vz * s.vz)
@@ -5140,6 +5654,21 @@ class MainActivity : Activity() {
         }
         FastHudFormatter.setFixed1(tvClearanceTop, "避障", s.minClearance, "m")
         if (tvHzTop.visibility == View.VISIBLE) {
+            val thermalTone = when {
+                hub.thermalThrottleLevel >= 4 -> 2
+                hub.thermalThrottleLevel >= 2 -> 1
+                else -> 0
+            }
+            if (thermalTone != lastThermalHudTone) {
+                lastThermalHudTone = thermalTone
+                tvHzTop.setTextColor(
+                    when (thermalTone) {
+                        2 -> Color.parseColor("#FF3B30")
+                        1 -> Color.rgb(225, 132, 0)
+                        else -> pal.textSecondary
+                    }
+                )
+            }
             FastHudFormatter.setTopHzFps(tvHzTop, hub.isRosMode, s.odomHz, hub.renderFps)
         }
 
@@ -5273,11 +5802,19 @@ class MainActivity : Activity() {
             FastHudFormatter.setCompactPoints(tvMapPtsCard, "", s.mapPointCount, " / 300k")
             FastHudFormatter.setIntMetric(tvCloudRateCard, "", s.cloudHz, " Hz · ", s.cloudScanPts, " pts")
             setTextIfChanged(tvMapBoundsCard, simEngine.voxelMap.formatBoundsSpanSummary())
+            if (::replayHudBar.isInitialized && hub.isReplayMode) {
+                if (replayHudBar.syncOnHudTick()) {
+                    syncBottomHudAvoidance()
+                }
+            }
             val rec = simEngine.telemetryRecorder
-            val recTxt = if (rec.isRecording) {
-                "录制中 (20Hz) · ${rec.sampleCount} 帧 (${rec.durationSec()}s)"
-            } else {
-                "待机 · 已缓存 ${rec.sampleCount} 帧"
+            val recTxt = when {
+                rec.isRecording ->
+                    "落库录制中 (SQLite #${missionRepository.activeMissionId} · 20Hz) · ${rec.sampleCount} 帧 (${rec.durationSec()}s)"
+                hub.isReplayMode ->
+                    "3D 回放中 · 本地库共 ${hub.savedMissionCount} 架次"
+                else ->
+                    "待机 · 本地 SQLite 已存 ${hub.savedMissionCount} 架次"
             }
             setTextIfChanged(tvRecorderStatusCard, recTxt)
             FastHudFormatter.setFixed2(tvPosX, "", s.uavX, " m")
